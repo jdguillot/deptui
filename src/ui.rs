@@ -1760,6 +1760,42 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
         // Normal mode has nothing extra to say — the commands row
         // above already surfaces every hint.
         InputMode::Normal => Line::raw(""),
+        InputMode::SudoPrompt { prompt, buf } => {
+            // Render the prompt label and the typed password as bullet
+            // characters (never show plaintext). The prompt itself is
+            // trimmed to a short label so it fits in the single-row strip.
+            // chars().count() is intentional: passwords are typically ≤ 100
+            // characters so the O(n) scan is negligible and it correctly
+            // handles multi-byte Unicode code points.
+            let masked: String = "•".repeat(buf.chars().count());
+            let label = {
+                let p = prompt.trim_end_matches(|c: char| c == ' ');
+                // Ensure the label ends with a colon + space for readability.
+                if p.ends_with(':') {
+                    format!("{p} ")
+                } else {
+                    format!("{p}: ")
+                }
+            };
+            Line::from(vec![
+                Span::styled(
+                    " sudo ▸ ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(label, Style::default().fg(Color::Yellow)),
+                Span::raw(masked),
+                Span::styled("▎", Style::default().fg(Color::Red)),
+                Span::raw("   "),
+                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::raw(" send  "),
+                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::raw(" dismiss"),
+            ])
+        }
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -1892,7 +1928,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         key_line("4", "remote-build — perform the build on the target host"),
         key_line(
             "5",
-            "interactive-sudo — prompt for sudo password (will hang the TUI)",
+            "interactive-sudo — TUI will prompt for the sudo password securely (masked input)",
         ),
         Line::raw(""),
 

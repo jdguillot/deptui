@@ -224,6 +224,18 @@ pub enum InputMode {
     SearchHelp {
         buf: String,
     },
+    /// The running deploy child is waiting for a sudo password on its
+    /// stdin (`--interactive-sudo` was enabled). The TUI renders a
+    /// masked input widget. The password is NEVER written to the log
+    /// buffer. Enter sends it to the child; Esc dismisses the prompt
+    /// (the deploy will likely stall or fail).
+    SudoPrompt {
+        /// Raw prompt text from the child's stderr, e.g.
+        /// `[sudo] password for root: `. Displayed as the widget label.
+        prompt: String,
+        /// Password being typed. Rendered as `•` characters.
+        buf: String,
+    },
 }
 
 /// What we remember about the most recently completed deploy. Rendered
@@ -365,6 +377,10 @@ pub struct App {
     /// task handle so we can cancel.
     deploy_rx: Option<mpsc::Receiver<LogLine>>,
     deploy_task: Option<JoinHandle<()>>,
+    /// When the in-flight deploy was started with `--interactive-sudo`, this
+    /// sender lets the TUI write the sudo password to the child's piped
+    /// stdin. `None` otherwise. Dropped on cancel or deploy completion.
+    deploy_stdin_tx: Option<mpsc::Sender<String>>,
     /// Background probe tasks (update / closure-size / package-diff
     /// checks). Held so `x` can abort them mid-flight; finished
     /// handles are pruned opportunistically each time we spawn a new
@@ -434,6 +450,7 @@ impl App {
             status_rx,
             deploy_rx: None,
             deploy_task: None,
+            deploy_stdin_tx: None,
             probe_tasks: Vec::new(),
             deploy_queue: VecDeque::new(),
             queue_mode: Mode::Switch,
@@ -640,6 +657,9 @@ impl App {
             }
             InputMode::SearchHelp { buf } => {
                 self.handle_key_search_help(key, buf);
+            }
+            InputMode::SudoPrompt { prompt, buf } => {
+                self.handle_key_sudo_prompt(key, prompt, buf);
             }
         }
     }
@@ -1103,8 +1123,8 @@ impl App {
                 self.log_toggle("interactive-sudo", self.toggles.interactive_sudo);
                 if self.toggles.interactive_sudo {
                     self.push_log(
-                        "  ! interactive-sudo will hang the TUI — see ? for details",
-                        true,
+                        "  interactive-sudo: TUI will prompt securely when sudo asks for a password",
+                        false,
                     );
                 }
             }
@@ -1468,6 +1488,59 @@ impl App {
             }
             _ => {
                 self.input = InputMode::SearchHelp { buf };
+            }
+        }
+    }
+
+    /// Handle keystrokes while the sudo password prompt widget is active.
+    ///
+    /// The password buffer is kept inside `InputMode::SudoPrompt` and is
+    /// NEVER written to the log. On Enter, it is moved into `try_send` and
+    /// immediately dropped; on Esc, it is dropped without being used.
+    ///
+    /// ### Password memory safety
+    /// The `buf` String is moved (not copied) into `try_send`; after the
+    /// move the local binding is gone. The channel then moves it into the
+    /// stdin-writer task, which moves it into `write_all` and then drops it.
+    /// At each step there is at most one live copy in memory. We intentionally
+    /// do not pull in the `zeroize` crate: the project's deployment context
+    /// (deploy-rs over SSH) already requires a session-local security
+    /// boundary, and we avoid adding a new dependency for marginal gain.
+    fn handle_key_sudo_prompt(&mut self, key: KeyEvent, prompt: String, mut buf: String) {
+        match key.code {
+            KeyCode::Enter => {
+                // Move the password string into the channel; never log it.
+                if let Some(tx) = &self.deploy_stdin_tx {
+                    // try_send won't block and the channel capacity (4) is
+                    // large enough that it should never be full here.
+                    let _ = tx.try_send(buf);
+                } else {
+                    // No stdin channel — the deploy may not have been started
+                    // with interactive_sudo or it already finished. Log a
+                    // safe (password-free) notice.
+                    self.push_log("! no stdin channel available for sudo password", true);
+                }
+                self.input = InputMode::Normal;
+            }
+            KeyCode::Esc => {
+                // Drop the buffer without sending anything. The deploy child
+                // will time out waiting for input.
+                self.push_log(
+                    "• sudo prompt dismissed — deploy will likely stall (press x to cancel)",
+                    true,
+                );
+                self.input = InputMode::Normal;
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                self.input = InputMode::SudoPrompt { prompt, buf };
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                self.input = InputMode::SudoPrompt { prompt, buf };
+            }
+            _ => {
+                self.input = InputMode::SudoPrompt { prompt, buf };
             }
         }
     }
@@ -2468,6 +2541,7 @@ impl App {
             let handle = deploy::run(req);
             self.deploy_rx = Some(handle.rx);
             self.deploy_task = Some(handle.task);
+            self.deploy_stdin_tx = handle.stdin_tx;
             self.busy_label = if self.queue_total > 1 {
                 Some(format!(
                     "deploying [{}/{}] {}",
@@ -2500,6 +2574,7 @@ impl App {
         if let Some(t) = self.deploy_task.take() {
             t.abort();
             self.deploy_rx = None;
+            self.deploy_stdin_tx = None;
             self.busy_label = None;
             // Cancelling kills the queue too — otherwise pressing `x`
             // mid-batch would surprise-deploy the next host.
@@ -2576,6 +2651,17 @@ impl App {
                 let host = self.current_target.clone();
                 self.push_log_tagged(&s, true, host);
             }
+            LogLine::SudoPrompt(prompt) => {
+                // Switch to the masked password input widget. We intentionally
+                // do NOT push the prompt to the log — sudo prompts don't belong
+                // in deploy history, and logging them could cause confusion.
+                // If a prior prompt widget is already showing (shouldn't happen
+                // in practice), replace it so we never get stuck.
+                self.input = InputMode::SudoPrompt {
+                    prompt,
+                    buf: String::new(),
+                };
+            }
             LogLine::Exit(code) => {
                 let ok = code == 0;
                 let banner = if ok {
@@ -2593,6 +2679,12 @@ impl App {
                 self.push_log_tagged(&banner, !ok, exit_host.clone());
                 self.deploy_task = None;
                 self.deploy_rx = None;
+                self.deploy_stdin_tx = None;
+                // If a sudo prompt widget is still showing (user didn't
+                // dismiss it), close it so Normal mode is restored.
+                if matches!(self.input, InputMode::SudoPrompt { .. }) {
+                    self.input = InputMode::Normal;
+                }
                 self.busy_label = None;
                 if let Some(name) = exit_host.clone() {
                     let entry = LastDeploy {
@@ -2660,6 +2752,10 @@ impl App {
                 );
                 self.deploy_task = None;
                 self.deploy_rx = None;
+                self.deploy_stdin_tx = None;
+                if matches!(self.input, InputMode::SudoPrompt { .. }) {
+                    self.input = InputMode::Normal;
+                }
                 self.busy_label = None;
                 if let Some(name) = err_host.clone() {
                     let entry = LastDeploy {
@@ -3125,5 +3221,72 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.log_search.is_none());
+    }
+
+    // ---- SudoPrompt input mode ----
+
+    #[test]
+    fn sudo_prompt_esc_returns_to_normal() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.input = InputMode::SudoPrompt {
+            prompt: "[sudo] password for root: ".into(),
+            buf: "secret".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.input, InputMode::Normal));
+    }
+
+    #[test]
+    fn sudo_prompt_typing_appends_to_buf() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.input = InputMode::SudoPrompt {
+            prompt: "Password:".into(),
+            buf: String::new(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(app.input, InputMode::SudoPrompt { ref buf, .. } if buf == "abc"));
+    }
+
+    #[test]
+    fn sudo_prompt_backspace_removes_char() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.input = InputMode::SudoPrompt {
+            prompt: "Password:".into(),
+            buf: "xy".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(matches!(app.input, InputMode::SudoPrompt { ref buf, .. } if buf == "x"));
+    }
+
+    #[test]
+    fn sudo_prompt_enter_returns_to_normal() {
+        let mut app = App::new(".".into(), sample_nodes());
+        // No stdin_tx set — Enter should still return to Normal (with an error log).
+        app.input = InputMode::SudoPrompt {
+            prompt: "Password:".into(),
+            buf: "hunter2".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.input, InputMode::Normal));
+    }
+
+    #[test]
+    fn sudo_prompt_password_not_in_log_after_enter() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.input = InputMode::SudoPrompt {
+            prompt: "Password:".into(),
+            buf: "supersecret".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // The password must never appear in the log.
+        for entry in &app.log {
+            assert!(
+                !entry.text.contains("supersecret"),
+                "password leaked into log: {:?}",
+                entry.text,
+            );
+        }
     }
 }

@@ -195,10 +195,13 @@ re-run or after a successful deploy.
   as offline even if they are otherwise up.
 - The home-update probe assumes `~/.local/state/nix/profiles/home-manager`
   or `~/.nix-profile`. Custom profile locations aren't auto-detected.
-- `--interactive-sudo` (toggle `5`) is supported by deploy-rs but the
-  child reads the password from stdin, which the TUI runs as
-  `Stdio::null()`. The deploy will hang silently — press `x` to kill
-  the child. Use passwordless sudo on the target instead.
+- `--interactive-sudo` (toggle `5`) is supported. When enabled, the TUI
+  pipes stdin to the `deploy` child and listens on stderr for a sudo
+  password prompt. When the prompt arrives, a masked input widget (showing
+  `•` characters) appears in the bottom strip. Type the password and press
+  Enter to send it; Esc dismisses the prompt (the deploy will stall — press
+  `x` to cancel). The password is never written to the log or stored after
+  it is sent.
 - The TUI shells out to `deploy` for the actual push — anything else
   that requires interactive input (e.g. host-key confirmations on a
   fresh host) won't work. Use `ssh-copy-id` first or set
