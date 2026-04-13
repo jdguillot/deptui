@@ -8,7 +8,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use deploy_rs_tui::flake;
+use deptui::flake;
 use serial_test::serial;
 use tempfile::TempDir;
 

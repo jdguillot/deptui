@@ -148,7 +148,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled(
-            " deploy-rs-tui ",
+            " deptui ",
             Style::default()
                 .bg(Color::Magenta)
                 .fg(Color::Black)

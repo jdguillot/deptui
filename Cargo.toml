@@ -1,12 +1,12 @@
 [package]
-name = "deploy-rs-tui"
+name = "deptui"
 version = "0.1.0"
 edition = "2021"
 description = "A terminal UI wrapper around serokell/deploy-rs"
 license = "MIT"
 
 [lib]
-name = "deploy_rs_tui"
+name = "deptui"
 path = "src/lib.rs"
 
 [[bin]]

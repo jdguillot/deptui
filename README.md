@@ -1,4 +1,4 @@
-# deploy-rs-tui
+# deptui
 
 A small terminal UI on top of [serokell/deploy-rs](https://github.com/serokell/deploy-rs).
 It reads `deploy.nodes` from your flake, shows which hosts are reachable
@@ -67,18 +67,18 @@ Or build directly via Nix:
 
 ```sh
 nix build
-./result/bin/deploy-rs-tui /path/to/your/flake
+./result/bin/deptui /path/to/your/flake
 ```
 
 ## Running
 
 ```sh
 # defaults to the current directory
-deploy-rs-tui
+deptui
 
 # or point at any flake reference nix understands
-deploy-rs-tui /home/me/.dotfiles
-deploy-rs-tui github:me/dotfiles
+deptui /home/me/.dotfiles
+deptui github:me/dotfiles
 ```
 
 Optional flags:
