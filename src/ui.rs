@@ -1839,7 +1839,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         Line::raw(""),
 
         section("status"),
-        key_line("r", "refresh nodes from flake.nix + online/offline (TCP-22 probe) for every host"),
+        key_line("r", "refresh nodes from flake.nix + online/offline (TCP probe via ssh -G) for every host"),
         key_line(
             "u",
             "check selected host (cheap tier: paths, activation time)",

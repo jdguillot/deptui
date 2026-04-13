@@ -188,8 +188,11 @@ re-run or after a successful deploy.
 
 ## Limitations
 
-- Online check probes TCP/22 only. Hosts that block port 22 from your
-  machine will show as offline even if they are up.
+- Online check resolves the effective host and port via `ssh -G`
+  (respecting `~/.ssh/config` and any per-host SSH overrides set in
+  the TUI). It falls back to port 22 only when `ssh -G` fails. Hosts
+  whose resolved SSH port is blocked from your machine will still show
+  as offline even if they are otherwise up.
 - The home-update probe assumes `~/.local/state/nix/profiles/home-manager`
   or `~/.nix-profile`. Custom profile locations aren't auto-detected.
 - `--interactive-sudo` (toggle `5`) is supported by deploy-rs but the
