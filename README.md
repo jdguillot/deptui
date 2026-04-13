@@ -73,19 +73,84 @@ nix build
 ## Running
 
 ```sh
-# defaults to the current directory
-deptui
-
-# or point at any flake reference nix understands
-deptui /home/me/.dotfiles
-deptui github:me/dotfiles
+deptui [OPTIONS] [FLAKE]
 ```
 
-Optional flags:
+### Arguments
 
-| flag         | purpose                                          |
-| ------------ | ------------------------------------------------ |
-| `--log-file` | write tracing logs to a file (TUI stays clean)   |
+#### `FLAKE` (positional, optional)
+
+Path or flake reference pointing at the flake that contains
+`deploy.nodes`. Anything `nix` accepts as a flakeref works here.
+Defaults to `.` (the current directory) when omitted.
+
+```sh
+# use the current directory (equivalent to `deptui .`)
+deptui
+
+# absolute path to a local flake
+deptui /home/me/.dotfiles
+
+# relative path
+deptui ../my-infra
+
+# remote GitHub flake reference
+deptui github:me/dotfiles
+
+# specific branch of a remote flake
+deptui github:me/dotfiles/staging
+
+# a Git URL
+deptui git+ssh://git@github.com/me/dotfiles
+```
+
+#### `--log-file <PATH>`
+
+Write tracing/diagnostic logs to the given file instead of discarding
+them. Without this flag all log output is silenced so it doesn't
+corrupt the alternate-screen TUI. Useful for debugging flake evaluation
+issues or deploy failures.
+
+```sh
+# log to a file in /tmp
+deptui --log-file /tmp/deptui.log
+
+# combine with a flake path
+deptui --log-file ./debug.log /home/me/.dotfiles
+```
+
+The log level is controlled by the standard `RUST_LOG` environment
+variable (default: `info`).
+
+```sh
+# enable debug-level output
+RUST_LOG=debug deptui --log-file /tmp/deptui.log
+```
+
+#### `-h`, `--help`
+
+Print a short help summary listing all arguments and exit.
+
+```sh
+deptui --help
+```
+
+#### `-V`, `--version`
+
+Print the program version (`deptui <version>`) and exit.
+
+```sh
+deptui --version
+```
+
+### Quick-reference table
+
+| argument             | kind       | default | description                                      |
+| -------------------- | ---------- | ------- | ------------------------------------------------ |
+| `FLAKE`              | positional | `.`     | flake reference containing `deploy.nodes`        |
+| `--log-file <PATH>`  | option     | —       | write tracing logs to a file (TUI stays clean)   |
+| `-h`, `--help`       | flag       | —       | print help and exit                              |
+| `-V`, `--version`    | flag       | —       | print version and exit                           |
 
 ## Key bindings
 
