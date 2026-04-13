@@ -1,4 +1,4 @@
-//! deploy-rs-tui — terminal UI for serokell/deploy-rs.
+//! deptui — terminal UI for serokell/deploy-rs.
 //!
 //! Discovers `deploy.nodes` from a Nix flake, shows host status, and runs
 //! `deploy` for the selected node/profile.
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use deploy_rs_tui::{app::App, flake, ui};
+use deptui::{app::App, flake, ui};
 
 /// CLI arguments. The TUI runs against a single flake reference.
 #[derive(Debug, Parser)]

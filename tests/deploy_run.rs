@@ -9,8 +9,8 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use deploy_rs_tui::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
-use deploy_rs_tui::ssh::SshOverride;
+use deptui::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
+use deptui::ssh::SshOverride;
 use serial_test::serial;
 use tempfile::TempDir;
 

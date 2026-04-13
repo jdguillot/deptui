@@ -1,5 +1,5 @@
 {
-  description = "deploy-rs-tui — a terminal UI wrapper for serokell/deploy-rs";
+  description = "deptui — a terminal UI wrapper for serokell/deploy-rs";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -21,7 +21,7 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          name = "deploy-rs-tui-dev";
+          name = "deptui-dev";
 
           packages = with pkgs; [
             # Rust toolchain
@@ -49,7 +49,7 @@
         };
 
         packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "deploy-rs-tui";
+          pname = "deptui";
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
