@@ -41,9 +41,10 @@ blocks in the source modules:
 - `deploy.rs` — `strip_ansi`, `ProfileSel::target_suffix`,
   `DeployRequest::target`, `Toggles::default`.
 - `flake.rs` — `Node::has_system`, `Node::has_home`, JSON deserialisation.
-- `app.rs` — `App::new` defaults, key handling (quit, navigation,
-  toggles, mode selection, help popup), `push_log` cap, override
-  management, `FocusPane` layout rows.
+- `app.rs` — `App::new` defaults, key handling (quit confirmation,
+  navigation, toggles, mode selection, help popup, global search
+  navigation), `push_log` cap, override management, `FocusPane`
+  layout rows.
 
 **Integration tests** (`tests/`, ~12 tests) exercise the process-spawning
 code paths via shell-script PATH shims (no real `nix`/`deploy`/`ssh`
@@ -106,8 +107,10 @@ Key invariants worth knowing before touching the code:
   `Node`/`Profile`, also add it to the `--apply` expression in
   `flake.rs`.
 - **`host::check_online` is the only "always-on" background work.** It
-  runs once at startup and again on every `r` keypress. Everything more
-  expensive (`u`, deploy itself) is lazy and user-triggered.
+  runs once at startup and again on every `r` keypress. The `r` keypress
+  also re-runs `flake::discover` so newly-added nodes in the flake appear
+  without restarting. Everything more expensive (`u`, deploy itself) is
+  lazy and user-triggered.
 - **`host::check_profile_up_to_date` resolves the deploy-rs wrapper
   to its toplevel** before comparing against the remote's
   `/run/current-system`. Stripping `/activate` alone isn't enough —
@@ -122,7 +125,9 @@ Key invariants worth knowing before touching the code:
   events, background status updates, and live deploy log lines. The
   optional deploy receiver is handled with `recv_optional`, which yields
   a never-resolving future when the receiver is `None` so the `select!`
-  arm just stays pending.
+  arm just stays pending. Tick events skip the draw pass when
+  `has_inflight_work()` is false (no spinners to animate), so idle CPU
+  is near zero.
 - **The deploy log is the only mutable buffer that grows.** It's capped
   at 2000 lines in `App::push_log`. If you add other long-lived buffers,
   cap them too.
@@ -147,6 +152,11 @@ Key invariants worth knowing before touching the code:
   in `app::App::handle_key` first short-circuits Ctrl-C and the help
   popup, then routes by `InputMode`. Adding a new modal mode means
   adding a new variant *and* a new dispatch arm.
+- **Quitting requires confirmation.** Both `q` and `Ctrl-C` enter
+  `InputMode::ConfirmQuit` instead of setting `should_quit` directly.
+  The popup warns when a deploy is running. Pressing `y`/Enter confirms,
+  `n`/Esc cancels. A second `Ctrl-C` while the popup is showing
+  confirms immediately (the short-circuit at the top of `handle_key`).
 - **`kill_on_drop(true)`** is set on the spawned `deploy` Command so
   cancelling (key `x`) actually reaps the child instead of orphaning
   it. Don't remove it.
@@ -171,15 +181,31 @@ Key invariants worth knowing before touching the code:
   basenames. The UI detects the `(content-only)` prefix and renders a
   yellow "packages identical, content differs" badge instead of the
   misleading green "packages identical".
-- **Scroll clamping happens before the title chip reads it.** Both
-  `draw_job_log` and `draw_details` compute inner dimensions and run
-  `compute_tail_scroll_offset` (which clamps in place) before
-  constructing the `[↑N]` chip. This prevents a one-frame flash of a
-  stale value when holding `k` past the top.
+- **Scroll clamping happens before the title chip reads it.** `draw_job_log`
+  computes inner dimensions and runs `compute_tail_scroll_offset` (which
+  clamps in place) before constructing the `[↑N]` chip. This prevents a
+  one-frame flash of a stale value when holding `k` past the top.
+  (`draw_details` no longer has a scrollable log.)
 - **Search highlight: active match is cyan**, all other matches are
   magenta. `highlight_match` takes a `current_match` (1-based global
   index from `log_search_stats`) and a `&mut match_counter` to
   distinguish the active hit across the entire pane.
+- **`/`, `n`/`N`, and `Esc` are global search keys.** The early key
+  dispatch in `handle_key_normal` catches `/` (open search), `n`/`N`
+  (next/prev match), and `Esc` (clear search) before pane-specific arms
+  fire, so search works identically regardless of which pane has focus.
+  `SearchTarget::JobLog` is the only remaining search target (the details
+  pane no longer has a scrollable log section).
+- **Job log is filtered to the active host set.** When any hosts are
+  marked (space bar), the job log shows only their entries. With no marks,
+  it shows only the selected host's entries. Both `draw_job_log` (ui.rs)
+  and `filtered_log_indices_for_job_log` (app.rs) implement the same
+  filter — keep them in sync.
+- **Layout is 2-column.** Left column (35%) is vertically split: hosts on
+  top, details on bottom. Right column (65%) is the job log. The details
+  pane holds only the summary + extras; it no longer has a log section.
+  Commands/info row is below both columns: commands left (60%), info right
+  (40%).
 - **`--interactive-sudo true` will hang the TUI**, by design — the
   child reads from `Stdio::null()`. Toggle 5 is exposed for
   completeness; the help popup tells the user to press `x` to recover.
@@ -195,6 +221,6 @@ Key invariants worth knowing before touching the code:
 - Don't print to stdout/stderr from the main thread once the TUI is up
   — it will corrupt the alternate screen. Use `--log-file` and tracing
   if you need diagnostics.
-- The host badges (`sys:✓` / `sys:↑` / `sys:!` / `sys:?` / `sys:-`) and
+- The host badges (`sys:✓` / `sys:↑` / `sys:—` / `sys:!` / `sys:?` / `sys:-`) and
   the colors are part of the user-facing contract — see README. Keep
   them consistent if you change rendering.

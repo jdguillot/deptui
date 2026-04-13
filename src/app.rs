@@ -85,15 +85,11 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Refresh, "r", "refresh"),
     (Command::Updates, "u", "updates"),
     (Command::ProfileAll, "a", "all"),
-    // `y` (sYs) replaced the original `n` so `/` + `n`/`Shift+N` can
-    // own log search the way vim and lazygit users expect. The letter
-    // is otherwise unbound; the y/n confirmation popup lives in its
-    // own input mode so there's no real collision.
-    (Command::ProfileSystem, "y", "sys"),
+    (Command::ProfileSystem, "s", "sys"),
     (Command::ProfileHome, "h", "home"),
-    (Command::Switch, "s", "switch"),
-    (Command::Boot, "b", "boot"),
-    (Command::DryRun, "d", "dry"),
+    (Command::Switch, "S", "switch"),
+    (Command::Boot, "B", "boot"),
+    (Command::DryRun, "D", "dry"),
     (Command::Cancel, "x", "cancel"),
     (Command::Override, "o", "override"),
 ];
@@ -137,10 +133,42 @@ impl OverrideField {
 /// keep using it for `n` / `Shift+N` until they start a new search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchTarget {
-    /// The middle-column details log (host-scoped + global messages).
-    DetailsLog,
     /// The right-column job log (host-tagged deploy output only).
     JobLog,
+}
+
+/// Whether the visual selection in the job log is character-level or line-level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualMode {
+    /// `v` — cursor tracks (line, col); partial-line selection is possible.
+    Char,
+    /// `V` — whole lines only; col component is ignored.
+    Line,
+}
+
+/// Active visual selection in the job log pane. Indices are in terms of the
+/// *filtered* log (same index space as `filtered_log_indices_for_job_log`).
+#[derive(Debug, Clone)]
+pub struct VisualSel {
+    pub mode: VisualMode,
+    /// The end the user *started* the selection from. Fixed until selection ends.
+    pub anchor: (usize, usize), // (filtered_line_idx, char_col)
+    /// The end the user is currently moving. Drives `j`/`k`/`h`/`l`.
+    pub cursor: (usize, usize),
+}
+
+impl VisualSel {
+    /// Returns the normalised range `(start, end)` where start ≤ end.
+    /// Both elements are `(filtered_line_idx, char_col)`.
+    pub fn normalized(&self) -> ((usize, usize), (usize, usize)) {
+        let (al, ac) = self.anchor;
+        let (cl, cc) = self.cursor;
+        if al < cl || (al == cl && ac <= cc) {
+            ((al, ac), (cl, cc))
+        } else {
+            ((cl, cc), (al, ac))
+        }
+    }
 }
 
 /// Top-level input mode. The vast majority of the time we're in `Normal`;
@@ -173,6 +201,12 @@ pub enum InputMode {
         hosts: Vec<String>,
         mode: Mode,
         profile: ProfileSel,
+    },
+    /// Quit confirmation popup. Shown when the user presses `q` or
+    /// `Ctrl+C`. `deploy_running` is true when a deploy is in flight so
+    /// the popup can warn that it will be killed.
+    ConfirmQuit {
+        deploy_running: bool,
     },
     /// User pressed `/` while one of the log panes was focused and is
     /// typing a search query. Enter commits (`App.log_search` set,
@@ -209,6 +243,9 @@ pub struct LastDeploy {
 #[derive(Debug)]
 enum StatusUpdate {
     Reachability(String, Reachability),
+    /// Re-discovered flake nodes from the last `r` refresh. Merges new
+    /// nodes into the running list without disturbing existing state.
+    FlakeDiscover(Vec<Node>),
     UpdateProbe {
         node: String,
         profile: String,
@@ -301,6 +338,14 @@ pub struct App {
     /// has its own independent scroll state so the user can focus it
     /// and scroll without disturbing the details log position.
     pub job_log_scroll: usize,
+    /// Last known rendered height (in rows) of the job log viewport.
+    /// Set by `draw_job_log` each frame; used by `visual_move_cursor`
+    /// to implement vim-style edge scrolling (view only moves when the
+    /// cursor reaches the top or bottom edge of the visible area).
+    pub job_log_viewport_height: usize,
+    /// Active visual selection in the job log (`v` / `V`). `None` when not in
+    /// visual mode. Indices are into `filtered_log_indices_for_job_log()`.
+    pub visual_sel: Option<VisualSel>,
     pub show_help: bool,
     /// Vertical scroll position of the help popup. 0 = top; bumped by
     /// arrow keys / j/k while the popup is open so the help works on
@@ -379,6 +424,8 @@ impl App {
             last_deploys: HashMap::new(),
             log_scroll: 0,
             job_log_scroll: 0,
+            job_log_viewport_height: 0,
+            visual_sel: None,
             show_help: false,
             help_scroll: 0,
             input: InputMode::Normal,
@@ -426,6 +473,18 @@ impl App {
         self.overrides.entry(name.to_string()).or_default()
     }
 
+    /// Returns true when background work is in flight (spinners are
+    /// animating), meaning tick-driven redraws are needed.
+    fn has_inflight_work(&self) -> bool {
+        if self.deploy_task.is_some() {
+            return true;
+        }
+        if self.probe_tasks.iter().any(|h| !h.is_finished()) {
+            return true;
+        }
+        false
+    }
+
     pub async fn run(&mut self, terminal: &mut Tui) -> Result<()> {
         let mut events = spawn_events();
 
@@ -436,23 +495,31 @@ impl App {
         terminal.draw(|f| ui::draw(f, self))?;
 
         while !self.should_quit {
+            let needs_redraw;
             tokio::select! {
                 biased;
 
                 Some(ev) = events.recv() => {
+                    // Ticks only need a redraw when something is animating
+                    // (spinners). Otherwise skip the expensive draw pass.
+                    needs_redraw = !matches!(ev, AppEvent::Tick) || self.has_inflight_work();
                     self.handle_event(ev);
                 }
 
                 Some(update) = self.status_rx.recv() => {
+                    needs_redraw = true;
                     self.apply_status(update);
                 }
 
                 Some(line) = recv_optional(&mut self.deploy_rx) => {
+                    needs_redraw = true;
                     self.handle_deploy_line(line);
                 }
             }
 
-            terminal.draw(|f| ui::draw(f, self))?;
+            if needs_redraw {
+                terminal.draw(|f| ui::draw(f, self))?;
+            }
         }
 
         // Cancel any running deploy when we exit. The child will be reaped
@@ -478,10 +545,16 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        // Ctrl-C is the universal escape hatch — works in every mode and
-        // also kills any running deploy.
+        // Ctrl-C shows the quit confirmation (same as `q`). If we're already
+        // showing it, Ctrl-C confirms immediately.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
+            if matches!(self.input, InputMode::ConfirmQuit { .. }) {
+                self.should_quit = true;
+            } else {
+                self.input = InputMode::ConfirmQuit {
+                    deploy_running: self.deploy_task.is_some(),
+                };
+            }
             return;
         }
 
@@ -558,6 +631,9 @@ impl App {
                 profile,
             } => {
                 self.handle_key_confirm_deploy(key, hosts, mode, profile);
+            }
+            InputMode::ConfirmQuit { deploy_running } => {
+                self.handle_key_confirm_quit(key, deploy_running);
             }
             InputMode::SearchLog { target, buf } => {
                 self.handle_key_search_log(key, target, buf);
@@ -660,14 +736,23 @@ impl App {
                 return;
             }
             KeyCode::Char('q') => {
-                self.should_quit = true;
+                self.input = InputMode::ConfirmQuit {
+                    deploy_running: self.deploy_task.is_some(),
+                };
                 return;
             }
             // Esc was an accidental quit before — now it just no-ops
             // in Normal mode so a stray escape doesn't kill the TUI.
             // Modal handlers (override / confirm / identity picker)
-            // still consume Esc to back out themselves.
-            KeyCode::Esc => return,
+            // still consume Esc to back out themselves. If visual
+            // selection is active, Esc clears it first.
+            KeyCode::Esc => {
+                if self.log_search.is_some() {
+                    self.clear_log_search();
+                }
+                self.visual_sel = None;
+                return;
+            }
             // Vim-style "g" → scroll/jump to the top of whatever the
             // focused pane is showing. This used to be a direct-jump
             // to the Hosts pane; it got repurposed because `gg`/`G`
@@ -691,7 +776,7 @@ impl App {
                 self.focus = FocusPane::Details;
                 return;
             }
-            KeyCode::Char('v') => {
+            KeyCode::Char('p') => {
                 self.focus = FocusPane::JobLog;
                 return;
             }
@@ -713,6 +798,35 @@ impl App {
         // motion (left/right); the row-2 panes use j/k for scroll
         // but leave h/l alone so they fall through to the global
         // action keys below (e.g. `h` = home profile).
+
+        // `/` opens the job-log search from any pane, matching how vim
+        // and lazygit make search always reachable.
+        if key.code == KeyCode::Char('/') && !shift {
+            self.input = InputMode::SearchLog {
+                target: SearchTarget::JobLog,
+                buf: String::new(),
+            };
+            return;
+        }
+
+        // `n`/`N` jump between search matches from any pane — the search
+        // is global so navigating results should be too.
+        if self.log_search.is_some()
+            && matches!(self.log_search_target, Some(SearchTarget::JobLog))
+        {
+            match key.code {
+                KeyCode::Char('n') if !shift => {
+                    self.search_job_log_jump(1);
+                    return;
+                }
+                KeyCode::Char('N') => {
+                    self.search_job_log_jump(-1);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match self.focus {
             FocusPane::Hosts => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -729,97 +843,74 @@ impl App {
                 }
                 _ => {}
             },
-            FocusPane::Details => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.scroll_log(1);
-                    return;
+            FocusPane::Details => {
+                // Details pane no longer has a scrollable log — key
+                // events fall through to the global action keys below.
+            }
+            FocusPane::JobLog => {
+                // --- visual mode intercept ---
+                if self.visual_sel.is_some() {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.visual_move_cursor(-1, 0);
+                            return;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.visual_move_cursor(1, 0);
+                            return;
+                        }
+                        KeyCode::Left | KeyCode::Char('h')
+                            if matches!(
+                                self.visual_sel.as_ref().map(|s| s.mode),
+                                Some(VisualMode::Char)
+                            ) =>
+                        {
+                            self.visual_move_cursor(0, -1);
+                            return;
+                        }
+                        KeyCode::Right | KeyCode::Char('l')
+                            if matches!(
+                                self.visual_sel.as_ref().map(|s| s.mode),
+                                Some(VisualMode::Char)
+                            ) =>
+                        {
+                            self.visual_move_cursor(0, 1);
+                            return;
+                        }
+                        KeyCode::Char('y') => {
+                            self.yank_visual();
+                            return;
+                        }
+                        // Esc is handled by the global early-exit above.
+                        // Any other key exits visual mode and falls through.
+                        _ => {
+                            self.visual_sel = None;
+                        }
+                    }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.scroll_log(-1);
-                    return;
+
+                match key.code {
+                    // Enter char-visual mode.
+                    KeyCode::Char('v') => {
+                        self.enter_visual_mode(VisualMode::Char);
+                        return;
+                    }
+                    // Enter line-visual mode.
+                    KeyCode::Char('V') => {
+                        self.enter_visual_mode(VisualMode::Line);
+                        return;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.scroll_job_log(1);
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.scroll_job_log(-1);
+                        return;
+                    }
+                    _ => {}
                 }
-                // `/` opens the search prompt for the details log.
-                // We pin the target here so the eventual `n`/`Shift+N`
-                // can't get re-routed if the user navigates away first.
-                KeyCode::Char('/') => {
-                    self.input = InputMode::SearchLog {
-                        target: SearchTarget::DetailsLog,
-                        buf: String::new(),
-                    };
-                    return;
-                }
-                // Esc clears an active search pinned to this pane so
-                // the highlights and chip disappear. Falls through to
-                // the global Esc no-op when no search is live.
-                KeyCode::Esc
-                    if matches!(self.log_search_target, Some(SearchTarget::DetailsLog))
-                        && self.log_search.is_some() =>
-                {
-                    self.clear_log_search();
-                    return;
-                }
-                // `n` / `Shift+N` navigate matches once a search has
-                // been committed for *this* pane. Until then they fall
-                // through to the global action keys below (where they
-                // currently land on nothing useful — `n` was rebound
-                // to `y` so search can own it).
-                KeyCode::Char('n')
-                    if matches!(self.log_search_target, Some(SearchTarget::DetailsLog))
-                        && self.log_search.is_some() =>
-                {
-                    self.search_log_jump(1);
-                    return;
-                }
-                KeyCode::Char('N')
-                    if matches!(self.log_search_target, Some(SearchTarget::DetailsLog))
-                        && self.log_search.is_some() =>
-                {
-                    self.search_log_jump(-1);
-                    return;
-                }
-                _ => {}
-            },
-            FocusPane::JobLog => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.scroll_job_log(1);
-                    return;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.scroll_job_log(-1);
-                    return;
-                }
-                KeyCode::Char('/') => {
-                    self.input = InputMode::SearchLog {
-                        target: SearchTarget::JobLog,
-                        buf: String::new(),
-                    };
-                    return;
-                }
-                // Esc clears an active search pinned to this pane.
-                // See the matching arm in FocusPane::Details for why.
-                KeyCode::Esc
-                    if matches!(self.log_search_target, Some(SearchTarget::JobLog))
-                        && self.log_search.is_some() =>
-                {
-                    self.clear_log_search();
-                    return;
-                }
-                KeyCode::Char('n')
-                    if matches!(self.log_search_target, Some(SearchTarget::JobLog))
-                        && self.log_search.is_some() =>
-                {
-                    self.search_job_log_jump(1);
-                    return;
-                }
-                KeyCode::Char('N')
-                    if matches!(self.log_search_target, Some(SearchTarget::JobLog))
-                        && self.log_search.is_some() =>
-                {
-                    self.search_job_log_jump(-1);
-                    return;
-                }
-                _ => {}
-            },
+            }
             FocusPane::Toggles => match key.code {
                 KeyCode::Left | KeyCode::Char('h') => {
                     self.move_toggle_index(-1);
@@ -862,19 +953,17 @@ impl App {
             KeyCode::Char('r') => self.refresh_reachability(),
             KeyCode::Char('u') => self.refresh_updates_for_selected(),
 
-            // Profile selection — home restored to `h` now that the
-            // pane-jump no longer steals it. `y` (sYs) replaced the
-            // original `n` so log search can own `n`/Shift+N for
-            // next/previous match in vim/lazygit style.
+            // Profile selection. `s` = sys (mnemonic: System), `h` = home, `a` = all.
             KeyCode::Char('a') => self.profile_sel = ProfileSel::All,
-            KeyCode::Char('y') => self.profile_sel = ProfileSel::System,
+            KeyCode::Char('s') => self.profile_sel = ProfileSel::System,
             KeyCode::Char('h') => self.profile_sel = ProfileSel::Home,
 
-            // Deploy modes — `d` restored to dry-run for the same
-            // reason (details pane is now `i`).
-            KeyCode::Char('s') => self.request_deploy(Mode::Switch),
-            KeyCode::Char('b') => self.request_deploy(Mode::Boot),
-            KeyCode::Char('d') => self.request_deploy(Mode::DryRun),
+            // Deploy modes — Shift versions so the lowercase letters are free
+            // for profile selection above. Boot (Shift+B) is blocked when only
+            // the home-manager profile is selected (home-manager has no boot).
+            KeyCode::Char('S') => self.request_deploy(Mode::Switch),
+            KeyCode::Char('B') => self.request_deploy(Mode::Boot),
+            KeyCode::Char('D') => self.request_deploy(Mode::DryRun),
             KeyCode::Char('x') => self.cancel_deploy(),
 
             // Toggles by direct number key.
@@ -914,37 +1003,44 @@ impl App {
         };
     }
 
-    /// Horizontal pane move — only meaningful in the middle row where
-    /// Hosts / Details / JobLog sit side by side. From Toggles or
-    /// Commands this is a no-op because those panes don't have a
-    /// horizontal sibling. Movement is **clamped** at both ends: from
-    /// JobLog going right is a no-op (not a wrap to Hosts), and from
-    /// Hosts going left is a no-op. The user specifically asked for
-    /// this so a stray Shift+L while reading the job log doesn't
-    /// teleport them back to the host list. Tab/Shift+Tab still wrap
-    /// for cycling.
+    /// Horizontal pane move. With the new two-column layout:
+    ///   Left column:  Hosts (top) | Details (bottom)
+    ///   Right column: JobLog (full height)
+    ///
+    /// Shift+L from Hosts or Details moves to JobLog.
+    /// Shift+H from JobLog moves back to Hosts.
+    /// Clamped at both ends (no wrap) so stray Shift+L at the right
+    /// edge doesn't teleport back to the host list.
     fn pane_move_horizontal(&mut self, delta: i32) {
-        let order = [FocusPane::Hosts, FocusPane::Details, FocusPane::JobLog];
-        let Some(pos) = order.iter().position(|p| *p == self.focus) else {
-            // Not in row 2 — nothing to move to.
-            return;
+        self.focus = match (self.focus, delta) {
+            (FocusPane::Hosts, 1) | (FocusPane::Details, 1) => FocusPane::JobLog,
+            (FocusPane::JobLog, -1) => FocusPane::Hosts,
+            _ => self.focus, // already at edge or not in the middle row
         };
-        let next = (pos as i32 + delta).clamp(0, order.len() as i32 - 1) as usize;
-        self.focus = order[next];
     }
 
-    /// Vertical pane move — jumps between rows: Toggles (row 0) →
-    /// middle row (row 1) → Commands (row 2). Clamped at both ends
-    /// like `pane_move_horizontal` so pressing Shift+J from Commands
-    /// doesn't wrap back to Toggles. When crossing into the middle
-    /// row, lands on Hosts by default.
+    /// Vertical pane move. With the new layout Hosts and Details stack
+    /// vertically in the left column, so Shift+J/K navigate between
+    /// them in addition to crossing the row boundary.
+    ///
+    ///   Shift+J:  Toggles → Hosts → Details → Commands
+    ///             JobLog  → Commands
+    ///   Shift+K:  Commands → JobLog
+    ///             Details  → Hosts → Toggles
+    ///             Hosts    → Toggles
+    ///
+    /// Clamped at the top and bottom edges.
     fn pane_move_vertical(&mut self, delta: i32) {
-        let row = self.focus.row() as i32;
-        let next_row = (row + delta).clamp(0, 2);
-        self.focus = match next_row {
-            0 => FocusPane::Toggles,
-            1 => FocusPane::Hosts,
-            2 => FocusPane::Commands,
+        self.focus = match (self.focus, delta) {
+            // Down
+            (FocusPane::Toggles, 1) => FocusPane::Hosts,
+            (FocusPane::Hosts, 1) => FocusPane::Details,
+            (FocusPane::Details, 1) | (FocusPane::JobLog, 1) => FocusPane::Commands,
+            // Up
+            (FocusPane::Commands, -1) => FocusPane::JobLog,
+            (FocusPane::Details, -1) => FocusPane::Hosts,
+            (FocusPane::Hosts, -1) | (FocusPane::JobLog, -1) => FocusPane::Toggles,
+            // Edges / no-ops
             _ => self.focus,
         };
     }
@@ -954,12 +1050,30 @@ impl App {
         self.toggle_index = ((self.toggle_index as i32 + delta).rem_euclid(len)) as usize;
     }
 
+    /// Returns `true` if the command at `idx` in `COMMANDS` should be
+    /// rendered and reachable given the current app state.
+    pub fn command_is_visible(&self, idx: usize) -> bool {
+        match COMMANDS.get(idx).map(|(c, _, _)| c) {
+            Some(Command::Boot) => self.profile_sel != ProfileSel::Home,
+            _ => true,
+        }
+    }
+
     fn move_command_index(&mut self, delta: i32) {
         if COMMANDS.is_empty() {
             return;
         }
         let len = COMMANDS.len() as i32;
-        self.command_index = ((self.command_index as i32 + delta).rem_euclid(len)) as usize;
+        let mut next = ((self.command_index as i32 + delta).rem_euclid(len)) as usize;
+        // Skip invisible commands (e.g. Boot when home-only). Guard against
+        // infinite loop in case all commands somehow become invisible.
+        for _ in 0..COMMANDS.len() {
+            if self.command_is_visible(next) {
+                break;
+            }
+            next = ((next as i32 + delta.signum()).rem_euclid(len)) as usize;
+        }
+        self.command_index = next;
     }
 
     /// Flip the toggle at `idx`. `idx` is expected to be `0..TOGGLE_COUNT`
@@ -1254,6 +1368,20 @@ impl App {
         }
     }
 
+    fn handle_key_confirm_quit(&mut self, key: KeyEvent, deploy_running: bool) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.should_quit = true;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.input = InputMode::Normal;
+            }
+            _ => {
+                self.input = InputMode::ConfirmQuit { deploy_running };
+            }
+        }
+    }
+
     /// Handle a keystroke while the user is typing a `/` search query
     /// for one of the log panes. Enter commits, Esc cancels (clearing
     /// any prior committed search), Backspace edits, every other
@@ -1281,14 +1409,7 @@ impl App {
                 self.log_search = Some(trimmed);
                 self.log_search_target = Some(target);
                 // Jump to the first match nearest the tail (newest).
-                // `0` here means "stay at current position then walk
-                // toward newer entries until a hit", which is the
-                // friendlier default than dumping the cursor at line 1.
                 match target {
-                    SearchTarget::DetailsLog => {
-                        self.log_scroll = 0;
-                        self.search_log_jump_initial();
-                    }
                     SearchTarget::JobLog => {
                         self.job_log_scroll = 0;
                         self.search_job_log_jump_initial();
@@ -1351,15 +1472,6 @@ impl App {
         }
     }
 
-    /// Snap the details log scroll to the next/previous entry whose
-    /// text contains the active search query. `direction = 1` advances
-    /// toward newer lines (smaller scroll value, closer to the tail);
-    /// `direction = -1` walks toward older lines (larger scroll). The
-    /// log buffer order is oldest→newest so newer = higher index.
-    fn search_log_jump(&mut self, direction: i32) {
-        self.advance_match(SearchTarget::DetailsLog, direction);
-    }
-
     fn search_job_log_jump(&mut self, direction: i32) {
         self.advance_match(SearchTarget::JobLog, direction);
     }
@@ -1367,15 +1479,6 @@ impl App {
     /// First-jump variant: set the active match to the last occurrence
     /// (nearest the tail) and scroll to it. Used right after commit so
     /// the cursor lands on something visible.
-    fn search_log_jump_initial(&mut self) {
-        let Some(query) = self.log_search.as_ref() else {
-            return;
-        };
-        let total = self.count_all_matches(SearchTarget::DetailsLog, query);
-        self.log_search_match_idx = total;
-        self.scroll_to_match(SearchTarget::DetailsLog);
-    }
-
     fn search_job_log_jump_initial(&mut self) {
         let Some(query) = self.log_search.as_ref() else {
             return;
@@ -1417,7 +1520,6 @@ impl App {
             return;
         };
         let filtered = match target {
-            SearchTarget::DetailsLog => self.filtered_log_indices_for_details(),
             SearchTarget::JobLog => self.filtered_log_indices_for_job_log(),
         };
         if filtered.is_empty() {
@@ -1432,7 +1534,6 @@ impl App {
                 // scroll == 0 ↔ tail, scroll == len-1 ↔ top.
                 let scroll = filtered.len().saturating_sub(1).saturating_sub(i);
                 match target {
-                    SearchTarget::DetailsLog => self.log_scroll = scroll,
                     SearchTarget::JobLog => self.job_log_scroll = scroll,
                 }
                 return;
@@ -1467,7 +1568,6 @@ impl App {
     /// Total number of individual query occurrences in the targeted pane.
     fn count_all_matches(&self, target: SearchTarget, query: &str) -> usize {
         let filtered = match target {
-            SearchTarget::DetailsLog => self.filtered_log_indices_for_details(),
             SearchTarget::JobLog => self.filtered_log_indices_for_job_log(),
         };
         let mut total = 0usize;
@@ -1477,29 +1577,28 @@ impl App {
         total
     }
 
-    /// Indices into `self.log` that the details pane currently shows
-    /// for the highlighted host. Mirrors the filter inside `draw_log`
-    /// in `ui.rs` so search and rendering agree.
-    fn filtered_log_indices_for_details(&self) -> Vec<usize> {
-        let selected = self.selected_node().map(|n| n.name.as_str());
-        self.log
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| match (e.host.as_deref(), selected) {
-                (None, _) => Some(i),
-                (Some(h), Some(sel)) if h == sel => Some(i),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Indices into `self.log` that the job-log pane currently shows.
-    /// Mirrors the filter inside `draw_job_log` in `ui.rs`.
+    /// Mirrors the filter inside `draw_job_log` in `ui.rs`: shows only
+    /// entries for the marked hosts (or the selected host when no marks
+    /// are set).
     fn filtered_log_indices_for_job_log(&self) -> Vec<usize> {
+        let active: std::collections::HashSet<&str> = if self.marked.is_empty() {
+            self.selected_node()
+                .map(|n| n.name.as_str())
+                .into_iter()
+                .collect()
+        } else {
+            self.marked.iter().map(|s| s.as_str()).collect()
+        };
         self.log
             .iter()
             .enumerate()
-            .filter_map(|(i, e)| e.host.as_ref().map(|_| i))
+            .filter_map(|(i, e)| {
+                e.host
+                    .as_deref()
+                    .filter(|h| active.contains(*h))
+                    .map(|_| i)
+            })
             .collect()
     }
 
@@ -1555,27 +1654,144 @@ impl App {
         self.selected = next as usize;
     }
 
-    /// Scroll the log buffer. Positive `delta` scrolls UP (older lines),
-    /// negative scrolls DOWN (towards the tail). `log_scroll == 0` is
-    /// auto-tail. We saturate at the bottom; the upper bound is enforced
-    /// by `draw_log` against the actual rendered height so the scroll
-    /// position can never reveal a blank pane.
-    fn scroll_log(&mut self, delta: i32) {
-        let cur = self.log_scroll as i32;
-        let next = (cur + delta).max(0) as usize;
-        // Hard cap so we don't scroll past the start of the buffer.
-        // The render layer also clamps against the visible height.
-        self.log_scroll = next.min(self.log.len().saturating_sub(1));
-    }
-
-    /// Same contract as [`scroll_log`] but for the job log pane. The
-    /// job log only shows tagged (deploy-originated) entries, so we
-    /// clamp against that filtered count.
+        /// Same contract as [`scroll_log`] but for the job log pane. The
+    /// job log only shows the active host set's entries, so we clamp
+    /// against that filtered count.
     fn scroll_job_log(&mut self, delta: i32) {
         let cur = self.job_log_scroll as i32;
         let next = (cur + delta).max(0) as usize;
-        let tagged = self.log.iter().filter(|e| e.host.is_some()).count();
-        self.job_log_scroll = next.min(tagged.saturating_sub(1));
+        let visible = self.filtered_log_indices_for_job_log().len();
+        self.job_log_scroll = next.min(visible.saturating_sub(1));
+    }
+
+    /// Enter visual mode (`v` = char, `V` = line) at the bottom-most visible
+    /// line. Clears any active search so highlight colours don't clash.
+    fn enter_visual_mode(&mut self, mode: VisualMode) {
+        let filtered = self.filtered_log_indices_for_job_log();
+        if filtered.is_empty() {
+            return;
+        }
+        // Start at the bottom visible line (tail minus current scroll offset).
+        let line = filtered
+            .len()
+            .saturating_sub(1)
+            .saturating_sub(self.job_log_scroll);
+        self.visual_sel = Some(VisualSel {
+            mode,
+            anchor: (line, 0),
+            cursor: (line, 0),
+        });
+    }
+
+    /// Move the visual cursor by `line_delta` lines and `col_delta` columns.
+    /// Updates `job_log_scroll` to keep the cursor line visible at the tail
+    /// of the viewport.
+    fn visual_move_cursor(&mut self, line_delta: i32, col_delta: i32) {
+        let filtered = self.filtered_log_indices_for_job_log();
+        if filtered.is_empty() {
+            return;
+        }
+        let sel = match self.visual_sel.take() {
+            Some(s) => s,
+            None => return,
+        };
+        let max_line = filtered.len().saturating_sub(1);
+        let new_line = (sel.cursor.0 as i32 + line_delta)
+            .max(0)
+            .min(max_line as i32) as usize;
+
+        // Clamp col to actual char count of the new line.
+        let new_col = if sel.mode == VisualMode::Char {
+            let log_idx = filtered[new_line];
+            let char_count = self.log[log_idx].text.chars().count();
+            if col_delta != 0 {
+                // Horizontal move — advance/retreat within line.
+                (sel.cursor.1 as i32 + col_delta)
+                    .max(0)
+                    .min(char_count.saturating_sub(1) as i32) as usize
+            } else {
+                // Vertical move — preserve col but clamp to new line length.
+                sel.cursor.1.min(char_count.saturating_sub(1))
+            }
+        } else {
+            0
+        };
+
+        // Vim-style edge scrolling: the view only moves when the cursor
+        // reaches the top or bottom edge of the visible area. This keeps
+        // the context stable while selecting instead of chasing every move.
+        //
+        // Coordinate system: job_log_scroll = lines above the tail.
+        // The viewport shows cursor_from_tail values in [scroll, scroll+vh-1].
+        let cursor_from_tail = filtered.len().saturating_sub(1 + new_line);
+        let vh = self.job_log_viewport_height.max(1);
+        if cursor_from_tail > self.job_log_scroll + vh.saturating_sub(1) {
+            // Cursor moved above the top edge — scroll up to reveal it.
+            self.job_log_scroll = cursor_from_tail.saturating_sub(vh.saturating_sub(1));
+        } else if cursor_from_tail < self.job_log_scroll {
+            // Cursor moved below the bottom edge — scroll down to reveal it.
+            self.job_log_scroll = cursor_from_tail;
+        }
+        // else: cursor is within the viewport, leave scroll unchanged.
+
+        self.visual_sel = Some(VisualSel {
+            cursor: (new_line, new_col),
+            ..sel
+        });
+    }
+
+    /// Copy the visually-selected text to the system clipboard, then exit
+    /// visual mode. Tries `wl-copy`, `xclip`, `xsel`, and `pbcopy` in order.
+    fn yank_visual(&mut self) {
+        let filtered = self.filtered_log_indices_for_job_log();
+        let sel = match self.visual_sel.take() {
+            Some(s) => s,
+            None => return,
+        };
+        let ((start_line, start_col), (end_line, end_col)) = sel.normalized();
+        let start_line = start_line.min(filtered.len().saturating_sub(1));
+        let end_line = end_line.min(filtered.len().saturating_sub(1));
+        let total = end_line - start_line + 1;
+
+        let mut text = String::new();
+        for (i, &log_idx) in filtered[start_line..=end_line].iter().enumerate() {
+            let line_text = &self.log[log_idx].text;
+            match sel.mode {
+                VisualMode::Line => {
+                    text.push_str(line_text);
+                    text.push('\n');
+                }
+                VisualMode::Char => {
+                    let chars: Vec<char> = line_text.chars().collect();
+                    let (s, e) = if total == 1 {
+                        (start_col.min(chars.len()), (end_col + 1).min(chars.len()))
+                    } else if i == 0 {
+                        (start_col.min(chars.len()), chars.len())
+                    } else if i == total - 1 {
+                        (0, (end_col + 1).min(chars.len()))
+                    } else {
+                        (0, chars.len())
+                    };
+                    text.push_str(&chars[s..e].iter().collect::<String>());
+                    if i < total - 1 {
+                        text.push('\n');
+                    }
+                }
+            }
+        }
+
+        if yank_to_clipboard(&text) {
+            self.push_log(
+                format!("→ yanked {} line{} to clipboard", total, if total == 1 { "" } else { "s" })
+                    .as_str(),
+                false,
+            );
+        } else {
+            self.push_log(
+                "→ yank: no clipboard tool found (install wl-copy, xclip, or xsel)",
+                false,
+            );
+        }
     }
 
     /// Vim-style "gg": jump to the top of whatever the focused pane
@@ -1593,13 +1809,11 @@ impl App {
                 }
             }
             FocusPane::Details => {
-                // Hard cap is `log.len() - 1`; renderer clamps against
-                // the visible height on top of that.
-                self.log_scroll = self.log.len().saturating_sub(1);
+                // Details no longer has a scrollable log; treat as no-op.
             }
             FocusPane::JobLog => {
-                let tagged = self.log.iter().filter(|e| e.host.is_some()).count();
-                self.job_log_scroll = tagged.saturating_sub(1);
+                let visible = self.filtered_log_indices_for_job_log().len();
+                self.job_log_scroll = visible.saturating_sub(1);
             }
             FocusPane::Toggles => self.toggle_index = 0,
             FocusPane::Commands => self.command_index = 0,
@@ -1610,8 +1824,12 @@ impl App {
     /// tail (offset 0). The Details and Job Log panes both maintain
     /// their own offset; outside those panes this is a no-op.
     fn snap_to_tail(&mut self) {
+        // Don't snap while the user is actively selecting — it would yank the
+        // cursor to the tail and destroy their in-progress selection.
+        if self.visual_sel.is_some() {
+            return;
+        }
         match self.focus {
-            FocusPane::Details => self.log_scroll = 0,
             FocusPane::JobLog => self.job_log_scroll = 0,
             _ => {}
         }
@@ -1655,7 +1873,17 @@ impl App {
             });
             self.track_probe(handle);
         }
-        self.push_log("→ refreshing reachability", false);
+        // Re-discover nodes from the flake so any newly-added hosts
+        // appear in the list without restarting the TUI.
+        let flake_path = self.flake.clone();
+        let tx = self.status_tx.clone();
+        let handle = tokio::spawn(async move {
+            if let Ok(nodes) = crate::flake::discover(&flake_path).await {
+                let _ = tx.send(StatusUpdate::FlakeDiscover(nodes)).await;
+            }
+        });
+        self.track_probe(handle);
+        self.push_log("→ refreshing nodes and reachability", false);
     }
 
     /// Park a freshly-spawned probe task so it can be aborted later
@@ -1947,6 +2175,21 @@ impl App {
                     entry.last_online = Some(std::time::SystemTime::now());
                 }
             }
+            StatusUpdate::FlakeDiscover(new_nodes) => {
+                // Merge newly discovered nodes into the running list.
+                // Nodes already present keep all their accumulated
+                // status (reachability, update checks, extras) — we
+                // only append nodes that weren't known before.
+                for node in new_nodes {
+                    if !self.nodes.iter().any(|n| n.name == node.name) {
+                        self.push_log(
+                            &format!("→ new node discovered: {}", node.name),
+                            false,
+                        );
+                        self.nodes.push(node);
+                    }
+                }
+            }
             StatusUpdate::UpdateProbe {
                 node,
                 profile,
@@ -1954,6 +2197,7 @@ impl App {
             } => {
                 let entry = self.status.entry(node).or_default();
                 let state = match &result {
+                    Ok(c) if c.not_deployed => UpdateState::NotDeployed,
                     Ok(c) if c.up_to_date => UpdateState::UpToDate,
                     Ok(_) => UpdateState::NeedsUpdate,
                     Err(e) => {
@@ -1973,6 +2217,16 @@ impl App {
                 };
                 if let Some(ex) = extra {
                     match &result {
+                        Ok(c) if c.not_deployed => {
+                            // No remote path exists yet — clear everything
+                            // so we don't show stale data from a previous probe.
+                            ex.local_path = None;
+                            ex.remote_path = None;
+                            ex.activation_time = None;
+                            ex.local_size = None;
+                            ex.remote_size = None;
+                            ex.pkg_diff = None;
+                        }
                         Ok(c) => {
                             ex.local_path = Some(c.local_path.clone());
                             ex.remote_path = Some(c.remote_path.clone());
@@ -2103,6 +2357,11 @@ impl App {
             self.push_log("! a deploy is already running — press x to cancel", true);
             return;
         }
+        // Boot is not supported by home-manager; block it when only home is targeted.
+        if mode == Mode::Boot && self.profile_sel == ProfileSel::Home {
+            self.push_log("! boot is not supported for the home-manager profile", true);
+            return;
+        }
         let hosts: Vec<String> = if self.marked.is_empty() {
             match self.selected_node().map(|n| n.name.clone()) {
                 Some(name) => vec![name],
@@ -2143,6 +2402,7 @@ impl App {
         self.last_deploy = None;
         self.log_scroll = 0;
         self.job_log_scroll = 0;
+        self.visual_sel = None;
         self.start_next_in_queue();
     }
 
@@ -2516,6 +2776,37 @@ fn describe_profile(p: ProfileSel) -> &'static str {
     }
 }
 
+/// Try to write `text` to the system clipboard. Attempts `wl-copy` (Wayland),
+/// then `xclip`, then `xsel` (X11), then `pbcopy` (macOS). Returns `true` if
+/// any tool succeeded.
+fn yank_to_clipboard(text: &str) -> bool {
+    use std::io::Write as _;
+    let candidates: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("pbcopy", &[]),
+    ];
+    for &(cmd, args) in candidates {
+        let Ok(mut child) = std::process::Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if child.wait().map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2684,18 +2975,27 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_ctrl_c_quits() {
+    fn handle_key_ctrl_c_shows_confirm_then_quits() {
         let mut app = App::new(".".into(), sample_nodes());
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_key(key);
+        assert!(!app.should_quit);
+        assert!(matches!(app.input, InputMode::ConfirmQuit { .. }));
+        // Second Ctrl-C confirms immediately.
         app.handle_key(key);
         assert!(app.should_quit);
     }
 
     #[test]
-    fn handle_key_q_quits() {
+    fn handle_key_q_shows_confirm_then_quits() {
         let mut app = App::new(".".into(), sample_nodes());
         let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         app.handle_key(key);
+        assert!(!app.should_quit);
+        assert!(matches!(app.input, InputMode::ConfirmQuit { .. }));
+        // Pressing 'y' confirms.
+        let confirm = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        app.handle_key(confirm);
         assert!(app.should_quit);
     }
 
@@ -2733,7 +3033,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert_eq!(app.profile_sel, ProfileSel::All);
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.profile_sel, ProfileSel::System);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
@@ -2772,5 +3072,58 @@ mod tests {
     fn input_mode_starts_normal() {
         let app = App::new(".".into(), sample_nodes());
         assert!(matches!(app.input, InputMode::Normal));
+    }
+
+    #[test]
+    fn quit_confirm_n_cancels() {
+        let mut app = App::new(".".into(), sample_nodes());
+        // q opens the dialog.
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(matches!(app.input, InputMode::ConfirmQuit { .. }));
+        // n cancels.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert!(matches!(app.input, InputMode::Normal));
+    }
+
+    #[test]
+    fn quit_confirm_esc_cancels() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(matches!(app.input, InputMode::ConfirmQuit { .. }));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert!(matches!(app.input, InputMode::Normal));
+    }
+
+    #[test]
+    fn search_n_works_from_hosts_pane() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.focus = FocusPane::Hosts;
+        // Add a log entry with the search term so advance_match has
+        // something to work with.
+        app.push_log_tagged("hello test world", false, Some("alpha".to_string()));
+        app.push_log_tagged("another test line", false, Some("alpha".to_string()));
+        app.log_search = Some("test".to_string());
+        app.log_search_target = Some(SearchTarget::JobLog);
+        app.log_search_match_idx = 1;
+
+        // n from the Hosts pane should advance the match index.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(app.log_search_match_idx, 2);
+        // Focus should remain on Hosts — the key was handled globally,
+        // not by the Hosts pane's own key handler.
+        assert_eq!(app.focus, FocusPane::Hosts);
+    }
+
+    #[test]
+    fn esc_clears_search_from_any_pane() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.focus = FocusPane::Hosts;
+        app.log_search = Some("needle".to_string());
+        app.log_search_target = Some(SearchTarget::JobLog);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.log_search.is_none());
     }
 }

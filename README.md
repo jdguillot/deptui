@@ -92,8 +92,8 @@ Optional flags:
 | key            | action                                                       |
 | -------------- | ------------------------------------------------------------ |
 | `?`            | open the in-app help popup (full reference)                  |
-| `q` / `Esc`    | quit (Esc also clears active search)                         |
-| `Ctrl-C`       | quit (also cancels any running deploy)                       |
+| `q` / `Ctrl-C` | quit (shows confirmation; warns if deploy is running)        |
+| `Esc`          | clear active search, visual selection, or cancel modal       |
 | `j` / `k`      | move selection / scroll log                                  |
 | `g` / `G`      | jump to top / snap to tail                                   |
 | `Space`        | mark/unmark host for batch operations                        |
@@ -105,8 +105,8 @@ Optional flags:
 | `a` / `y` / `h` | target all profiles / system (sYs) / home (home-manager)   |
 | `s` / `b` / `d` | deploy: switch now / boot entry / dry run                  |
 | `x`            | cancel the running deploy                                    |
-| `/`            | search the focused log pane                                  |
-| `n` / `N`      | next / previous search match                                 |
+| `/`            | search the job log (works from any pane)                     |
+| `n` / `N`      | next / previous search match (works from any pane)           |
 | `1`–`5`        | toggle deploy-rs flags (see below)                           |
 | `o`            | open the SSH overrides menu for the selected host            |
 
@@ -180,6 +180,7 @@ re-run or after a successful deploy.
 | `sys:?`     | not yet checked                                      |
 | `sys:✓`     | host already runs the latest build                   |
 | `sys:↑`     | host is behind — deploy would change something       |
+| `sys:—`     | profile has never been deployed on this host         |
 | `sys:!`     | check failed (host unreachable, eval error, …)       |
 | `sys:-`     | this profile is not defined for this host            |
 | `sys:⠋`     | check in flight (animated braille spinner)           |

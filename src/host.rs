@@ -39,6 +39,10 @@ pub enum UpdateState {
     Unknown,
     UpToDate,
     NeedsUpdate,
+    /// The profile symlink is absent — the host has never had this profile
+    /// deployed to it. Shown as a distinct badge rather than an error so
+    /// the user can tell "never deployed" from "probe failed".
+    NotDeployed,
     /// We tried to check but the comparison failed (host unreachable, eval
     /// error, etc.). The string is rendered in the details pane.
     Error,
@@ -76,6 +80,11 @@ pub struct HostStatus {
 #[derive(Debug, Clone)]
 pub struct ProfileCheck {
     pub up_to_date: bool,
+    /// True when the remote profile symlink is absent — the host has never
+    /// had this profile deployed. Implies `up_to_date = false` and an
+    /// empty `remote_path`. Callers should surface this as
+    /// `UpdateState::NotDeployed` rather than `NeedsUpdate`.
+    pub not_deployed: bool,
     pub local_path: String,
     pub remote_path: String,
     pub activation_time: Option<SystemTime>,
@@ -205,11 +214,12 @@ pub async fn check_profile_up_to_date(
     let remote_cmd = match profile {
         "system" => "readlink -f /run/current-system && stat -c %Y /run/current-system".to_string(),
         "home" => {
-            // Try the modern home-manager symlink first; fall back to
-            // the legacy ~/.nix-profile. We pick whichever exists,
-            // emit its resolved path, then stat the symlink we picked
-            // so the activation time matches the path we reported.
-            r#"if [ -L ~/.local/state/nix/profiles/home-manager ]; then link=~/.local/state/nix/profiles/home-manager; else link=~/.nix-profile; fi; readlink -f "$link" && stat -c %Y "$link""#.to_string()
+            // Try the modern home-manager symlink first; fall back to the
+            // legacy ~/.nix-profile. If neither symlink exists the host has
+            // never had a home-manager deployment — emit a sentinel token
+            // and exit 0 so we can distinguish "not deployed yet" from a
+            // real SSH failure.
+            r#"if [ -L ~/.local/state/nix/profiles/home-manager ]; then link=~/.local/state/nix/profiles/home-manager; elif [ -L ~/.nix-profile ]; then link=~/.nix-profile; else printf 'NOT_DEPLOYED\n'; exit 0; fi; readlink -f "$link" && stat -c %Y "$link""#.to_string()
         }
         other => return Err(anyhow!("unknown profile `{other}`")),
     };
@@ -217,23 +227,37 @@ pub async fn check_profile_up_to_date(
     let target = build_ssh_target(node, profile, override_);
     let remote = ssh_capture(&target, &remote_cmd, override_).await?;
 
+    let local_trimmed = local.trim().to_string();
+
     // First line is the resolved store path; second line is the mtime
     // (seconds since epoch) of the symlink on the remote. Missing
     // second line just means we couldn't stat — not fatal.
     //
+    // Special case: the home-profile script emits "NOT_DEPLOYED" when
+    // neither the modern nor the legacy home-manager symlink exists.
+    // Return a distinct result so the caller can surface it as
+    // UpdateState::NotDeployed rather than treating it as NeedsUpdate.
+    let mut lines = remote.lines();
+    let first_line = lines.next().unwrap_or("").trim();
+    if first_line == "NOT_DEPLOYED" {
+        return Ok(ProfileCheck {
+            up_to_date: false,
+            not_deployed: true,
+            local_path: local_trimmed,
+            remote_path: String::new(),
+            activation_time: None,
+        });
+    }
+    let remote_path = first_line.to_string();
     // Defensive: drop suspiciously small values. Anything before
     // 2010 (mtime < 1262304000) is almost certainly a Nix-frozen
     // mtime and not a real activation time, so we hide it rather
     // than render "56 years ago".
-    let mut lines = remote.lines();
-    let remote_path = lines.next().unwrap_or("").trim().to_string();
     let activation_time = lines
         .next()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 1_262_304_000)
         .map(|secs| std::time::UNIX_EPOCH + Duration::from_secs(secs));
-
-    let local_trimmed = local.trim().to_string();
 
     // `local_trimmed` is the deploy-rs activation *wrapper* path — its
     // store hash is distinct from the toplevel that
@@ -257,6 +281,7 @@ pub async fn check_profile_up_to_date(
 
     Ok(ProfileCheck {
         up_to_date,
+        not_deployed: false,
         local_path: reported_local,
         remote_path,
         activation_time,

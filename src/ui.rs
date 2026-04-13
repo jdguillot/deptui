@@ -20,7 +20,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::app::{App, FocusPane, InputMode, LastDeploy, OverrideField, COMMANDS, TOGGLE_COUNT};
+use crate::app::{App, FocusPane, InputMode, LastDeploy, OverrideField, VisualMode, COMMANDS, TOGGLE_COUNT};
 use crate::deploy::{Mode, ProfileSel};
 use crate::host::{Reachability, UpdateState};
 
@@ -29,7 +29,8 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 pub fn init() -> Result<Tui> {
     enable_raw_mode().context("enabling raw mode")?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen).context("entering alternate screen")?;
+    execute!(out, EnterAlternateScreen)
+        .context("entering alternate screen")?;
     let backend = CrosstermBackend::new(out);
     let terminal = Terminal::new(backend).context("constructing terminal")?;
     Ok(terminal)
@@ -81,15 +82,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         3
     };
 
-    // Commands row: two-column layout (40/60). Measure info +
-    // commands independently and bump the whole strip if *either*
-    // side overflows its column.
-    let info_col_w = (area.width as usize * 40) / 100;
-    let cmd_col_w = area.width as usize - info_col_w;
-    let info_inner_w = info_col_w.saturating_sub(2);
+    // Commands row: two-column layout (60% commands / 40% info). Measure
+    // each side independently and bump the whole strip if *either* side
+    // overflows its column.
+    let cmd_col_w = (area.width as usize * 60) / 100;
+    let info_col_w = area.width as usize - cmd_col_w;
     let cmd_inner_w = cmd_col_w.saturating_sub(2);
+    let info_inner_w = info_col_w.saturating_sub(2);
     let info_content_w = info_content_width(app);
-    let cmd_content_w = commands_content_width();
+    let cmd_content_w = commands_content_width(app);
     let commands_height: u16 = if info_content_w > info_inner_w || cmd_content_w > cmd_inner_w {
         4
     } else {
@@ -138,6 +139,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } = &app.input
     {
         draw_confirm_popup(frame, area, hosts, *mode, *profile);
+    }
+    if let InputMode::ConfirmQuit { deploy_running } = &app.input {
+        draw_confirm_quit_popup(frame, area, *deploy_running);
     }
 }
 
@@ -201,25 +205,55 @@ fn deploy_outcome_chip(last: &LastDeploy) -> Span<'static> {
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
-    // Three-column layout. The job log lives permanently in the right
-    // column because that's where the actual deploy-rs stdout ends up
-    // and it's the thing the user watches during a run — so it gets
-    // the most horizontal space. Hosts and details stay narrower.
+    // Two-column layout: left = hosts (top) + details (bottom) stacked;
+    // right = job log (full height). The job log gets the majority of
+    // horizontal space since it's what the user watches during a run.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(22),
-            Constraint::Percentage(28),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(area);
-    draw_host_list(frame, cols[0], app);
-    // Details and job log both need to clamp their scroll offsets
-    // against the rendered visible height, so they take &mut App and
-    // mutate `log_scroll` / `job_log_scroll` in place. Held-key past
-    // the edge can no longer accumulate phantom offset.
-    draw_details(frame, cols[1], app);
-    draw_job_log(frame, cols[2], app);
+
+    // Left column: compute the details height first (node summary rows
+    // + extras + 2 border rows), then give the remainder to hosts.
+    let details_inner_rows = 11u16; // fixed node-summary rows
+    let extras_height = {
+        // Peek at how many extras lines the selected node would render
+        // so we can reserve that space now.
+        use crate::host::UpdateState;
+        let node = app.selected_node();
+        let status = node.map(|n| app.status_for(&n.name));
+        let has_system = node.map(|n| n.has_system()).unwrap_or(false);
+        let has_home = node.map(|n| n.has_home()).unwrap_or(false);
+        let sys_ok = status
+            .as_ref()
+            .map(|s| {
+                s.system_extra.local_path.is_some()
+                    && s.system_update != UpdateState::NotDeployed
+            })
+            .unwrap_or(false);
+        let home_ok = status
+            .as_ref()
+            .map(|s| {
+                s.home_extra.local_path.is_some()
+                    && s.home_update != UpdateState::NotDeployed
+            })
+            .unwrap_or(false);
+        let n = if has_system && sys_ok { 1 } else { 0 }
+            + if has_home && home_ok { 1 } else { 0 };
+        n as u16 * 3 // rough estimate: each profile section is ~3 lines
+    };
+    // border (top+bottom) = 2; summary = 11; extras; minimum hosts = 3
+    let details_total = 2 + details_inner_rows + extras_height;
+    let left_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(details_total)])
+        .split(cols[0]);
+
+    draw_host_list(frame, left_rows[0], app);
+    // Details needs to clamp its scroll offset against the rendered
+    // visible height so we pass &mut App.
+    draw_details(frame, left_rows[1], app);
+    draw_job_log(frame, cols[1], app);
 }
 
 fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
@@ -431,6 +465,7 @@ fn badge(
         let prior = match state {
             UpdateState::UpToDate => Some('✓'),
             UpdateState::NeedsUpdate => Some('↑'),
+            UpdateState::NotDeployed => Some('—'),
             UpdateState::Error => Some('!'),
             UpdateState::Unknown => None,
         };
@@ -443,6 +478,7 @@ fn badge(
     let (icon, color) = match state {
         UpdateState::UpToDate => ("✓", Color::Green),
         UpdateState::NeedsUpdate => ("↑", Color::Yellow),
+        UpdateState::NotDeployed => ("—", Color::Blue),
         UpdateState::Error => ("!", Color::Red),
         UpdateState::Unknown => ("?", Color::DarkGray),
     };
@@ -452,48 +488,24 @@ fn badge(
 fn draw_details(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == FocusPane::Details;
 
-    // Compute inner dimensions first (borders only — title doesn't
-    // affect them) so we can figure out the log area, clamp the
-    // scroll, and *then* build the title with the correct `[↑N]`
-    // chip. Without this ordering the chip would show the pre-clamp
-    // value for one frame before snapping, looking janky.
     let inner = Block::default().borders(Borders::ALL).inner(area);
 
     let extras_lines = build_profile_extras_lines(app);
     let extras_height = extras_lines.len() as u16;
-    let (summary_area, extras_area, log_area) = if extras_height > 0 {
+    let (summary_area, extras_area) = if extras_height > 0 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(11),
-                Constraint::Length(extras_height),
-                Constraint::Min(3),
+                Constraint::Min(0),
             ])
             .split(inner);
-        (rows[0], Some(rows[1]), rows[2])
+        (rows[0], Some(rows[1]))
     } else {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(11), Constraint::Min(3)])
-            .split(inner);
-        (rows[0], None, rows[1])
+        (inner, None)
     };
 
-    // Pre-build filtered log lines and clamp scroll against the
-    // actual log area dimensions.
-    let (log_lines, log_y_offset) = build_log_lines_and_clamp(app, log_area);
-
-    // Title chips now read the already-clamped scroll.
-    let mut title_spans = pane_title_spans("details", 'i', focused);
-    if let (Some(q), Some(crate::app::SearchTarget::DetailsLog)) =
-        (app.log_search.as_ref(), app.log_search_target)
-    {
-        let (cur, total) = app.log_search_stats(crate::app::SearchTarget::DetailsLog);
-        title_spans.push(search_chip(q, cur, total));
-    }
-    if app.log_scroll > 0 {
-        title_spans.push(scroll_chip(app.log_scroll));
-    }
+    let title_spans = pane_title_spans("details", 'i', focused);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -504,14 +516,6 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &mut App) {
     draw_node_summary(frame, summary_area, app);
     if let Some(ea) = extras_area {
         frame.render_widget(Paragraph::new(extras_lines).wrap(Wrap { trim: false }), ea);
-    }
-    if !log_lines.is_empty() {
-        frame.render_widget(
-            Paragraph::new(log_lines)
-                .wrap(Wrap { trim: false })
-                .scroll((log_y_offset, 0)),
-            log_area,
-        );
     }
 }
 
@@ -923,7 +927,26 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = Block::default().borders(Borders::ALL).inner(area);
 
     let width = job_log_prefix_width(app);
-    let tagged: Vec<&crate::app::LogEntry> = app.log.iter().filter(|e| e.host.is_some()).collect();
+    // Show only entries for the active host set: marked nodes if any
+    // are marked, otherwise the currently selected node.
+    let active_hosts: std::collections::HashSet<&str> = if app.marked.is_empty() {
+        app.selected_node()
+            .map(|n| n.name.as_str())
+            .into_iter()
+            .collect()
+    } else {
+        app.marked.iter().map(|s| s.as_str()).collect()
+    };
+    let tagged: Vec<&crate::app::LogEntry> = app
+        .log
+        .iter()
+        .filter(|e| {
+            e.host
+                .as_deref()
+                .map(|h| active_hosts.contains(h))
+                .unwrap_or(false)
+        })
+        .collect();
 
     let query = if matches!(
         app.log_search_target,
@@ -948,11 +971,18 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     let mut match_counter = 0usize;
 
+    // Snapshot visual selection state (if any) for line building below.
+    let visual_range = app.visual_sel.as_ref().map(|sel| {
+        let ((sl, sc), (el, ec)) = sel.normalized();
+        (sel.mode, sl, sc, el, ec)
+    });
+
     // Build every filtered line up-front and clamp scroll before the
     // title reads it.
     let all_lines: Vec<Line> = tagged
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(line_idx, entry)| {
             let host = entry.host.as_deref().unwrap_or("");
             let pad = width.saturating_sub(host.len());
             let color = job_log_color(host);
@@ -962,10 +992,73 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Style::default()
             };
-            let mut spans = vec![Span::styled(
+            let prefix_span = Span::styled(
                 prefix,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )];
+            );
+
+            if let Some((vmode, start_line, start_col, end_line, end_col)) = visual_range {
+                let in_sel = line_idx >= start_line && line_idx <= end_line;
+                if in_sel {
+                    let sel_bg = Style::default().bg(Color::DarkGray);
+                    match vmode {
+                        VisualMode::Line => {
+                            // Whole line highlighted — prefix + body both get bg.
+                            let mut spans = vec![prefix_span.style(
+                                Style::default()
+                                    .fg(color)
+                                    .add_modifier(Modifier::BOLD)
+                                    .bg(Color::DarkGray),
+                            )];
+                            spans.extend(
+                                highlight_match(
+                                    &entry.text,
+                                    query,
+                                    body_style.patch(sel_bg),
+                                    current_match,
+                                    &mut match_counter,
+                                ),
+                            );
+                            return Line::from(spans);
+                        }
+                        VisualMode::Char => {
+                            // Partial selection — split body text at column boundaries.
+                            let chars: Vec<char> = entry.text.chars().collect();
+                            let len = chars.len();
+                            let (s, e) = if start_line == end_line {
+                                // Single-line selection.
+                                (start_col.min(len), (end_col + 1).min(len))
+                            } else if line_idx == start_line {
+                                (start_col.min(len), len)
+                            } else if line_idx == end_line {
+                                (0, (end_col + 1).min(len))
+                            } else {
+                                (0, len)
+                            };
+                            let before: String = chars[..s].iter().collect();
+                            let selected: String = chars[s..e].iter().collect();
+                            let after: String = chars[e..].iter().collect();
+                            let mut spans = vec![prefix_span];
+                            if !before.is_empty() {
+                                spans.push(Span::styled(before, body_style));
+                            }
+                            if !selected.is_empty() {
+                                spans.push(Span::styled(
+                                    selected,
+                                    body_style.patch(sel_bg),
+                                ));
+                            }
+                            if !after.is_empty() {
+                                spans.push(Span::styled(after, body_style));
+                            }
+                            return Line::from(spans);
+                        }
+                    }
+                }
+            }
+
+            // Default path — search highlighting, no visual selection.
+            let mut spans = vec![prefix_span];
             spans.extend(highlight_match(
                 &entry.text,
                 query,
@@ -978,6 +1071,7 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     let visible = inner.height as usize;
+    app.job_log_viewport_height = visible;
     let y_offset = if tagged.is_empty() {
         app.job_log_scroll = 0;
         0
@@ -986,7 +1080,26 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     };
 
     // Now build the title with the already-clamped scroll value.
-    let mut title_spans = pane_title_spans("job log", 'v', focused);
+    let in_visual = app.visual_sel.is_some();
+    let mut title_spans = if in_visual {
+        let mode_label = match app.visual_sel.as_ref().map(|s| s.mode) {
+            Some(VisualMode::Char) => " VISUAL ",
+            _ => " VISUAL LINE ",
+        };
+        vec![
+            Span::raw(" "),
+            Span::styled(
+                mode_label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]
+    } else {
+        pane_title_spans("job log", 'p', focused)
+    };
     if let (Some(q), Some(crate::app::SearchTarget::JobLog)) =
         (app.log_search.as_ref(), app.log_search_target)
     {
@@ -1005,7 +1118,7 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
 
     if tagged.is_empty() {
         let empty = Line::styled(
-            " (no deploy output yet — press s / b / d to start)",
+            " (no deploy output for this host — press s / b / d to start, or mark hosts with Space)",
             Style::default().fg(Color::DarkGray),
         );
         frame.render_widget(Paragraph::new(empty), inner);
@@ -1044,18 +1157,16 @@ fn compute_tail_scroll_offset(
         *scroll = 0;
         return 0;
     }
-    // Per-entry wrapped row counts. Measuring each line on its own
-    // is an approximation for lines that interact via word-wrap
-    // across Text boundaries, but since every filtered entry is its
-    // own `Line` already, the Paragraph won't merge them — the sum
-    // matches what the full paragraph would report.
+    let w = width as usize;
+    // Cheap row-count estimate: use Line::width() instead of
+    // constructing a full Paragraph per line. This is O(n) in span
+    // count rather than O(n * layout-engine) and gives the same
+    // result for non-CJK text (which is all deploy-rs outputs).
     let per_entry_rows: Vec<usize> = all_lines
         .iter()
         .map(|line| {
-            Paragraph::new(vec![line.clone()])
-                .wrap(Wrap { trim: false })
-                .line_count(width)
-                .max(1)
+            let lw = line.width();
+            if lw <= w { 1 } else { (lw + w - 1) / w }
         })
         .collect();
     let total_rows: usize = per_entry_rows.iter().sum();
@@ -1097,63 +1208,6 @@ fn compute_tail_scroll_offset(
 /// Called by `draw_details` *before* the pane title is constructed so
 /// the `[↑N]` chip always shows the post-clamp value and never
 /// flashes a stale number.
-fn build_log_lines_and_clamp(app: &mut App, area: Rect) -> (Vec<Line<'static>>, u16) {
-    let selected_name = app.selected_node().map(|n| n.name.to_string());
-    let filtered: Vec<&crate::app::LogEntry> = app
-        .log
-        .iter()
-        .filter(|e| match (e.host.as_deref(), selected_name.as_deref()) {
-            (None, _) => true,
-            (Some(h), Some(sel)) => h == sel,
-            (Some(_), None) => false,
-        })
-        .collect();
-
-    let query = if matches!(
-        app.log_search_target,
-        Some(crate::app::SearchTarget::DetailsLog)
-    ) {
-        app.log_search.as_deref()
-    } else {
-        None
-    };
-    if filtered.is_empty() {
-        app.log_scroll = 0;
-        return (Vec::new(), 0);
-    }
-    let current_match = if query.is_some() {
-        let (cur, _) = app.log_search_stats(crate::app::SearchTarget::DetailsLog);
-        if cur > 0 {
-            Some(cur)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let mut match_counter = 0usize;
-    let all_lines: Vec<Line> = filtered
-        .iter()
-        .map(|entry| {
-            let style = if entry.is_err {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default()
-            };
-            Line::from(highlight_match(
-                &entry.text,
-                query,
-                style,
-                current_match,
-                &mut match_counter,
-            ))
-        })
-        .collect();
-    let visible = area.height as usize;
-    let y_offset = compute_tail_scroll_offset(&all_lines, &mut app.log_scroll, area.width, visible);
-    (all_lines, y_offset)
-}
-
 /// Highlight every occurrence of `query` in `text`. Non-matching
 /// segments keep `base_style`; matches get a magenta background.
 ///
@@ -1348,32 +1402,32 @@ fn toggle_span(key: &str, label: &str, on: bool, focused: bool) -> Span<'static>
 fn draw_commands_row(frame: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    // Left: informational hints. Never takes focus.
-    let info_block = Block::default().borders(Borders::ALL).title(" info ");
-    let info_inner = info_block.inner(cols[0]);
-    frame.render_widget(info_block, cols[0]);
-    let info_spans = build_info_spans(app);
-    frame.render_widget(
-        Paragraph::new(Line::from(info_spans)).wrap(Wrap { trim: false }),
-        info_inner,
-    );
-
-    // Right: navigable command buttons.
+    // Left: navigable command buttons.
     let focused = app.focus == FocusPane::Commands;
     let cmd_block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_border_style(focused))
         .title(Line::from(pane_title_spans("commands", 'c', focused)));
-    let cmd_inner = cmd_block.inner(cols[1]);
-    frame.render_widget(cmd_block, cols[1]);
+    let cmd_inner = cmd_block.inner(cols[0]);
+    frame.render_widget(cmd_block, cols[0]);
 
     let spans = build_commands_spans(app, focused);
     frame.render_widget(
         Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
         cmd_inner,
+    );
+
+    // Right: informational hints. Never takes focus.
+    let info_block = Block::default().borders(Borders::ALL).title(" info ");
+    let info_inner = info_block.inner(cols[1]);
+    frame.render_widget(info_block, cols[1]);
+    let info_spans = build_info_spans(app);
+    frame.render_widget(
+        Paragraph::new(Line::from(info_spans)).wrap(Wrap { trim: false }),
+        info_inner,
     );
 }
 
@@ -1405,27 +1459,43 @@ fn build_info_spans(app: &App) -> Vec<Span<'static>> {
 /// Pulled out of `build_info_spans` so both the renderer and the
 /// width-measurer walk the exact same list.
 fn info_hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
-    let search_active_here = match (app.focus, app.log_search_target, &app.log_search) {
-        (FocusPane::Details, Some(crate::app::SearchTarget::DetailsLog), Some(_)) => true,
-        (FocusPane::JobLog, Some(crate::app::SearchTarget::JobLog), Some(_)) => true,
-        _ => false,
-    };
+    let search_active_here = matches!(
+        (app.focus, app.log_search_target, &app.log_search),
+        (FocusPane::JobLog, Some(crate::app::SearchTarget::JobLog), Some(_))
+    );
     match app.focus {
         FocusPane::Hosts => vec![
             ("j/k", "move"),
             ("Space", "mark"),
             ("g/G", "top/bottom"),
+            ("/", "search log"),
             ("Tab", "focus"),
             ("?", "help"),
             ("q", "quit"),
         ],
-        FocusPane::Details | FocusPane::JobLog => {
+        FocusPane::Details => vec![
+            ("/", "search log"),
+            ("Tab", "focus"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        FocusPane::JobLog => {
+            if app.visual_sel.is_some() {
+                return vec![
+                    ("j/k", "extend"),
+                    ("h/l", "col (char mode)"),
+                    ("y", "yank to clipboard"),
+                    ("Esc", "cancel"),
+                ];
+            }
             let mut v: Vec<(&'static str, &'static str)> =
                 vec![("j/k", "scroll"), ("g/G", "top/tail"), ("/", "search")];
             if search_active_here {
                 v.push(("n/N", "next/prev"));
                 v.push(("Esc", "clear"));
             }
+            v.push(("V", "line-select"));
+            v.push(("v", "char-select"));
             v.push(("Tab", "focus"));
             v.push(("?", "help"));
             v.push(("q", "quit"));
@@ -1477,25 +1547,34 @@ fn build_commands_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
     };
     let mut spans: Vec<Span> = Vec::with_capacity(COMMANDS.len() * 3 + 1);
     spans.push(Span::raw(" "));
+    let mut first = true;
     for (i, (_cmd, key, label)) in COMMANDS.iter().enumerate() {
-        if i > 0 {
+        if !app.command_is_visible(i) {
+            continue;
+        }
+        if !first {
             spans.push(Span::raw(" "));
         }
+        first = false;
         spans.extend(command_button(key, label, sub == Some(i)));
     }
     spans
 }
 
-/// Rendered width of the commands-button row. `command_button`
-/// always emits `" <key>:<label> "` = 3 fixed chars + key + label,
-/// separated by a single space between buttons, with one leading
-/// space.
-fn commands_content_width() -> usize {
-    let per_button: usize = COMMANDS
+/// Rendered width of the commands-button row, accounting for hidden
+/// commands (e.g. Boot when home-only profile is selected).
+fn commands_content_width(app: &App) -> usize {
+    let visible: Vec<_> = COMMANDS
         .iter()
-        .map(|(_cmd, key, label)| 3 + key.len() + label.len())
+        .enumerate()
+        .filter(|(i, _)| app.command_is_visible(*i))
+        .map(|(_, (_, key, label))| (key, label))
+        .collect();
+    let per_button: usize = visible
+        .iter()
+        .map(|(key, label)| 3 + key.len() + label.len())
         .sum();
-    let separators = COMMANDS.len().saturating_sub(1); // 1-char spaces
+    let separators = visible.len().saturating_sub(1);
     1 + per_button + separators
 }
 
@@ -1623,7 +1702,6 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         InputMode::SearchLog { target, buf } => {
             let label = match target {
-                crate::app::SearchTarget::DetailsLog => " /search details ▸ ",
                 crate::app::SearchTarget::JobLog => " /search job log ▸ ",
             };
             Line::from(vec![
@@ -1660,6 +1738,24 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" commit  "),
             Span::styled("Esc", Style::default().fg(Color::Yellow)),
             Span::raw(" clear"),
+        ]),
+        InputMode::ConfirmQuit { .. } => Line::from(vec![
+            Span::styled(
+                " quit? ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("y", Style::default().fg(Color::Yellow)),
+            Span::raw(" / "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(" confirm  "),
+            Span::styled("n", Style::default().fg(Color::Yellow)),
+            Span::raw(" / "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(" cancel"),
         ]),
         // Normal mode has nothing extra to say — the commands row
         // above already surfaces every hint.
@@ -1703,13 +1799,13 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         section("navigation"),
         key_line("↑/↓ j/k", "within pane: hosts = selection, details/joblog = scroll"),
         key_line("←/→ h/l", "toggles/commands = sub-cursor (vim-style hjkl)"),
-        key_line("Shift+H/L", "horizontal pane move (hosts ↔ details ↔ job log)"),
+        key_line("Shift+H/L", "horizontal pane move (hosts/details ↔ job log)"),
         key_line("Shift+←/→", "same as Shift+H/L"),
-        key_line("Shift+J/K", "vertical pane move (toggles ↔ middle ↔ commands)"),
+        key_line("Shift+J/K", "vertical pane move (toggles ↔ hosts ↔ details / job log ↔ commands)"),
         key_line("Shift+↑/↓", "same as Shift+J/K"),
         key_line("Tab", "cycle focus forward (toggles → hosts → details → joblog → commands)"),
         key_line("Shift+Tab", "cycle focus backward"),
-        key_line("f/i/v/t/c", "btop-style jump: (f)ocus hosts, (i)nfo details, (v)iew job log, (t)oggles, (c)ommands"),
+        key_line("f/i/p/t/c", "btop-style jump: (f)ocus hosts, (i)nfo details, (p)ipeline log, (t)oggles, (c)ommands"),
         key_line("Enter", "activate the focused toggle or command button"),
         key_line(
             "g",
@@ -1723,20 +1819,27 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         section("search"),
         key_line(
             "/",
-            "open the search prompt (details/job log = match nav, help popup = filter)",
+            "open job-log search from any pane (n/Shift+N navigate matches after commit)",
         ),
         key_line(
             "n / Shift+N",
-            "next / previous match in the focused log pane (after committing /)",
+            "next / previous match in the job log (after committing /)",
         ),
         key_line(
             "Esc",
-            "in log pane: clear the committed search. While typing: abort the prompt.",
+            "in job log: clear the committed search. While typing: abort the prompt.",
         ),
         Line::raw(""),
 
+        section("visual selection (job log)"),
+        key_line("V", "enter visual line mode — select whole lines with j/k"),
+        key_line("v", "enter visual char mode — select by character with j/k/h/l"),
+        key_line("y", "yank selected text to clipboard (wl-copy / xclip / xsel / pbcopy)"),
+        key_line("Esc", "cancel visual selection without copying"),
+        Line::raw(""),
+
         section("status"),
-        key_line("r", "refresh online/offline (TCP-22 probe) for every host"),
+        key_line("r", "refresh nodes from flake.nix + online/offline (TCP-22 probe) for every host"),
         key_line(
             "u",
             "check selected host (cheap tier: paths, activation time)",
@@ -1746,22 +1849,22 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
             "closure size delta + package diff (needs prior u)",
         ),
         Line::from(Span::styled(
-            "              badges: ✓ up-to-date   ↑ behind   ! error   ? unchecked   - n/a   ⠋ checking",
+            "              badges: ✓ up-to-date   ↑ behind   — not deployed   ! error   ? unchecked   - n/a   ⠋ checking",
             dim,
         )),
         Line::raw(""),
 
         section("deploy"),
         key_line(
-            "a / y / h",
-            "target all profiles / system (NixOS, sYs) / home (home-manager)",
+            "a / s / h",
+            "target all profiles / system (NixOS) / home (home-manager)",
         ),
-        key_line("s", "switch — apply now (asks for confirmation)"),
+        key_line("Shift+S", "switch — apply now (asks for confirmation)"),
         key_line(
-            "b",
-            "boot — install as next boot entry, don't activate now (asks for confirmation)",
+            "Shift+B",
+            "boot — install as next boot entry, don't activate now (not available for home-only)",
         ),
-        key_line("d", "dry-run — `deploy --dry-activate`, build + diff only"),
+        key_line("Shift+D", "dry-run — `deploy --dry-activate`, build + diff only"),
         key_line("x", "cancel running deploy AND drop any queued hosts (SIGKILL the child)"),
         Line::raw(""),
 
@@ -2029,6 +2132,64 @@ fn draw_confirm_popup(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  confirm    "),
+        Span::styled(
+            " n / Esc ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  cancel"),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_confirm_quit_popup(frame: &mut Frame, area: Rect, deploy_running: bool) {
+    let popup = centered_rect(40, 30, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(Span::styled(
+            " confirm quit ",
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw(""));
+    if deploy_running {
+        lines.push(Line::from(vec![
+            Span::styled("  ⚠ ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "A deploy is currently running!",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "    It will be killed if you quit.",
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::raw("  Are you sure you want to quit?"));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  y / Enter ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  quit    "),
         Span::styled(
             " n / Esc ",
             Style::default()
