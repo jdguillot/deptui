@@ -9,6 +9,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
+use deptui::askpass::AskpassEnv;
 use deptui::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
 use deptui::ssh::SshOverride;
 use serial_test::serial;
@@ -46,6 +47,10 @@ fn basic_request() -> DeployRequest {
         mode: Mode::Switch,
         toggles: Toggles::default(),
         ssh_override: SshOverride::default(),
+        askpass: AskpassEnv {
+            script_path: "/dev/null".into(),
+            socket_path: "/dev/null".into(),
+        },
     }
 }
 
@@ -59,7 +64,7 @@ echo "done"
 exit 0"#,
     );
 
-    let handle = deploy::run(basic_request());
+    let handle = deploy::run(basic_request(), None);
     let lines = collect_lines(handle).await;
 
     // Should have at least stdout lines + an Exit(0).
@@ -97,7 +102,7 @@ async fn failed_deploy_reports_exit_code() {
 exit 42"#,
     );
 
-    let handle = deploy::run(basic_request());
+    let handle = deploy::run(basic_request(), None);
     let lines = collect_lines(handle).await;
 
     let exit = lines.iter().find_map(|l| match l {
@@ -118,7 +123,7 @@ exit 0"#,
 
     let mut req = basic_request();
     req.mode = Mode::Boot;
-    let handle = deploy::run(req);
+    let handle = deploy::run(req, None);
     let lines = collect_lines(handle).await;
 
     let all_stdout: String = lines
@@ -142,7 +147,7 @@ exit 0"#,
 
     let mut req = basic_request();
     req.mode = Mode::DryRun;
-    let handle = deploy::run(req);
+    let handle = deploy::run(req, None);
     let lines = collect_lines(handle).await;
 
     let all_stdout: String = lines
@@ -173,7 +178,7 @@ exit 0"#,
     req.toggles.auto_rollback = false; // differs from default → emit
     req.toggles.remote_build = true;
 
-    let handle = deploy::run(req);
+    let handle = deploy::run(req, None);
     let lines = collect_lines(handle).await;
 
     let all_stdout: String = lines
@@ -215,7 +220,7 @@ exit 0"#,
         extra_opts: Some("Port=2222".into()),
     };
 
-    let handle = deploy::run(req);
+    let handle = deploy::run(req, None);
     let lines = collect_lines(handle).await;
 
     let all_stdout: String = lines
@@ -241,7 +246,7 @@ async fn ansi_stripped_from_output() {
 exit 0"#,
     );
 
-    let handle = deploy::run(basic_request());
+    let handle = deploy::run(basic_request(), None);
     let lines = collect_lines(handle).await;
 
     let stdout: Vec<_> = lines
@@ -274,7 +279,7 @@ exit 0"#,
 
     let mut req = basic_request();
     req.profile = ProfileSel::System;
-    let handle = deploy::run(req);
+    let handle = deploy::run(req, None);
     let lines = collect_lines(handle).await;
 
     let all_stdout: String = lines

@@ -20,7 +20,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::app::{App, FocusPane, InputMode, LastDeploy, OverrideField, VisualMode, COMMANDS, TOGGLE_COUNT};
+use crate::app::{App, FocusPane, InputMode, LastDeploy, OverrideField, PromptSource, VisualMode, COMMANDS, TOGGLE_COUNT};
 use crate::deploy::{Mode, ProfileSel};
 use crate::host::{Reachability, UpdateState};
 
@@ -142,6 +142,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let InputMode::ConfirmQuit { deploy_running } = &app.input {
         draw_confirm_quit_popup(frame, area, *deploy_running);
+    }
+    if let InputMode::PasswordPrompt {
+        prompt,
+        buf,
+        source,
+    } = &app.input
+    {
+        draw_password_popup(frame, area, prompt, buf, source);
     }
 }
 
@@ -1760,42 +1768,7 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
         // Normal mode has nothing extra to say — the commands row
         // above already surfaces every hint.
         InputMode::Normal => Line::raw(""),
-        InputMode::SudoPrompt { prompt, buf } => {
-            // Render the prompt label and the typed password as bullet
-            // characters (never show plaintext). The prompt itself is
-            // trimmed to a short label so it fits in the single-row strip.
-            // chars().count() is intentional: passwords are typically ≤ 100
-            // characters so the O(n) scan is negligible and it correctly
-            // handles multi-byte Unicode code points.
-            let masked: String = "•".repeat(buf.chars().count());
-            let label = {
-                let p = prompt.trim_end_matches(|c: char| c == ' ');
-                // Ensure the label ends with a colon + space for readability.
-                if p.ends_with(':') {
-                    format!("{p} ")
-                } else {
-                    format!("{p}: ")
-                }
-            };
-            Line::from(vec![
-                Span::styled(
-                    " sudo ▸ ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" "),
-                Span::styled(label, Style::default().fg(Color::Yellow)),
-                Span::raw(masked),
-                Span::styled("▎", Style::default().fg(Color::Red)),
-                Span::raw("   "),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                Span::raw(" send  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                Span::raw(" dismiss"),
-            ])
-        }
+        InputMode::PasswordPrompt { .. } => Line::raw(""),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -2234,6 +2207,79 @@ fn draw_confirm_quit_popup(frame: &mut Frame, area: Rect, deploy_running: bool) 
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  cancel"),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_password_popup(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &str,
+    buf: &str,
+    source: &PromptSource,
+) {
+    let popup = centered_rect(50, 30, area);
+    frame.render_widget(Clear, popup);
+
+    let (title, border_color) = match source {
+        PromptSource::Askpass => (" auth ", Color::Yellow),
+        PromptSource::Sudo => (" sudo ", Color::Red),
+        PromptSource::SudoPre => (" sudo (pre-deploy) ", Color::Magenta),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let label = {
+        let p = prompt.trim_end_matches(|c: char| c == ' ');
+        if p.ends_with(':') {
+            format!("{p} ")
+        } else {
+            format!("{p}: ")
+        }
+    };
+    let masked: String = "•".repeat(buf.chars().count());
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        format!("  {label}"),
+        Style::default().fg(Color::Yellow),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::raw(masked),
+        Span::styled("▎", Style::default().fg(border_color)),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Enter ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  send    "),
+        Span::styled(
+            " Esc ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  dismiss"),
     ]));
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);

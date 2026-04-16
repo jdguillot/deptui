@@ -206,9 +206,42 @@ Key invariants worth knowing before touching the code:
   pane holds only the summary + extras; it no longer has a log section.
   Commands/info row is below both columns: commands left (60%), info right
   (40%).
-- **`--interactive-sudo true` will hang the TUI**, by design — the
-  child reads from `Stdio::null()`. Toggle 5 is exposed for
-  completeness; the help popup tells the user to press `x` to recover.
+- **SSH_ASKPASS is always active during deploys and probes.** The
+  deploy child and all SSH-spawning probe tasks run in a new session
+  (`setsid`) with `SSH_ASKPASS` pointing at our own binary in
+  `--askpass` mode. SSH password / passphrase prompts are relayed
+  over a Unix-domain socket to the TUI, which shows a centered
+  popup dialog (`InputMode::PasswordPrompt` with `source: Askpass`).
+  The askpass server is app-level (created once in `App::run`) and
+  lives in `askpass.rs`.
+- **`--interactive-sudo` uses a PTY + pre-prompt.** deploy-rs reads
+  the sudo password locally via `rpassword::prompt_password`, which
+  opens `/dev/tty`. We always call `setsid()` in `pre_exec` (to
+  force SSH to honour `SSH_ASKPASS`), and that would normally strip
+  the child of any controlling tty and make rpassword's open fail —
+  so when toggle 5 is on, `deploy::run_inner` allocates a PTY via
+  `libc::openpty`, registers a second `pre_exec` hook that calls
+  `TIOCSCTTY` on the slave (after `setsid`) to make it the
+  controlling terminal, and pre-writes the password + `\n` to the
+  master so rpassword reads it the moment it opens `/dev/tty`. The
+  TUI pops a pre-deploy password popup (`PromptSource::SudoPre`) via
+  `handle_key_confirm_deploy` before spawning; on Enter the password
+  is cached AND passed as the second arg of `deploy::run(req, pw)`
+  so subsequent hosts in a batch re-use it. Any output deploy-rs
+  writes to `/dev/tty` (its "You will now be prompted…" banner) is
+  drained on a `spawn_blocking` task and forwarded as
+  `LogLine::Stderr`. The legacy stderr-based detection
+  (`read_stderr_interactive` / `PromptSource::Sudo`) is kept for
+  defense-in-depth but rarely fires in practice because the prompt
+  now goes to the PTY, not stderr.
+- **Password caching within a deploy action.** After the first
+  password entry, subsequent prompts within the same action are
+  auto-replied from an in-memory cache (`cached_password`). The
+  cache is cleared when the action ends (success, failure, cancel)
+  or when a new action starts. The cached buffer is `mlock`'d to
+  prevent swapping to disk, `zeroize`'d on clear, and core dumps
+  are disabled at startup via `setrlimit(RLIMIT_CORE, 0)`. Never
+  written to disk or logs.
 
 ## Project conventions
 

@@ -5,6 +5,7 @@
 //! is achieved by dropping the join handle and killing the child via the
 //! returned [`DeployHandle`].
 
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
@@ -12,7 +13,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
+use crate::askpass::AskpassEnv;
 use crate::ssh::SshOverride;
 
 /// What kind of activation deploy-rs should perform on the remote.
@@ -62,9 +65,13 @@ pub struct Toggles {
     pub auto_rollback: bool,
     /// `--remote-build` — perform the build on the target host.
     pub remote_build: bool,
-    /// `--interactive-sudo true`. **Will hang the TUI** because the child
-    /// reads a password from stdin and we run with `Stdio::null()`. Kept
-    /// as a toggle for completeness; the help popup explains the catch.
+    /// `--interactive-sudo true`. When enabled, the TUI pre-prompts for
+    /// the sudo password before spawning the child and pre-writes it
+    /// into a PTY that backs the child's controlling tty. This is
+    /// required because deploy-rs reads the password locally via
+    /// `rpassword::prompt_password`, which opens `/dev/tty`; without a
+    /// PTY the `setsid()` pre-exec hook leaves the child with no
+    /// controlling terminal and rpassword would fail silently.
     pub interactive_sudo: bool,
 }
 
@@ -92,6 +99,8 @@ pub struct DeployRequest {
     /// Per-host SSH override. Empty/default means "no override, use the
     /// flake / ssh_config as-is".
     pub ssh_override: SshOverride,
+    /// Askpass environment for SSH_ASKPASS integration.
+    pub askpass: AskpassEnv,
 }
 
 impl DeployRequest {
@@ -111,10 +120,9 @@ impl DeployRequest {
 pub enum LogLine {
     Stdout(String),
     Stderr(String),
-    /// The `deploy` child process (via sudo) is waiting for a password on
-    /// its stdin. The string is the raw prompt text (e.g. `[sudo] password
-    /// for root: `). The TUI should display a masked input widget and then
-    /// write the password via [`DeployHandle::stdin_tx`].
+    /// Remote sudo is waiting for a password (detected as a partial line on
+    /// stderr matching a password-prompt pattern). The TUI should display a
+    /// masked input widget and write the password via [`DeployHandle::stdin_tx`].
     SudoPrompt(String),
     /// Final exit code; the channel closes after this.
     Exit(i32),
@@ -134,7 +142,15 @@ pub struct DeployHandle {
 }
 
 /// Spawn `deploy` for the given request and return a streaming handle.
-pub fn run(req: DeployRequest) -> DeployHandle {
+///
+/// When `req.toggles.interactive_sudo` is true, `sudo_password` should
+/// contain the pre-collected sudo password. It is written into the
+/// allocated PTY master so deploy-rs's `rpassword::prompt_password`
+/// call (which reads from `/dev/tty`) receives it immediately — without
+/// this, the `setsid()` pre-exec would leave the child with no
+/// controlling terminal and rpassword would error out, causing the
+/// remote sudo to run with an empty password.
+pub fn run(req: DeployRequest, sudo_password: Option<Zeroizing<String>>) -> DeployHandle {
     let (tx, rx) = mpsc::channel(256);
     // Create the stdin channel only when interactive_sudo is enabled so
     // we don't allocate it for the common case.
@@ -146,14 +162,46 @@ pub fn run(req: DeployRequest) -> DeployHandle {
         (None, None)
     };
     let task = tokio::spawn(async move {
-        if let Err(e) = run_inner(req, tx.clone(), stdin_rx).await {
+        if let Err(e) = run_inner(req, tx.clone(), stdin_rx, sudo_password).await {
             let _ = tx.send(LogLine::Error(format!("{e:#}"))).await;
         }
     });
-    DeployHandle { rx, task, stdin_tx }
+    DeployHandle {
+        rx,
+        task,
+        stdin_tx,
+    }
 }
 
-async fn run_inner(req: DeployRequest, tx: mpsc::Sender<LogLine>, stdin_rx: Option<mpsc::Receiver<String>>) -> Result<()> {
+/// Allocate a pseudo-terminal pair. Returns `(master_fd, slave_fd)`.
+/// Both ends are opened; the caller is responsible for closing them.
+fn open_pty() -> std::io::Result<(RawFd, RawFd)> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    // SAFETY: `openpty` writes two valid fds into the out-params and
+    // returns -1 on error. We pass null for the remaining optional
+    // arguments (name buffer, termios, winsize).
+    let ret = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((master, slave))
+}
+
+async fn run_inner(
+    req: DeployRequest,
+    tx: mpsc::Sender<LogLine>,
+    stdin_rx: Option<mpsc::Receiver<String>>,
+    sudo_password: Option<Zeroizing<String>>,
+) -> Result<()> {
     let mut cmd = Command::new("deploy");
     cmd.arg(req.target());
 
@@ -208,14 +256,110 @@ async fn run_inner(req: DeployRequest, tx: mpsc::Sender<LogLine>, stdin_rx: Opti
     }
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // kill_on_drop ensures the spawned `deploy` is reaped when the
-        // owning task is aborted (cancel key) or the App exits.
         .kill_on_drop(true)
-        // Make sure deploy-rs's coloured output stays human-readable when
-        // we forward it line-by-line.
         .env("NO_COLOR", "1");
 
+    // SSH_ASKPASS: use the app-level askpass env so SSH prompts are
+    // routed through the TUI instead of corrupting the terminal.
+    req.askpass.apply(&mut cmd);
+    AskpassEnv::pre_exec_setsid(&mut cmd);
+
+    // If interactive_sudo is on, allocate a PTY and wire the slave side
+    // up as the child's controlling tty. deploy-rs reads the sudo
+    // password locally via `rpassword::prompt_password`, which opens
+    // `/dev/tty`. Without a controlling tty that open fails (ENXIO) and
+    // deploy-rs proceeds with an empty password — hence the remote
+    // "no password was provided" failures. By pre-feeding the password
+    // into the PTY master we also avoid a visible terminal prompt flash
+    // and let the TUI stay in charge of the UX.
+    let (pty_master, pty_slave_fd) = if t.interactive_sudo {
+        let (master_fd, slave_fd) = open_pty().context("allocating pty for interactive sudo")?;
+
+        // SAFETY: `ioctl(fd, TIOCSCTTY, 0)` runs in the child after
+        // `fork`, in the session created by the earlier `setsid()`
+        // pre_exec hook. The slave fd was inherited across the fork,
+        // so it's valid here. After the ioctl the child has a
+        // controlling terminal and `/dev/tty` resolves to this PTY.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The slave fd is no longer needed in the child — the
+                // kernel keeps the terminal as controlling tty
+                // regardless. Close it so we don't leak an extra fd
+                // into every exec'd binary.
+                libc::close(slave_fd);
+                Ok(())
+            });
+        }
+
+        // Pre-write the password + newline so rpassword reads it the
+        // moment it opens /dev/tty. This is safe because the master
+        // end buffers until the child reads it.
+        // SAFETY: `from_raw_fd` takes ownership of the master fd.
+        let mut master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
+        if let Some(pw) = sudo_password.as_ref() {
+            use std::io::Write;
+            let _ = master_file.write_all(pw.as_bytes());
+            let _ = master_file.write_all(b"\n");
+            let _ = master_file.flush();
+        }
+        (Some(master_file), Some(slave_fd))
+    } else {
+        (None, None)
+    };
+
     let mut child: Child = cmd.spawn().context("spawning `deploy`")?;
+
+    // The slave fd now lives in the child; close our parent-side copy
+    // so the PTY master sees EOF when the child exits.
+    if let Some(fd) = pty_slave_fd {
+        // SAFETY: closing our own dup of the slave fd. The child holds
+        // its own fd (duplicated across fork) and will close it via
+        // the pre_exec hook above.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    // Drain the PTY master: forward any bytes deploy-rs writes to
+    // /dev/tty (e.g. its "You will now be prompted for the sudo
+    // password" banner) into the log. If the child produces no
+    // output on the PTY the task just blocks until EOF.
+    if let Some(master) = pty_master {
+        let tx_pty = tx.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::{BufReader, Read};
+            let mut reader = BufReader::new(master);
+            let mut line_buf: Vec<u8> = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match reader.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if byte[0] == b'\n' {
+                            let s = String::from_utf8_lossy(&line_buf);
+                            let line = s.trim_end_matches('\r').to_string();
+                            line_buf.clear();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            if tx_pty
+                                .blocking_send(LogLine::Stderr(strip_ansi(&line)))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else {
+                            line_buf.push(byte[0]);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
@@ -458,6 +602,13 @@ fn is_sudo_prompt(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn dummy_askpass() -> AskpassEnv {
+        AskpassEnv {
+            script_path: "/dev/null".into(),
+            socket_path: "/dev/null".into(),
+        }
+    }
+
     // ---- ProfileSel ----
 
     #[test]
@@ -486,6 +637,7 @@ mod tests {
             mode: Mode::Switch,
             toggles: Toggles::default(),
             ssh_override: SshOverride::default(),
+            askpass: dummy_askpass(),
         };
         assert_eq!(req.target(), "/home/me/dotfiles#myhost");
     }
@@ -499,6 +651,7 @@ mod tests {
             mode: Mode::Boot,
             toggles: Toggles::default(),
             ssh_override: SshOverride::default(),
+            askpass: dummy_askpass(),
         };
         assert_eq!(req.target(), ".#server1.system");
     }
@@ -512,6 +665,7 @@ mod tests {
             mode: Mode::DryRun,
             toggles: Toggles::default(),
             ssh_override: SshOverride::default(),
+            askpass: dummy_askpass(),
         };
         assert_eq!(req.target(), "github:me/dotfiles#laptop.home");
     }

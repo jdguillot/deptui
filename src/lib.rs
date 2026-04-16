@@ -3,6 +3,7 @@
 //! tests in `tests/` import them through this crate root.
 
 pub mod app;
+pub mod askpass;
 pub mod deploy;
 pub mod event;
 pub mod flake;

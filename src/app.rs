@@ -12,11 +12,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use zeroize::Zeroizing;
 use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::askpass::{AskpassEnv, AskpassServer};
 use crate::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
 use crate::event::{spawn as spawn_events, AppEvent};
 use crate::flake::Node;
@@ -224,18 +226,41 @@ pub enum InputMode {
     SearchHelp {
         buf: String,
     },
-    /// The running deploy child is waiting for a sudo password on its
-    /// stdin (`--interactive-sudo` was enabled). The TUI renders a
-    /// masked input widget. The password is NEVER written to the log
-    /// buffer. Enter sends it to the child; Esc dismisses the prompt
-    /// (the deploy will likely stall or fail).
-    SudoPrompt {
-        /// Raw prompt text from the child's stderr, e.g.
-        /// `[sudo] password for root: `. Displayed as the widget label.
+    /// A deploy child (or SSH) is waiting for a password. The TUI
+    /// renders a masked input widget. The password is NEVER written to
+    /// the log buffer. Enter sends it via the appropriate channel
+    /// (askpass socket or child stdin); Esc dismisses the prompt.
+    PasswordPrompt {
+        /// Raw prompt text, e.g. `[sudo] password for root: ` or
+        /// `Enter passphrase for key '…': `.
         prompt: String,
         /// Password being typed. Rendered as `•` characters.
         buf: String,
+        /// Where to send the password on Enter.
+        source: PromptSource,
     },
+}
+
+/// Distinguishes whether a password prompt came from the SSH_ASKPASS
+/// mechanism (routed through [`DeployHandle::askpass_tx`]), from a
+/// sudo prompt detected on stderr (routed through
+/// [`DeployHandle::stdin_tx`]), or from a pre-deploy prompt asked
+/// before spawning when `--interactive-sudo` is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptSource {
+    /// SSH password / passphrase via SSH_ASKPASS → respond through
+    /// `askpass_password_tx`.
+    Askpass,
+    /// Remote sudo prompt detected on stderr → respond through
+    /// `deploy_stdin_tx`. Retained for completeness but rarely fires
+    /// in practice because `--interactive-sudo` reads via `/dev/tty`
+    /// (now a PTY) rather than stderr.
+    Sudo,
+    /// Pre-deploy sudo prompt collected BEFORE the child spawns.
+    /// On submit, the password is cached AND passed to
+    /// [`deploy::run`] so it can be pre-written into the child's
+    /// controlling-tty PTY.
+    SudoPre,
 }
 
 /// What we remember about the most recently completed deploy. Rendered
@@ -381,6 +406,28 @@ pub struct App {
     /// sender lets the TUI write the sudo password to the child's piped
     /// stdin. `None` otherwise. Dropped on cancel or deploy completion.
     deploy_stdin_tx: Option<mpsc::Sender<String>>,
+
+    /// App-level askpass environment: script and socket paths, cloned
+    /// into every task that spawns SSH.
+    askpass_env: AskpassEnv,
+    /// Send passwords to the askpass server (which relays them to the
+    /// SSH_ASKPASS helper over the Unix socket).
+    askpass_password_tx: mpsc::Sender<String>,
+    /// Receives prompt text from the askpass server — polled in the
+    /// main `select!` loop.
+    askpass_prompt_rx: mpsc::Receiver<String>,
+    /// Keep the server's background task alive. `None` before `run()`.
+    _askpass_task: Option<JoinHandle<()>>,
+    /// Cached password for the current deploy action. Auto-replayed on
+    /// subsequent prompts within the same action, then securely zeroed
+    /// when the action ends (exit, cancel, or new action start).
+    /// Never written to disk or logs.
+    cached_password: Option<Zeroizing<String>>,
+    /// Stashed deploy parameters while the SudoPre password prompt is
+    /// on screen. Consumed by [`handle_key_password_prompt`] on Enter
+    /// (actually starts the deploy) or cleared on Esc (cancels).
+    pending_deploy: Option<(Vec<String>, Mode, ProfileSel)>,
+
     /// Background probe tasks (update / closure-size / package-diff
     /// checks). Held so `x` can abort them mid-flight; finished
     /// handles are pruned opportunistically each time we spawn a new
@@ -417,6 +464,14 @@ impl App {
         for n in &nodes {
             status.insert(n.name.clone(), HostStatus::default());
         }
+
+        // Askpass channels are created now (cheap); the actual server
+        // is started in `run()` which has a tokio runtime. Until then
+        // `askpass_env` holds a dummy value — it's overwritten before
+        // any SSH commands are spawned.
+        let (askpass_password_tx, _placeholder_rx) = mpsc::channel::<String>(4);
+        let (_placeholder_tx, askpass_prompt_rx) = mpsc::channel::<String>(4);
+
         Self {
             flake,
             nodes,
@@ -451,6 +506,15 @@ impl App {
             deploy_rx: None,
             deploy_task: None,
             deploy_stdin_tx: None,
+            askpass_env: AskpassEnv {
+                script_path: "/dev/null".into(),
+                socket_path: "/dev/null".into(),
+            },
+            askpass_password_tx,
+            askpass_prompt_rx,
+            _askpass_task: None,
+            cached_password: None,
+            pending_deploy: None,
             probe_tasks: Vec::new(),
             deploy_queue: VecDeque::new(),
             queue_mode: Mode::Switch,
@@ -460,6 +524,28 @@ impl App {
             current_target: None,
             should_quit: false,
         }
+    }
+
+    /// Cache a password in memory, locking its pages to prevent swapping.
+    fn set_cached_password(&mut self, password: String) {
+        self.clear_cached_password();
+        let pw = Zeroizing::new(password);
+        // Best-effort: lock the heap buffer into RAM so it can't be swapped
+        // to disk. Failure (e.g. low RLIMIT_MEMLOCK) is non-fatal.
+        unsafe {
+            libc::mlock(pw.as_ptr() as *const libc::c_void, pw.len());
+        }
+        self.cached_password = Some(pw);
+    }
+
+    /// Clear the cached password, unlocking and zeroing memory.
+    fn clear_cached_password(&mut self) {
+        if let Some(ref pw) = self.cached_password {
+            unsafe {
+                libc::munlock(pw.as_ptr() as *const libc::c_void, pw.len());
+            }
+        }
+        self.cached_password = None; // Zeroizing zeros the buffer on drop
     }
 
     /// True if `name` is in the multi-select set.
@@ -503,6 +589,21 @@ impl App {
     }
 
     pub async fn run(&mut self, terminal: &mut Tui) -> Result<()> {
+        // Start the app-level SSH_ASKPASS server now that we have a
+        // tokio runtime. Every SSH-spawning operation (status probes,
+        // deploys) will route password prompts through this server.
+        let askpass_server = AskpassServer::new().context("setting up SSH_ASKPASS")?;
+        self.askpass_env = askpass_server.env.clone();
+        let (askpass_prompt_tx, askpass_prompt_rx) = mpsc::channel::<String>(4);
+        let (askpass_password_tx, askpass_password_rx) = mpsc::channel::<String>(4);
+        self.askpass_password_tx = askpass_password_tx;
+        self.askpass_prompt_rx = askpass_prompt_rx;
+        self._askpass_task = Some(tokio::spawn(async move {
+            askpass_server
+                .serve(askpass_prompt_tx, askpass_password_rx)
+                .await;
+        }));
+
         let mut events = spawn_events();
 
         // Kick off an initial reachability sweep so the first frame isn't
@@ -531,6 +632,20 @@ impl App {
                 Some(line) = recv_optional(&mut self.deploy_rx) => {
                     needs_redraw = true;
                     self.handle_deploy_line(line);
+                }
+
+                Some(prompt) = self.askpass_prompt_rx.recv() => {
+                    if let Some(ref pw) = self.cached_password {
+                        let _ = self.askpass_password_tx.try_send(pw.to_string());
+                        needs_redraw = false;
+                    } else {
+                        needs_redraw = true;
+                        self.input = InputMode::PasswordPrompt {
+                            prompt,
+                            buf: String::new(),
+                            source: PromptSource::Askpass,
+                        };
+                    }
                 }
             }
 
@@ -658,8 +773,12 @@ impl App {
             InputMode::SearchHelp { buf } => {
                 self.handle_key_search_help(key, buf);
             }
-            InputMode::SudoPrompt { prompt, buf } => {
-                self.handle_key_sudo_prompt(key, prompt, buf);
+            InputMode::PasswordPrompt {
+                prompt,
+                buf,
+                source,
+            } => {
+                self.handle_key_password_prompt(key, prompt, buf, source);
             }
         }
     }
@@ -1370,7 +1489,27 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 self.input = InputMode::Normal;
-                self.run_confirmed(hosts, mode, profile);
+                // Interactive sudo needs the password BEFORE the child
+                // spawns (deploy-rs's `rpassword::prompt_password`
+                // reads from /dev/tty, which we back with a PTY that
+                // we pre-feed). If there's already a cached password
+                // from an earlier prompt in this session we reuse it;
+                // otherwise pop the pre-prompt widget and stash the
+                // deploy parameters until Enter is pressed.
+                if self.toggles.interactive_sudo && self.cached_password.is_none() {
+                    let first_host = hosts
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "host".into());
+                    self.pending_deploy = Some((hosts, mode, profile));
+                    self.input = InputMode::PasswordPrompt {
+                        prompt: format!("sudo password for {first_host}: "),
+                        buf: String::new(),
+                        source: PromptSource::SudoPre,
+                    };
+                } else {
+                    self.run_confirmed(hosts, mode, profile);
+                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.input = InputMode::Normal;
@@ -1492,55 +1631,98 @@ impl App {
         }
     }
 
-    /// Handle keystrokes while the sudo password prompt widget is active.
+    /// Handle keystrokes while the password prompt widget is active.
     ///
-    /// The password buffer is kept inside `InputMode::SudoPrompt` and is
-    /// NEVER written to the log. On Enter, it is moved into `try_send` and
-    /// immediately dropped; on Esc, it is dropped without being used.
+    /// The password buffer is kept inside `InputMode::PasswordPrompt` and
+    /// is NEVER written to the log. On Enter, it is moved into `try_send`
+    /// and immediately dropped; on Esc, it is dropped without being used.
     ///
     /// ### Password memory safety
     /// The `buf` String is moved (not copied) into `try_send`; after the
     /// move the local binding is gone. The channel then moves it into the
-    /// stdin-writer task, which moves it into `write_all` and then drops it.
-    /// At each step there is at most one live copy in memory. We intentionally
-    /// do not pull in the `zeroize` crate: the project's deployment context
-    /// (deploy-rs over SSH) already requires a session-local security
-    /// boundary, and we avoid adding a new dependency for marginal gain.
-    fn handle_key_sudo_prompt(&mut self, key: KeyEvent, prompt: String, mut buf: String) {
+    /// writer task, which moves it into `write_all` and then drops it.
+    /// At each step there is at most one live copy in memory.
+    fn handle_key_password_prompt(
+        &mut self,
+        key: KeyEvent,
+        prompt: String,
+        mut buf: String,
+        source: PromptSource,
+    ) {
         match key.code {
             KeyCode::Enter => {
-                // Move the password string into the channel; never log it.
-                if let Some(tx) = &self.deploy_stdin_tx {
-                    // try_send won't block and the channel capacity (4) is
-                    // large enough that it should never be full here.
-                    let _ = tx.try_send(buf);
-                } else {
-                    // No stdin channel — the deploy may not have been started
-                    // with interactive_sudo or it already finished. Log a
-                    // safe (password-free) notice.
-                    self.push_log("! no stdin channel available for sudo password", true);
+                // Cache the password for replay within this action.
+                self.set_cached_password(buf.clone());
+                // Route the password to the appropriate destination.
+                match source {
+                    PromptSource::Askpass => {
+                        let _ = self.askpass_password_tx.try_send(buf);
+                        self.input = InputMode::Normal;
+                    }
+                    PromptSource::Sudo => {
+                        if let Some(tx) = &self.deploy_stdin_tx {
+                            let _ = tx.try_send(buf);
+                        } else {
+                            self.push_log(
+                                "! no stdin channel available for sudo password",
+                                true,
+                            );
+                        }
+                        self.input = InputMode::Normal;
+                    }
+                    PromptSource::SudoPre => {
+                        // Cached above; now actually start the deploy.
+                        // The cached password will be pulled into the
+                        // DeployRequest inside `start_next_in_queue`.
+                        // `buf` isn't needed beyond the cache — drop it.
+                        drop(buf);
+                        self.input = InputMode::Normal;
+                        if let Some((hosts, mode, profile)) = self.pending_deploy.take() {
+                            self.run_confirmed(hosts, mode, profile);
+                        }
+                    }
                 }
-                self.input = InputMode::Normal;
             }
             KeyCode::Esc => {
-                // Drop the buffer without sending anything. The deploy child
-                // will time out waiting for input.
-                self.push_log(
-                    "• sudo prompt dismissed — deploy will likely stall (press x to cancel)",
-                    true,
-                );
+                // Clear cache so next prompt asks again.
+                self.clear_cached_password();
+                match source {
+                    PromptSource::SudoPre => {
+                        // User bailed before the deploy ran.
+                        self.pending_deploy = None;
+                        self.push_log("• deploy cancelled — sudo password not provided", false);
+                    }
+                    _ => {
+                        self.push_log(
+                            "• password prompt dismissed — deploy may stall (press x to cancel)",
+                            true,
+                        );
+                    }
+                }
                 self.input = InputMode::Normal;
             }
             KeyCode::Backspace => {
                 buf.pop();
-                self.input = InputMode::SudoPrompt { prompt, buf };
+                self.input = InputMode::PasswordPrompt {
+                    prompt,
+                    buf,
+                    source,
+                };
             }
             KeyCode::Char(c) => {
                 buf.push(c);
-                self.input = InputMode::SudoPrompt { prompt, buf };
+                self.input = InputMode::PasswordPrompt {
+                    prompt,
+                    buf,
+                    source,
+                };
             }
             _ => {
-                self.input = InputMode::SudoPrompt { prompt, buf };
+                self.input = InputMode::PasswordPrompt {
+                    prompt,
+                    buf,
+                    source,
+                };
             }
         }
     }
@@ -2016,16 +2198,19 @@ impl App {
 
         let flake = self.flake.clone();
         let override_ = self.override_for(&node.name).clone();
+        let askpass = self.askpass_env.clone();
         for profile in node.profiles.keys() {
             let profile = profile.clone();
             let node = node.clone();
             let flake = flake.clone();
             let override_ = override_.clone();
+            let askpass = askpass.clone();
             let tx = self.status_tx.clone();
             let handle = tokio::spawn(async move {
-                let result = host::check_profile_up_to_date(&flake, &node, &profile, &override_)
-                    .await
-                    .map_err(|e| format!("{e:#}"));
+                let result =
+                    host::check_profile_up_to_date(&flake, &node, &profile, &override_, &askpass)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
                 let _ = tx
                     .send(StatusUpdate::UpdateProbe {
                         node: node.name.clone(),
@@ -2089,17 +2274,11 @@ impl App {
             }
             let node_cloned = node.clone();
             let override_ = self.override_for(&node.name).clone();
+            let askpass = self.askpass_env.clone();
             let tx = self.status_tx.clone();
             let profile_cloned = profile.clone();
             let flake_cloned = self.flake.clone();
             let handle = tokio::spawn(async move {
-                // Same forwarder pattern as refresh_pkg_diff_for_selected:
-                // host::check_closure_sizes emits free-form progress
-                // strings (especially when it has to build the local
-                // closure, which can take tens of seconds). We convert
-                // each one to a LogLine tagged with the node name so
-                // it lands in that host's details log alongside the
-                // spinner.
                 let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
                 let forwarder_tx = tx.clone();
                 let forwarder_node = node_cloned.name.clone();
@@ -2121,6 +2300,7 @@ impl App {
                     &local_path,
                     &remote_path,
                     &override_,
+                    &askpass,
                     prog_tx,
                 )
                 .await
@@ -2182,12 +2362,9 @@ impl App {
         let node_cloned = node.clone();
         let profile_cloned = profile.to_string();
         let override_ = self.override_for(&node.name).clone();
+        let askpass = self.askpass_env.clone();
         let flake_cloned = self.flake.clone();
         let handle = tokio::spawn(async move {
-            // Bridge: host::check_package_diff emits free-form
-            // progress strings; forward each one as a LogLine tagged
-            // with the node name so it lands in the host's details
-            // log alongside the spinner.
             let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
             let forwarder_tx = tx.clone();
             let forwarder_node = node_cloned.name.clone();
@@ -2210,6 +2387,7 @@ impl App {
                 &local_path,
                 &remote_path,
                 &override_,
+                &askpass,
                 prog_tx,
             )
             .await
@@ -2462,6 +2640,11 @@ impl App {
     /// Confirmed by the user. Stash the queue and kick off the first
     /// deploy. The remaining hosts are run sequentially as each child
     /// exits cleanly (see `handle_deploy_line`).
+    ///
+    /// The cached password (if any) is preserved: the SudoPre flow
+    /// just populated it, and the askpass/sudo flows also rely on
+    /// carrying a cache across subsequent hosts in the same batch.
+    /// The cache is cleared on deploy exit, failure, and cancel.
     fn run_confirmed(&mut self, hosts: Vec<String>, mode: Mode, profile: ProfileSel) {
         self.mode = mode;
         self.queue_mode = mode;
@@ -2524,6 +2707,7 @@ impl App {
                 mode: self.queue_mode,
                 toggles: self.toggles,
                 ssh_override: self.override_for(&node.name).clone(),
+                askpass: self.askpass_env.clone(),
             };
             self.push_log_tagged(
                 format!(
@@ -2538,7 +2722,16 @@ impl App {
                 false,
                 Some(node.name.clone()),
             );
-            let handle = deploy::run(req);
+            // When interactive_sudo is on, pass the cached password so
+            // `deploy::run` can pre-feed it into the PTY that backs the
+            // child's controlling tty. Clone so our cache survives for
+            // replay on subsequent hosts in the queue.
+            let sudo_pw = if self.toggles.interactive_sudo {
+                self.cached_password.as_deref().map(|s| Zeroizing::new(s.clone()))
+            } else {
+                None
+            };
+            let handle = deploy::run(req, sudo_pw);
             self.deploy_rx = Some(handle.rx);
             self.deploy_task = Some(handle.task);
             self.deploy_stdin_tx = handle.stdin_tx;
@@ -2575,6 +2768,8 @@ impl App {
             t.abort();
             self.deploy_rx = None;
             self.deploy_stdin_tx = None;
+            self.clear_cached_password();
+
             self.busy_label = None;
             // Cancelling kills the queue too — otherwise pressing `x`
             // mid-batch would surprise-deploy the next host.
@@ -2652,15 +2847,17 @@ impl App {
                 self.push_log_tagged(&s, true, host);
             }
             LogLine::SudoPrompt(prompt) => {
-                // Switch to the masked password input widget. We intentionally
-                // do NOT push the prompt to the log — sudo prompts don't belong
-                // in deploy history, and logging them could cause confusion.
-                // If a prior prompt widget is already showing (shouldn't happen
-                // in practice), replace it so we never get stuck.
-                self.input = InputMode::SudoPrompt {
-                    prompt,
-                    buf: String::new(),
-                };
+                if let Some(ref pw) = self.cached_password {
+                    if let Some(tx) = &self.deploy_stdin_tx {
+                        let _ = tx.try_send(pw.to_string());
+                    }
+                } else {
+                    self.input = InputMode::PasswordPrompt {
+                        prompt,
+                        buf: String::new(),
+                        source: PromptSource::Sudo,
+                    };
+                }
             }
             LogLine::Exit(code) => {
                 let ok = code == 0;
@@ -2680,9 +2877,8 @@ impl App {
                 self.deploy_task = None;
                 self.deploy_rx = None;
                 self.deploy_stdin_tx = None;
-                // If a sudo prompt widget is still showing (user didn't
-                // dismiss it), close it so Normal mode is restored.
-                if matches!(self.input, InputMode::SudoPrompt { .. }) {
+    
+                if matches!(self.input, InputMode::PasswordPrompt { .. }) {
                     self.input = InputMode::Normal;
                 }
                 self.busy_label = None;
@@ -2719,10 +2915,12 @@ impl App {
                     if !self.deploy_queue.is_empty() {
                         self.start_next_in_queue();
                     } else {
+                        self.clear_cached_password();
                         self.queue_total = 0;
                         self.queue_done = 0;
                     }
                 } else {
+                    self.clear_cached_password();
                     // Stop the batch on failure — safer than blindly
                     // continuing to push to more hosts after one breaks.
                     let dropped = self.deploy_queue.len();
@@ -2753,7 +2951,9 @@ impl App {
                 self.deploy_task = None;
                 self.deploy_rx = None;
                 self.deploy_stdin_tx = None;
-                if matches!(self.input, InputMode::SudoPrompt { .. }) {
+                self.clear_cached_password();
+
+                if matches!(self.input, InputMode::PasswordPrompt { .. }) {
                     self.input = InputMode::Normal;
                 }
                 self.busy_label = None;
@@ -3223,64 +3423,68 @@ mod tests {
         assert!(app.log_search.is_none());
     }
 
-    // ---- SudoPrompt input mode ----
+    // ---- PasswordPrompt input mode ----
 
     #[test]
-    fn sudo_prompt_esc_returns_to_normal() {
+    fn password_prompt_esc_returns_to_normal() {
         let mut app = App::new(".".into(), sample_nodes());
-        app.input = InputMode::SudoPrompt {
+        app.input = InputMode::PasswordPrompt {
             prompt: "[sudo] password for root: ".into(),
             buf: "secret".into(),
+            source: PromptSource::Sudo,
         };
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.input, InputMode::Normal));
     }
 
     #[test]
-    fn sudo_prompt_typing_appends_to_buf() {
+    fn password_prompt_typing_appends_to_buf() {
         let mut app = App::new(".".into(), sample_nodes());
-        app.input = InputMode::SudoPrompt {
+        app.input = InputMode::PasswordPrompt {
             prompt: "Password:".into(),
             buf: String::new(),
+            source: PromptSource::Askpass,
         };
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-        assert!(matches!(app.input, InputMode::SudoPrompt { ref buf, .. } if buf == "abc"));
+        assert!(matches!(app.input, InputMode::PasswordPrompt { ref buf, .. } if buf == "abc"));
     }
 
     #[test]
-    fn sudo_prompt_backspace_removes_char() {
+    fn password_prompt_backspace_removes_char() {
         let mut app = App::new(".".into(), sample_nodes());
-        app.input = InputMode::SudoPrompt {
+        app.input = InputMode::PasswordPrompt {
             prompt: "Password:".into(),
             buf: "xy".into(),
+            source: PromptSource::Sudo,
         };
         app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert!(matches!(app.input, InputMode::SudoPrompt { ref buf, .. } if buf == "x"));
+        assert!(matches!(app.input, InputMode::PasswordPrompt { ref buf, .. } if buf == "x"));
     }
 
     #[test]
-    fn sudo_prompt_enter_returns_to_normal() {
+    fn password_prompt_enter_returns_to_normal() {
         let mut app = App::new(".".into(), sample_nodes());
         // No stdin_tx set — Enter should still return to Normal (with an error log).
-        app.input = InputMode::SudoPrompt {
+        app.input = InputMode::PasswordPrompt {
             prompt: "Password:".into(),
             buf: "hunter2".into(),
+            source: PromptSource::Sudo,
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.input, InputMode::Normal));
     }
 
     #[test]
-    fn sudo_prompt_password_not_in_log_after_enter() {
+    fn password_prompt_password_not_in_log_after_enter() {
         let mut app = App::new(".".into(), sample_nodes());
-        app.input = InputMode::SudoPrompt {
+        app.input = InputMode::PasswordPrompt {
             prompt: "Password:".into(),
             buf: "supersecret".into(),
+            source: PromptSource::Sudo,
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        // The password must never appear in the log.
         for entry in &app.log {
             assert!(
                 !entry.text.contains("supersecret"),
@@ -3288,5 +3492,18 @@ mod tests {
                 entry.text,
             );
         }
+    }
+
+    #[test]
+    fn askpass_prompt_enter_returns_to_normal() {
+        let mut app = App::new(".".into(), sample_nodes());
+        // No askpass_tx set — Enter should still return to Normal.
+        app.input = InputMode::PasswordPrompt {
+            prompt: "Enter passphrase for key: ".into(),
+            buf: "mypass".into(),
+            source: PromptSource::Askpass,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.input, InputMode::Normal));
     }
 }

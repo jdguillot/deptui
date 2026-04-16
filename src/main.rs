@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use deptui::{app::App, flake, ui};
+use deptui::{app::App, askpass, flake, ui};
 
 /// CLI arguments. The TUI runs against a single flake reference.
 #[derive(Debug, Parser)]
@@ -23,11 +23,26 @@ struct Cli {
     /// stderr (which would corrupt the TUI).
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Internal: act as an SSH_ASKPASS helper. SSH calls this with the prompt
+    /// as $1. Not intended for direct use.
+    #[arg(long, hide = true)]
+    askpass: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // SSH_ASKPASS helper mode: relay the prompt to the TUI over the Unix
+    // socket, read the password back, print it for SSH, and exit.
+    if cli.askpass {
+        let prompt = std::env::args().nth(2).unwrap_or_default();
+        return askpass::run_client(&prompt);
+    }
+
+    // Prevent core dumps so cached passwords can't leak to disk on crash.
+    disable_core_dumps();
 
     init_tracing(cli.log_file.as_deref())?;
 
@@ -47,6 +62,19 @@ async fn main() -> Result<()> {
     let result = App::new(cli.flake.clone(), nodes).run(&mut terminal).await;
     ui::restore()?;
     result
+}
+
+/// Disable core dumps for this process so that cached passwords cannot
+/// be written to disk if the process crashes.
+fn disable_core_dumps() {
+    let zero = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: setrlimit with RLIMIT_CORE and a valid rlimit struct is safe.
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &zero);
+    }
 }
 
 fn init_tracing(log_file: Option<&std::path::Path>) -> Result<()> {

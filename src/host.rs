@@ -21,6 +21,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use crate::askpass::AskpassEnv;
 use crate::flake::Node;
 use crate::ssh::SshOverride;
 
@@ -201,6 +202,7 @@ pub async fn check_profile_up_to_date(
     node: &Node,
     profile: &str,
     override_: &SshOverride,
+    askpass: &AskpassEnv,
 ) -> Result<ProfileCheck> {
     let local = local_profile_path(flake, &node.name, profile)
         .await
@@ -214,18 +216,13 @@ pub async fn check_profile_up_to_date(
     let remote_cmd = match profile {
         "system" => "readlink -f /run/current-system && stat -c %Y /run/current-system".to_string(),
         "home" => {
-            // Try the modern home-manager symlink first; fall back to the
-            // legacy ~/.nix-profile. If neither symlink exists the host has
-            // never had a home-manager deployment — emit a sentinel token
-            // and exit 0 so we can distinguish "not deployed yet" from a
-            // real SSH failure.
             r#"if [ -L ~/.local/state/nix/profiles/home-manager ]; then link=~/.local/state/nix/profiles/home-manager; elif [ -L ~/.nix-profile ]; then link=~/.nix-profile; else printf 'NOT_DEPLOYED\n'; exit 0; fi; readlink -f "$link" && stat -c %Y "$link""#.to_string()
         }
         other => return Err(anyhow!("unknown profile `{other}`")),
     };
 
     let target = build_ssh_target(node, profile, override_);
-    let remote = ssh_capture(&target, &remote_cmd, override_).await?;
+    let remote = ssh_capture(&target, &remote_cmd, override_, askpass).await?;
 
     let local_trimmed = local.trim().to_string();
 
@@ -376,6 +373,7 @@ pub async fn check_closure_sizes(
     local_path: &str,
     remote_path: &str,
     override_: &SshOverride,
+    askpass: &AskpassEnv,
     progress: mpsc::Sender<String>,
 ) -> Result<(u64, u64)> {
     // Step 1: make sure the deploy-rs activation wrapper is in the
@@ -402,7 +400,7 @@ pub async fn check_closure_sizes(
         .send(format!("[size] measuring remote closure on {target} …"))
         .await;
     let remote_cmd = format!("nix path-info --closure-size '{remote_path}'");
-    let remote = ssh_capture(&target, &remote_cmd, override_)
+    let remote = ssh_capture(&target, &remote_cmd, override_, askpass)
         .await
         .context("remote `nix path-info --closure-size`")?;
     let remote_size = parse_closure_size(&remote)
@@ -450,6 +448,7 @@ pub async fn check_package_diff(
     local_path: &str,
     remote_path: &str,
     override_: &SshOverride,
+    askpass: &AskpassEnv,
     progress: mpsc::Sender<String>,
 ) -> Result<String> {
     let target = build_ssh_target(node, profile, override_);
@@ -478,7 +477,7 @@ pub async fn check_package_diff(
         .send(format!("[pkg] listing remote closure on {target} …"))
         .await;
     let remote_cmd = format!("nix-store --query --requisites '{remote_path}'");
-    let remote_out = ssh_capture(&target, &remote_cmd, override_)
+    let remote_out = ssh_capture(&target, &remote_cmd, override_, askpass)
         .await
         .with_context(|| format!("remote `nix-store --query --requisites {remote_path}`"))?;
     let remote_paths: Vec<String> = remote_out
@@ -1219,11 +1218,14 @@ mod tests {
 
 /// Run a non-interactive ssh command and return its stdout. Errors include
 /// stderr to make TUI diagnostics legible.
-async fn ssh_capture(target: &str, command: &str, override_: &SshOverride) -> Result<String> {
+async fn ssh_capture(
+    target: &str,
+    command: &str,
+    override_: &SshOverride,
+    askpass: &AskpassEnv,
+) -> Result<String> {
     let mut cmd = Command::new("ssh");
     cmd.args([
-        "-o",
-        "BatchMode=yes",
         "-o",
         "ConnectTimeout=3",
         "-o",
@@ -1241,13 +1243,16 @@ async fn ssh_capture(target: &str, command: &str, override_: &SshOverride) -> Re
     // drops the awaiting future and the Child along with it. Without
     // kill_on_drop the ssh process — and the remote nix-store command
     // it's running — would orphan and keep going.
-    let mut child = cmd
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("spawning ssh")?;
+        .kill_on_drop(true);
+
+    // Route SSH prompts through the TUI's askpass mechanism.
+    askpass.apply(&mut cmd);
+    AskpassEnv::pre_exec_setsid(&mut cmd);
+
+    let mut child = cmd.spawn().context("spawning ssh")?;
 
     let mut stdout = String::new();
     let mut stderr = String::new();
