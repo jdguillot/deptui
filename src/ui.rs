@@ -5,6 +5,7 @@
 //! plumbing here so the App can stay focused on state transitions.
 
 use std::io::{stdout, Stdout};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -915,6 +916,251 @@ fn job_log_prefix_width(app: &App) -> usize {
         .min(MAX)
 }
 
+#[derive(Debug, Clone)]
+struct StyledSegment {
+    text: String,
+    style: Style,
+}
+
+fn styled_segment(text: impl Into<String>, style: Style) -> StyledSegment {
+    StyledSegment {
+        text: text.into(),
+        style,
+    }
+}
+
+fn dim_style(base: Style) -> Style {
+    base.patch(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )
+}
+
+fn accent_style(base: Style, color: Color) -> Style {
+    base.patch(Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
+fn plain_segments(text: &str, style: Style) -> Vec<StyledSegment> {
+    vec![styled_segment(text, style)]
+}
+
+fn parse_size_bytes(text: &str, label: &str) -> Option<u64> {
+    text.strip_prefix(label)?
+        .strip_suffix(" bytes")?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+fn style_pkg_probe_line(text: &str, base: Style) -> Vec<StyledSegment> {
+    let Some(body) = text.strip_prefix("[pkg] ") else {
+        return plain_segments(text, base);
+    };
+    let tag = dim_style(base);
+
+    if let Some(rest) = body.strip_prefix("done (") {
+        if let Some(count) = rest.strip_suffix(" change(s))") {
+            let changes = count.parse::<usize>().ok().unwrap_or(0);
+            let emphasis = if changes == 0 {
+                accent_style(base, Color::Green)
+            } else {
+                accent_style(base, Color::Yellow)
+            };
+            return vec![
+                styled_segment("[pkg] ", tag),
+                styled_segment("done ", emphasis),
+                styled_segment(format!("({changes} change(s))"), emphasis),
+            ];
+        }
+    }
+
+    if let Some(summary) = body.strip_prefix("(content-only)") {
+        return vec![
+            styled_segment("[pkg] ", tag),
+            styled_segment("(content-only)", accent_style(base, Color::Yellow)),
+            styled_segment(summary, dim_style(base)),
+        ];
+    }
+
+    if let Some((name, delta)) = body.split_once(": ") {
+        if let Some((old, new)) = delta.split_once(" → ") {
+            return vec![
+                styled_segment("[pkg] ", tag),
+                styled_segment(name, accent_style(base, Color::Yellow)),
+                styled_segment(": ", tag),
+                styled_segment(old, dim_style(base)),
+                styled_segment(" → ", tag),
+                styled_segment(new, accent_style(base, Color::Green)),
+            ];
+        }
+        if let Some(added) = delta.strip_prefix("+ ") {
+            return vec![
+                styled_segment("[pkg] ", tag),
+                styled_segment(name, accent_style(base, Color::Yellow)),
+                styled_segment(": ", tag),
+                styled_segment("+ ", accent_style(base, Color::Green)),
+                styled_segment(added, accent_style(base, Color::Green)),
+            ];
+        }
+        if let Some(removed) = delta.strip_prefix("- ") {
+            return vec![
+                styled_segment("[pkg] ", tag),
+                styled_segment(name, accent_style(base, Color::Yellow)),
+                styled_segment(": ", tag),
+                styled_segment("- ", accent_style(base, Color::Red)),
+                styled_segment(removed, accent_style(base, Color::Red)),
+            ];
+        }
+    }
+
+    plain_segments(text, dim_style(base))
+}
+
+fn style_size_probe_line(text: &str, base: Style, local_size: Option<u64>) -> Vec<StyledSegment> {
+    let Some(_body) = text.strip_prefix("[size] ") else {
+        return plain_segments(text, base);
+    };
+    let tag = dim_style(base);
+
+    if let Some(local) = parse_size_bytes(text, "[size] local: ") {
+        return vec![
+            styled_segment("[size] ", tag),
+            styled_segment("local: ", tag),
+            styled_segment(humanise_bytes(local), dim_style(base)),
+            styled_segment(format!(" ({local} bytes)"), dim_style(base)),
+        ];
+    }
+
+    if let Some(remote) = parse_size_bytes(text, "[size] remote: ") {
+        let mut spans = vec![
+            styled_segment("[size] ", tag),
+            styled_segment("remote: ", tag),
+            styled_segment(humanise_bytes(remote), dim_style(base)),
+            styled_segment(format!(" ({remote} bytes)"), dim_style(base)),
+        ];
+        if let Some(local) = local_size {
+            let (delta_abs, sign, color) = if local >= remote {
+                (local - remote, '+', Color::Yellow)
+            } else {
+                (remote - local, '-', Color::Yellow)
+            };
+            spans.push(styled_segment("  delta ", tag));
+            spans.push(styled_segment(
+                format!("{sign}{}", humanise_bytes(delta_abs)),
+                accent_style(base, color),
+            ));
+        }
+        return spans;
+    }
+
+    plain_segments(text, dim_style(base))
+}
+
+fn style_job_log_segments(text: &str, base: Style, local_size: Option<u64>) -> Vec<StyledSegment> {
+    if text.starts_with("[pkg] ") {
+        return style_pkg_probe_line(text, base);
+    }
+    if text.starts_with("[size] ") {
+        return style_size_probe_line(text, base, local_size);
+    }
+    if text.starts_with("→ computing package diff for ") {
+        return plain_segments(text, dim_style(base));
+    }
+    plain_segments(text, base)
+}
+
+fn highlight_segments(
+    segments: Vec<StyledSegment>,
+    query: Option<&str>,
+    current_match: Option<usize>,
+    match_counter: &mut usize,
+) -> Vec<Span<'static>> {
+    let Some(q) = query.filter(|q| !q.is_empty()) else {
+        return segments
+            .into_iter()
+            .map(|seg| Span::styled(seg.text, seg.style))
+            .collect();
+    };
+
+    let hi_patch = Style::default()
+        .bg(Color::Magenta)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+    let hi_current_patch = Style::default()
+        .bg(Color::Cyan)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+
+    let full_text = segments.iter().map(|seg| seg.text.as_str()).collect::<String>();
+    let mut matches = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(found) = full_text[cursor..].find(q) {
+        let start = cursor + found;
+        let end = start + q.len();
+        *match_counter += 1;
+        matches.push((start, end, current_match == Some(*match_counter)));
+        cursor = end;
+    }
+
+    if matches.is_empty() {
+        return segments
+            .into_iter()
+            .map(|seg| Span::styled(seg.text, seg.style))
+            .collect();
+    }
+
+    let mut spans = Vec::new();
+    let mut seg_start = 0usize;
+    let mut match_idx = 0usize;
+
+    for seg in segments {
+        let seg_end = seg_start + seg.text.len();
+        let mut local_cursor = 0usize;
+
+        while match_idx < matches.len() && matches[match_idx].1 <= seg_start {
+            match_idx += 1;
+        }
+
+        let mut scan_idx = match_idx;
+        while scan_idx < matches.len() && matches[scan_idx].0 < seg_end {
+            let (match_start, match_end, active) = matches[scan_idx];
+            let start = match_start.max(seg_start) - seg_start;
+            let end = match_end.min(seg_end) - seg_start;
+
+            if start > local_cursor {
+                spans.push(Span::styled(
+                    seg.text[local_cursor..start].to_string(),
+                    seg.style,
+                ));
+            }
+
+            let highlight_style = if active {
+                seg.style.patch(hi_current_patch)
+            } else {
+                seg.style.patch(hi_patch)
+            };
+            spans.push(Span::styled(
+                seg.text[start..end].to_string(),
+                highlight_style,
+            ));
+            local_cursor = end;
+            scan_idx += 1;
+        }
+
+        if local_cursor < seg.text.len() {
+            spans.push(Span::styled(
+                seg.text[local_cursor..].to_string(),
+                seg.style,
+            ));
+        }
+
+        seg_start = seg_end;
+    }
+
+    spans
+}
+
 /// Right-column job log. This is where the actual `deploy` stdout
 /// lands — every tagged line (single-host or batch) with a coloured
 /// host prefix so interleaved output stays legible. Untagged lines
@@ -987,6 +1233,7 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // Build every filtered line up-front and clamp scroll before the
     // title reads it.
+    let mut size_locals: HashMap<String, u64> = HashMap::new();
     let all_lines: Vec<Line> = tagged
         .iter()
         .enumerate()
@@ -1004,6 +1251,8 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
                 prefix,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             );
+            let local_size_hint = size_locals.get(host).copied();
+            let styled_body = style_job_log_segments(&entry.text, body_style, local_size_hint);
 
             if let Some((vmode, start_line, start_col, end_line, end_col)) = visual_range {
                 let in_sel = line_idx >= start_line && line_idx <= end_line;
@@ -1018,15 +1267,22 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
                                     .add_modifier(Modifier::BOLD)
                                     .bg(Color::DarkGray),
                             )];
-                            spans.extend(
-                                highlight_match(
+                            spans.extend(highlight_segments(
+                                style_job_log_segments(
                                     &entry.text,
-                                    query,
                                     body_style.patch(sel_bg),
-                                    current_match,
-                                    &mut match_counter,
+                                    local_size_hint,
                                 ),
-                            );
+                                query,
+                                current_match,
+                                &mut match_counter,
+                            ));
+                            if let Some(local) = parse_size_bytes(&entry.text, "[size] local: ") {
+                                size_locals.insert(host.to_string(), local);
+                            }
+                            if parse_size_bytes(&entry.text, "[size] remote: ").is_some() {
+                                size_locals.remove(host);
+                            }
                             return Line::from(spans);
                         }
                         VisualMode::Char => {
@@ -1067,13 +1323,18 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
 
             // Default path — search highlighting, no visual selection.
             let mut spans = vec![prefix_span];
-            spans.extend(highlight_match(
-                &entry.text,
+            spans.extend(highlight_segments(
+                styled_body,
                 query,
-                body_style,
                 current_match,
                 &mut match_counter,
             ));
+            if let Some(local) = parse_size_bytes(&entry.text, "[size] local: ") {
+                size_locals.insert(host.to_string(), local);
+            }
+            if parse_size_bytes(&entry.text, "[size] remote: ").is_some() {
+                size_locals.remove(host);
+            }
             Line::from(spans)
         })
         .collect();
@@ -1210,60 +1471,6 @@ fn compute_tail_scroll_offset(
     };
     let y = max_row_offset.saturating_sub(row_scroll);
     y.min(u16::MAX as usize) as u16
-}
-
-/// Build filtered details-log lines and clamp the scroll in one pass.
-/// Called by `draw_details` *before* the pane title is constructed so
-/// the `[↑N]` chip always shows the post-clamp value and never
-/// flashes a stale number.
-/// Highlight every occurrence of `query` in `text`. Non-matching
-/// segments keep `base_style`; matches get a magenta background.
-///
-/// `current_match` / `match_counter` implement "active match"
-/// highlighting: the Nth global match across the entire pane (1-based,
-/// matching `log_search_stats().0`) renders with a cyan background
-/// instead of magenta so the user can tell which hit they're on when
-/// pressing `n`/`N`. Pass `None` / a dummy counter when the pane
-/// isn't the search-target pane to skip the special highlighting.
-fn highlight_match(
-    text: &str,
-    query: Option<&str>,
-    base_style: Style,
-    current_match: Option<usize>,
-    match_counter: &mut usize,
-) -> Vec<Span<'static>> {
-    let Some(q) = query.filter(|q| !q.is_empty()) else {
-        return vec![Span::styled(text.to_string(), base_style)];
-    };
-    let hi = base_style
-        .bg(Color::Magenta)
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD);
-    let hi_current = base_style
-        .bg(Color::Cyan)
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD);
-    let mut spans = Vec::new();
-    let mut cursor = 0;
-    let qlen = q.len();
-    while let Some(found) = text[cursor..].find(q) {
-        let start = cursor + found;
-        if start > cursor {
-            spans.push(Span::styled(text[cursor..start].to_string(), base_style));
-        }
-        *match_counter += 1;
-        let style = if current_match == Some(*match_counter) {
-            hi_current
-        } else {
-            hi
-        };
-        spans.push(Span::styled(text[start..start + qlen].to_string(), style));
-        cursor = start + qlen;
-    }
-    if cursor < text.len() {
-        spans.push(Span::styled(text[cursor..].to_string(), base_style));
-    }
-    spans
 }
 
 /// Pane-title chip rendered next to a log pane label when the user
@@ -2391,5 +2598,44 @@ fn describe_profile(p: ProfileSel) -> &'static str {
         ProfileSel::All => "all profiles",
         ProfileSel::System => "system only",
         ProfileSel::Home => "home only",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joined_text(segments: &[StyledSegment]) -> String {
+        segments.iter().map(|seg| seg.text.as_str()).collect()
+    }
+
+    #[test]
+    fn styles_pkg_done_line_without_changing_text() {
+        let segments = style_pkg_probe_line("[pkg] done (0 change(s))", Style::default());
+        assert_eq!(joined_text(&segments), "[pkg] done (0 change(s))");
+    }
+
+    #[test]
+    fn styles_pkg_version_update_without_changing_text() {
+        let segments = style_pkg_probe_line(
+            "[pkg] usbutils: 018 → 018, 019, 019-man",
+            Style::default(),
+        );
+        assert_eq!(
+            joined_text(&segments),
+            "[pkg] usbutils: 018 → 018, 019, 019-man"
+        );
+    }
+
+    #[test]
+    fn size_remote_line_shows_human_size_and_delta() {
+        let segments = style_size_probe_line(
+            "[size] remote: 13886547224 bytes",
+            Style::default(),
+            Some(13886874912),
+        );
+        let text = joined_text(&segments);
+        assert!(text.contains("12.9 GiB"));
+        assert!(text.contains("delta +320.0 KiB"));
     }
 }
