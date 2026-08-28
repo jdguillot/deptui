@@ -1162,6 +1162,7 @@ mod tests {
             hostname: "myhost.example.com".into(),
             ssh_user: Some("root".into()),
             profiles: BTreeMap::new(),
+            profiles_order: None,
         };
         let o = SshOverride::default();
         assert_eq!(build_ssh_target(&node, "system", &o), "root@myhost.example.com");
@@ -1174,6 +1175,7 @@ mod tests {
             hostname: "myhost.example.com".into(),
             ssh_user: Some("root".into()),
             profiles: BTreeMap::new(),
+            profiles_order: None,
         };
         let o = SshOverride {
             hostname: Some("10.0.0.5".into()),
@@ -1190,6 +1192,7 @@ mod tests {
             hostname: "myhost.example.com".into(),
             ssh_user: None,
             profiles: BTreeMap::new(),
+            profiles_order: None,
         };
         let o = SshOverride::default();
         // No user at all → bare hostname.
@@ -1202,13 +1205,14 @@ mod tests {
         let mut profiles = BTreeMap::new();
         profiles.insert(
             "home".into(),
-            Profile { user: Some("jd".into()) },
+            Profile { user: Some("jd".into()), ssh_user: None },
         );
         let node = Node {
             name: "myhost".into(),
             hostname: "myhost.example.com".into(),
             ssh_user: None,
             profiles,
+            profiles_order: None,
         };
         let o = SshOverride::default();
         // Home profile should use its own user.

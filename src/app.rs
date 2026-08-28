@@ -2700,6 +2700,19 @@ impl App {
                 }
                 other => other,
             };
+            // Profiles in deploy order, so `DeployRequest::plan` can tell
+            // whether an ssh-user override fits each one and split the run
+            // when it doesn't.
+            let profiles = node
+                .ordered_profiles()
+                .into_iter()
+                .filter_map(|name| {
+                    node.profiles.get(&name).map(|p| deploy::ProfileInfo {
+                        name,
+                        user: p.user.clone(),
+                    })
+                })
+                .collect();
             let req = DeployRequest {
                 flake: self.flake.clone(),
                 node: node.name.clone(),
@@ -2708,6 +2721,7 @@ impl App {
                 toggles: self.toggles,
                 ssh_override: self.override_for(&node.name).clone(),
                 askpass: self.askpass_env.clone(),
+                profiles,
             };
             self.push_log_tagged(
                 format!(
@@ -3111,14 +3125,15 @@ mod tests {
 
     fn sample_nodes() -> Vec<Node> {
         let mut profiles = BTreeMap::new();
-        profiles.insert("system".into(), Profile { user: None });
-        profiles.insert("home".into(), Profile { user: Some("jd".into()) });
+        profiles.insert("system".into(), Profile { user: None, ssh_user: None });
+        profiles.insert("home".into(), Profile { user: Some("jd".into()), ssh_user: None });
         vec![
             Node {
                 name: "alpha".into(),
                 hostname: "alpha.lan".into(),
                 ssh_user: Some("root".into()),
                 profiles: profiles.clone(),
+                profiles_order: None,
             },
             Node {
                 name: "beta".into(),
@@ -3126,15 +3141,17 @@ mod tests {
                 ssh_user: None,
                 profiles: {
                     let mut p = BTreeMap::new();
-                    p.insert("system".into(), Profile { user: None });
+                    p.insert("system".into(), Profile { user: None, ssh_user: None });
                     p
                 },
+                profiles_order: None,
             },
             Node {
                 name: "gamma".into(),
                 hostname: "gamma.lan".into(),
                 ssh_user: None,
                 profiles: BTreeMap::new(),
+                profiles_order: None,
             },
         ]
     }

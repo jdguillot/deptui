@@ -51,6 +51,7 @@ fn basic_request() -> DeployRequest {
             script_path: "/dev/null".into(),
             socket_path: "/dev/null".into(),
         },
+        profiles: Vec::new(),
     }
 }
 

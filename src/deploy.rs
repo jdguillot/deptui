@@ -7,11 +7,13 @@
 
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::mpsc;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
@@ -89,6 +91,31 @@ impl Default for Toggles {
     }
 }
 
+/// What we know about one of the node's deploy-rs profiles, in the order
+/// deploy-rs pushes them. Used to decide whether the ssh-user override can
+/// safely be applied to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileInfo {
+    /// Profile name as it appears in `deploy.nodes.<node>.profiles`.
+    pub name: String,
+    /// The user the profile is activated as (`profiles.<n>.user`).
+    pub user: Option<String>,
+}
+
+/// One `deploy` child process: which flake target suffix to push, and which
+/// `--ssh-user` (if any) to pass for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    /// `""`, `".system"`, `".home"` — appended to `<flake>#<node>`.
+    pub suffix: String,
+    /// Value for `--ssh-user`, or `None` to leave the flake's own
+    /// `sshUser` in charge.
+    pub ssh_user: Option<String>,
+    /// True when the ssh-user override was deliberately withheld here
+    /// because applying it would break the profile's activation.
+    pub override_withheld: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeployRequest {
     pub flake: String,
@@ -101,16 +128,107 @@ pub struct DeployRequest {
     pub ssh_override: SshOverride,
     /// Askpass environment for SSH_ASKPASS integration.
     pub askpass: AskpassEnv,
+    /// The node's profiles in deploy order. Empty when discovery didn't
+    /// report any, in which case we fall back to the old single-invocation
+    /// behaviour rather than guessing.
+    pub profiles: Vec<ProfileInfo>,
+}
+
+/// Can the ssh-user override be applied to this profile without breaking
+/// its activation?
+///
+/// `--ssh-user` is a *global* deploy-rs flag, but the activation user is
+/// per-profile. When they differ deploy-rs runs `sudo -u <user>` from the
+/// ssh login. That is fine for escalating to root, which needs no session
+/// of its own — but `sudo -u <human>` from someone else's login inherits no
+/// D-Bus and no `XDG_RUNTIME_DIR`, so home-manager's `systemctl --user`
+/// step fails and the whole deploy rolls back.
+fn override_fits(profile: &ProfileInfo, override_user: &str) -> bool {
+    match profile.user.as_deref() {
+        // Nothing to sudo to, or we're already that user.
+        None => true,
+        Some(u) if u == override_user => true,
+        // Escalation to root needs no user session.
+        Some("root") => true,
+        Some(_) => false,
+    }
 }
 
 impl DeployRequest {
-    fn target(&self) -> String {
-        format!(
-            "{}#{}{}",
-            self.flake,
-            self.node,
-            self.profile.target_suffix()
-        )
+    fn target_with(&self, suffix: &str) -> String {
+        format!("{}#{}{}", self.flake, self.node, suffix)
+    }
+
+    /// Which profiles the current selection actually pushes.
+    fn selected_profiles(&self) -> Vec<&ProfileInfo> {
+        self.profiles
+            .iter()
+            .filter(|p| match self.profile {
+                ProfileSel::All => true,
+                ProfileSel::System => p.name == "system",
+                ProfileSel::Home => p.name == "home",
+            })
+            .collect()
+    }
+
+    /// Expand this request into the `deploy` invocations to run, in order.
+    ///
+    /// Normally that's exactly one. It becomes several only when an
+    /// ssh-user override is set and the selected profiles disagree about
+    /// whether it fits — a single `--ssh-user` cannot serve both, so each
+    /// profile gets its own child with the right login user.
+    pub fn plan(&self) -> Vec<Invocation> {
+        let whole = self.profile.target_suffix().to_string();
+
+        let Some(override_user) = self.ssh_override.user.clone() else {
+            return vec![Invocation {
+                suffix: whole,
+                ssh_user: None,
+                override_withheld: false,
+            }];
+        };
+
+        let selected = self.selected_profiles();
+
+        // Discovery told us nothing — keep the previous behaviour rather
+        // than silently dropping what the user asked for.
+        if selected.is_empty() {
+            return vec![Invocation {
+                suffix: whole,
+                ssh_user: Some(override_user),
+                override_withheld: false,
+            }];
+        }
+
+        let fits: Vec<bool> = selected
+            .iter()
+            .map(|p| override_fits(p, &override_user))
+            .collect();
+
+        if fits.iter().all(|ok| *ok) {
+            return vec![Invocation {
+                suffix: whole,
+                ssh_user: Some(override_user),
+                override_withheld: false,
+            }];
+        }
+        if fits.iter().all(|ok| !*ok) {
+            return vec![Invocation {
+                suffix: whole,
+                ssh_user: None,
+                override_withheld: true,
+            }];
+        }
+
+        selected
+            .iter()
+            .zip(fits)
+            .map(|(p, ok)| Invocation {
+                suffix: format!(".{}", p.name),
+                ssh_user: if ok { Some(override_user.clone()) } else { None },
+                override_withheld: !ok,
+            })
+            .collect()
     }
 }
 
@@ -202,8 +320,67 @@ async fn run_inner(
     stdin_rx: Option<mpsc::Receiver<String>>,
     sudo_password: Option<Zeroizing<String>>,
 ) -> Result<()> {
+    let plan = req.plan();
+    let multi = plan.len() > 1;
+
+    // One receiver, several sequential children. Sharing it behind a mutex
+    // lets each child's writer task take it in turn instead of the first
+    // one consuming it for good.
+    let stdin_rx = stdin_rx.map(|r| Arc::new(TokioMutex::new(r)));
+
+    let mut code = 0;
+    for (idx, inv) in plan.iter().enumerate() {
+        if inv.override_withheld {
+            if let Some(user) = &req.ssh_override.user {
+                let profile = if inv.suffix.is_empty() {
+                    "this deploy".to_string()
+                } else {
+                    format!("`{}`", inv.suffix.trim_start_matches('.'))
+                };
+                let _ = tx
+                    .send(LogLine::Stderr(format!(
+                        "• ssh-user override `{user}` not applied to {profile}: deploy-rs \
+would log in as `{user}` and then `sudo -u` the profile's own user, which \
+inherits no D-Bus session — home-manager's `systemctl --user` step fails \
+there. Using the flake's sshUser for it instead."
+                    )))
+                    .await;
+            }
+        }
+        if multi {
+            let _ = tx
+                .send(LogLine::Stdout(format!(
+                    "• [{}/{}] deploying {}{}",
+                    idx + 1,
+                    plan.len(),
+                    req.node,
+                    inv.suffix
+                )))
+                .await;
+        }
+
+        code = run_one(&req, inv, &tx, stdin_rx.clone(), sudo_password.as_ref()).await?;
+        if code != 0 {
+            break;
+        }
+    }
+
+    let _ = tx.send(LogLine::Exit(code)).await;
+    Ok(())
+}
+
+/// Spawn a single `deploy` child for one [`Invocation`] and stream its
+/// output. Returns the child's exit code; the caller owns the final
+/// [`LogLine::Exit`].
+async fn run_one(
+    req: &DeployRequest,
+    inv: &Invocation,
+    tx: &mpsc::Sender<LogLine>,
+    stdin_rx: Option<Arc<TokioMutex<mpsc::Receiver<String>>>>,
+    sudo_password: Option<&Zeroizing<String>>,
+) -> Result<i32> {
     let mut cmd = Command::new("deploy");
-    cmd.arg(req.target());
+    cmd.arg(req.target_with(&inv.suffix));
 
     // Mode → activation flag.
     match req.mode {
@@ -236,10 +413,13 @@ async fn run_inner(
     }
 
     // Per-host SSH override → --hostname / --ssh-user / --ssh-opts.
+    // The user comes from the invocation rather than the override itself:
+    // `--ssh-user` applies to every profile in one `deploy` run, so
+    // `plan()` may have withheld it here. See `override_fits`.
     if let Some(host) = &req.ssh_override.hostname {
         cmd.args(["--hostname", host]);
     }
-    if let Some(user) = &req.ssh_override.user {
+    if let Some(user) = &inv.ssh_user {
         cmd.args(["--ssh-user", user]);
     }
     if let Some(opts) = req.ssh_override.deploy_ssh_opts() {
@@ -299,7 +479,7 @@ async fn run_inner(
         // end buffers until the child reads it.
         // SAFETY: `from_raw_fd` takes ownership of the master fd.
         let mut master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
-        if let Some(pw) = sudo_password.as_ref() {
+        if let Some(pw) = sudo_password {
             use std::io::Write;
             let _ = master_file.write_all(pw.as_bytes());
             let _ = master_file.write_all(b"\n");
@@ -366,18 +546,23 @@ async fn run_inner(
     // When interactive_sudo is enabled, spawn a task that reads password
     // strings from the channel and writes them (plus a newline) to the
     // child's piped stdin.
-    if let (Some(child_stdin), Some(mut rx)) = (child.stdin.take(), stdin_rx) {
+    if let (Some(child_stdin), Some(rx_arc)) = (child.stdin.take(), stdin_rx) {
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
             let mut stdin = child_stdin;
+            let mut rx = rx_arc.lock().await;
             while let Some(password) = rx.recv().await {
-                // Write the password followed by a newline. Ignore errors
-                // (child may have already exited).
-                let _ = stdin.write_all(password.as_bytes()).await;
-                let _ = stdin.write_all(b"\n").await;
-                let _ = stdin.flush().await;
+                // Write the password followed by a newline. A write error
+                // means this child is gone — stop, so the next invocation's
+                // task can take the receiver.
+                if stdin.write_all(password.as_bytes()).await.is_err()
+                    || stdin.write_all(b"\n").await.is_err()
+                    || stdin.flush().await.is_err()
+                {
+                    break;
+                }
             }
-            // rx closed (sender dropped) → task exits naturally.
+            // rx closed (sender dropped) or child gone → release the lock.
         });
     }
 
@@ -418,9 +603,7 @@ async fn run_inner(
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
-    let code = status.code().unwrap_or(-1);
-    let _ = tx.send(LogLine::Exit(code)).await;
-    Ok(())
+    Ok(status.code().unwrap_or(-1))
 }
 
 /// Remove ANSI terminal control sequences from a captured line.
@@ -609,6 +792,120 @@ mod tests {
         }
     }
 
+    fn req(profile: ProfileSel, override_user: Option<&str>, profiles: Vec<ProfileInfo>) -> DeployRequest {
+        DeployRequest {
+            flake: ".".into(),
+            node: "host".into(),
+            profile,
+            mode: Mode::Switch,
+            toggles: Toggles::default(),
+            ssh_override: SshOverride {
+                user: override_user.map(str::to_string),
+                ..Default::default()
+            },
+            askpass: dummy_askpass(),
+            profiles,
+        }
+    }
+
+    fn sys_and_home() -> Vec<ProfileInfo> {
+        vec![
+            ProfileInfo { name: "system".into(), user: Some("root".into()) },
+            ProfileInfo { name: "home".into(), user: Some("jd".into()) },
+        ]
+    }
+
+    // ---- ssh-user override planning ----
+
+    #[test]
+    fn plan_without_override_is_one_untouched_invocation() {
+        let plan = req(ProfileSel::All, None, sys_and_home()).plan();
+        assert_eq!(
+            plan,
+            vec![Invocation { suffix: "".into(), ssh_user: None, override_withheld: false }]
+        );
+    }
+
+    #[test]
+    fn plan_splits_when_override_fits_only_some_profiles() {
+        // The regression this fixes: `--ssh-user root` is global, so the
+        // home profile would be activated via `sudo -u jd` from root's
+        // login — no session bus, home-manager activation fails, and
+        // magic-rollback reverts the system profile too.
+        let plan = req(ProfileSel::All, Some("root"), sys_and_home()).plan();
+        assert_eq!(
+            plan,
+            vec![
+                Invocation { suffix: ".system".into(), ssh_user: Some("root".into()), override_withheld: false },
+                Invocation { suffix: ".home".into(), ssh_user: None, override_withheld: true },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_keeps_single_invocation_when_override_fits_everything() {
+        // ssh as the home profile's own user: no sudo, nothing to lose.
+        let plan = req(ProfileSel::All, Some("jd"), sys_and_home()).plan();
+        assert_eq!(
+            plan,
+            vec![Invocation { suffix: "".into(), ssh_user: Some("jd".into()), override_withheld: false }]
+        );
+    }
+
+    #[test]
+    fn plan_withholds_override_for_home_only_selection() {
+        let plan = req(ProfileSel::Home, Some("root"), sys_and_home()).plan();
+        assert_eq!(
+            plan,
+            vec![Invocation { suffix: ".home".into(), ssh_user: None, override_withheld: true }]
+        );
+    }
+
+    #[test]
+    fn plan_applies_override_for_system_only_selection() {
+        let plan = req(ProfileSel::System, Some("root"), sys_and_home()).plan();
+        assert_eq!(
+            plan,
+            vec![Invocation { suffix: ".system".into(), ssh_user: Some("root".into()), override_withheld: false }]
+        );
+    }
+
+    #[test]
+    fn plan_falls_back_when_profiles_unknown() {
+        // Discovery gave us nothing — honour the override rather than
+        // silently dropping what the user asked for.
+        let plan = req(ProfileSel::All, Some("root"), Vec::new()).plan();
+        assert_eq!(
+            plan,
+            vec![Invocation { suffix: "".into(), ssh_user: Some("root".into()), override_withheld: false }]
+        );
+    }
+
+    #[test]
+    fn plan_preserves_profile_order() {
+        // `profiles` arrives in deploy order; the split must not reorder it.
+        let mut reversed = sys_and_home();
+        reversed.reverse();
+        let plan = req(ProfileSel::All, Some("root"), reversed).plan();
+        let suffixes: Vec<&str> = plan.iter().map(|i| i.suffix.as_str()).collect();
+        assert_eq!(suffixes, vec![".home", ".system"]);
+    }
+
+    #[test]
+    fn override_fits_rules() {
+        let root = ProfileInfo { name: "system".into(), user: Some("root".into()) };
+        let jd = ProfileInfo { name: "home".into(), user: Some("jd".into()) };
+        let none = ProfileInfo { name: "x".into(), user: None };
+        // Escalating to root needs no session of its own.
+        assert!(override_fits(&root, "jd"));
+        // Already the right user.
+        assert!(override_fits(&jd, "jd"));
+        // No activation user to sudo to.
+        assert!(override_fits(&none, "root"));
+        // The broken case.
+        assert!(!override_fits(&jd, "root"));
+    }
+
     // ---- ProfileSel ----
 
     #[test]
@@ -638,8 +935,9 @@ mod tests {
             toggles: Toggles::default(),
             ssh_override: SshOverride::default(),
             askpass: dummy_askpass(),
+            profiles: Vec::new(),
         };
-        assert_eq!(req.target(), "/home/me/dotfiles#myhost");
+        assert_eq!(req.target_with(&req.plan()[0].suffix), "/home/me/dotfiles#myhost");
     }
 
     #[test]
@@ -652,8 +950,9 @@ mod tests {
             toggles: Toggles::default(),
             ssh_override: SshOverride::default(),
             askpass: dummy_askpass(),
+            profiles: Vec::new(),
         };
-        assert_eq!(req.target(), ".#server1.system");
+        assert_eq!(req.target_with(&req.plan()[0].suffix), ".#server1.system");
     }
 
     #[test]
@@ -666,8 +965,9 @@ mod tests {
             toggles: Toggles::default(),
             ssh_override: SshOverride::default(),
             askpass: dummy_askpass(),
+            profiles: Vec::new(),
         };
-        assert_eq!(req.target(), "github:me/dotfiles#laptop.home");
+        assert_eq!(req.target_with(&req.plan()[0].suffix), "github:me/dotfiles#laptop.home");
     }
 
     // ---- Toggles ----
