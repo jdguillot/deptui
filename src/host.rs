@@ -975,8 +975,6 @@ async fn local_profile_path(flake: &str, node: &str, profile: &str) -> Result<St
     Ok(raw.trim_end_matches("/activate").to_string())
 }
 
-
-
 /// Run a non-interactive ssh command and return its stdout. Errors include
 /// stderr to make TUI diagnostics legible.
 async fn ssh_capture(
@@ -1579,9 +1577,8 @@ pub fn parse_dry_run(text: &str) -> BuildPlan {
             Section::None => {}
         }
     }
-    plan.nothing_to_do = plan.to_build.is_empty()
-        && plan.to_fetch.is_empty()
-        && plan.download_bytes.is_none();
+    plan.nothing_to_do =
+        plan.to_build.is_empty() && plan.to_fetch.is_empty() && plan.download_bytes.is_none();
     plan
 }
 
@@ -1640,10 +1637,7 @@ async fn resolve_build_outputs(drvs: &[String]) -> Vec<String> {
         return Vec::new();
     }
     // `nix derivation show` replaced `nix show-derivation` in nix 2.17.
-    for verb in [
-        &["derivation", "show"][..],
-        &["show-derivation"][..],
-    ] {
+    for verb in [&["derivation", "show"][..], &["show-derivation"][..]] {
         let out = Command::new("nix")
             .args(verb)
             .arg("--no-warn-dirty")
@@ -1659,7 +1653,9 @@ async fn resolve_build_outputs(drvs: &[String]) -> Vec<String> {
         let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
             continue;
         };
-        let Some(map) = json.as_object() else { continue };
+        let Some(map) = json.as_object() else {
+            continue;
+        };
         let mut paths = Vec::new();
         for drv in map.values() {
             let Some(outputs) = drv.get("outputs").and_then(|o| o.as_object()) else {
@@ -1896,8 +1892,7 @@ mod tests {
 
     #[test]
     fn split_activate_rs_suffix() {
-        let (name, ver) =
-            split_name_version("abc123-nixos-system-myhost-26.05.12345-activate-rs");
+        let (name, ver) = split_name_version("abc123-nixos-system-myhost-26.05.12345-activate-rs");
         assert_eq!(name, "nixos-system-myhost-activate-rs");
         assert_eq!(ver, "26.05.12345");
     }
@@ -2098,7 +2093,10 @@ mod tests {
             profiles_order: None,
         };
         let o = SshOverride::default();
-        assert_eq!(build_ssh_target(&node, "system", &o), "root@myhost.example.com");
+        assert_eq!(
+            build_ssh_target(&node, "system", &o),
+            "root@myhost.example.com"
+        );
     }
 
     #[test]
@@ -2138,7 +2136,10 @@ mod tests {
         let mut profiles = BTreeMap::new();
         profiles.insert(
             "home".into(),
-            Profile { user: Some("jd".into()), ssh_user: None },
+            Profile {
+                user: Some("jd".into()),
+                ssh_user: None,
+            },
         );
         let node = Node {
             name: "myhost".into(),
@@ -2168,7 +2169,10 @@ these 2 derivations will be built:
     #[test]
     fn parses_builds_and_fetches() {
         let plan = parse_dry_run(SAMPLE);
-        assert_eq!(plan.build_labels(), vec!["cuda-merged-12.4", "ollama-0.5.4"]);
+        assert_eq!(
+            plan.build_labels(),
+            vec!["cuda-merged-12.4", "ollama-0.5.4"]
+        );
         assert_eq!(plan.fetch_labels(), vec!["hello-2.12.1"]);
         // Full paths are retained so seeding can resolve outputs.
         assert!(plan.to_build[0].starts_with("/nix/store/"));
@@ -2421,7 +2425,10 @@ max-jobs = 8
         let c = parse_nix_config_show(text);
         assert_eq!(
             c.substituters,
-            vec!["https://cache.nixos.org/", "https://nix-community.cachix.org"]
+            vec![
+                "https://cache.nixos.org/",
+                "https://nix-community.cachix.org"
+            ]
         );
         assert_eq!(c.trusted_users, vec!["root", "@wheel"]);
         assert_eq!(c.trusted_public_keys.len(), 2);
@@ -2435,9 +2442,7 @@ max-jobs = 8
 
     #[test]
     fn trusted_substituters_count_as_usable() {
-        let c = parse_nix_config_show(
-            "substituters = https://a\ntrusted-substituters = https://b",
-        );
+        let c = parse_nix_config_show("substituters = https://a\ntrusted-substituters = https://b");
         assert_eq!(c.substituters, vec!["https://a", "https://b"]);
     }
 

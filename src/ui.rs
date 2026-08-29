@@ -4,8 +4,8 @@
 //! screen, and `draw` paints the current [`App`] state. Keep all crossterm
 //! plumbing here so the App can stay focused on state transitions.
 
-use std::io::{stdout, Stdout};
 use std::collections::HashMap;
+use std::io::{stdout, Stdout};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -21,7 +21,10 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::app::{App, FocusPane, InputMode, LastDeploy, OverrideField, PromptSource, VisualMode, COMMANDS, TOGGLE_COUNT};
+use crate::app::{
+    App, FocusPane, InputMode, LastDeploy, OverrideField, PromptSource, VisualMode, COMMANDS,
+    TOGGLE_COUNT,
+};
 use crate::deploy::{Mode, ProfileSel};
 use crate::host::{Reachability, UpdateState};
 
@@ -31,8 +34,7 @@ pub fn init() -> Result<Tui> {
     install_panic_hook();
     enable_raw_mode().context("enabling raw mode")?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)
-        .context("entering alternate screen")?;
+    execute!(out, EnterAlternateScreen).context("entering alternate screen")?;
     let backend = CrosstermBackend::new(out);
     let terminal = Terminal::new(backend).context("constructing terminal")?;
     Ok(terminal)
@@ -261,19 +263,14 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
         let sys_ok = status
             .as_ref()
             .map(|s| {
-                s.system_extra.local_path.is_some()
-                    && s.system_update != UpdateState::NotDeployed
+                s.system_extra.local_path.is_some() && s.system_update != UpdateState::NotDeployed
             })
             .unwrap_or(false);
         let home_ok = status
             .as_ref()
-            .map(|s| {
-                s.home_extra.local_path.is_some()
-                    && s.home_update != UpdateState::NotDeployed
-            })
+            .map(|s| s.home_extra.local_path.is_some() && s.home_update != UpdateState::NotDeployed)
             .unwrap_or(false);
-        let n = if has_system && sys_ok { 1 } else { 0 }
-            + if has_home && home_ok { 1 } else { 0 };
+        let n = if has_system && sys_ok { 1 } else { 0 } + if has_home && home_ok { 1 } else { 0 };
         n as u16 * 3 // rough estimate: each profile section is ~3 lines
     };
     // border (top+bottom) = 2; summary = 11; extras; minimum hosts = 3
@@ -529,10 +526,7 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &mut App) {
     let (summary_area, extras_area) = if extras_height > 0 {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(11),
-                Constraint::Min(0),
-            ])
+            .constraints([Constraint::Length(11), Constraint::Min(0)])
             .split(inner);
         (rows[0], Some(rows[1]))
     } else {
@@ -926,7 +920,10 @@ fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<
     if status.build_plans.is_empty() {
         return Line::from(vec![
             label,
-            Span::styled("not checked (Shift+P)", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "not checked (Shift+P)",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]);
     }
     let builds: usize = status.build_plans.values().map(|p| p.to_build.len()).sum();
@@ -939,7 +936,10 @@ fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<
     if builds == 0 && fetches == 0 {
         return Line::from(vec![
             label,
-            Span::styled("nothing to build or fetch", Style::default().fg(Color::Green)),
+            Span::styled(
+                "nothing to build or fetch",
+                Style::default().fg(Color::Green),
+            ),
         ]);
     }
     let mut spans = vec![label];
@@ -990,7 +990,10 @@ fn cache_drift_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line
     match &status.cache_drift {
         None => Line::from(vec![
             label,
-            Span::styled("not checked (Shift+C)", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "not checked (Shift+C)",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Some(d) if d.has_drift() => Line::from(vec![
             label,
@@ -1235,7 +1238,10 @@ fn highlight_segments(
         .fg(Color::Black)
         .add_modifier(Modifier::BOLD);
 
-    let full_text = segments.iter().map(|seg| seg.text.as_str()).collect::<String>();
+    let full_text = segments
+        .iter()
+        .map(|seg| seg.text.as_str())
+        .collect::<String>();
     let mut matches = Vec::new();
     let mut cursor = 0usize;
     while let Some(found) = full_text[cursor..].find(q) {
@@ -1485,10 +1491,7 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
                                 spans.push(Span::styled(before, body_style));
                             }
                             if !selected.is_empty() {
-                                spans.push(Span::styled(
-                                    selected,
-                                    body_style.patch(sel_bg),
-                                ));
+                                spans.push(Span::styled(selected, body_style.patch(sel_bg)));
                             }
                             if !after.is_empty() {
                                 spans.push(Span::styled(after, body_style));
@@ -1616,7 +1619,11 @@ fn compute_tail_scroll_offset(
         .iter()
         .map(|line| {
             let lw = line.width();
-            if lw <= w { 1 } else { lw.div_ceil(w) }
+            if lw <= w {
+                1
+            } else {
+                lw.div_ceil(w)
+            }
         })
         .collect();
     let total_rows: usize = per_entry_rows.iter().sum();
@@ -1857,7 +1864,11 @@ fn build_info_spans(app: &App) -> Vec<Span<'static>> {
 fn info_hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
     let search_active_here = matches!(
         (app.focus, app.log_search_target, &app.log_search),
-        (FocusPane::JobLog, Some(crate::app::SearchTarget::JobLog), Some(_))
+        (
+            FocusPane::JobLog,
+            Some(crate::app::SearchTarget::JobLog),
+            Some(_)
+        )
     );
     match app.focus {
         FocusPane::Hosts => vec![
@@ -2705,9 +2716,7 @@ fn draw_confirm_quit_popup(frame: &mut Frame, area: Rect, deploy_running: bool) 
         .border_style(Style::default().fg(Color::Red))
         .title(Span::styled(
             " confirm quit ",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -2953,10 +2962,8 @@ mod tests {
 
     #[test]
     fn styles_pkg_version_update_without_changing_text() {
-        let segments = style_pkg_probe_line(
-            "[pkg] usbutils: 018 → 018, 019, 019-man",
-            Style::default(),
-        );
+        let segments =
+            style_pkg_probe_line("[pkg] usbutils: 018 → 018, 019, 019-man", Style::default());
         assert_eq!(
             joined_text(&segments),
             "[pkg] usbutils: 018 → 018, 019, 019-man"

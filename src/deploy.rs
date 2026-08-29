@@ -247,7 +247,11 @@ impl DeployRequest {
             .zip(fits)
             .map(|(p, ok)| Invocation {
                 suffix: format!(".{}", p.name),
-                ssh_user: if ok { Some(override_user.clone()) } else { None },
+                ssh_user: if ok {
+                    Some(override_user.clone())
+                } else {
+                    None
+                },
                 override_withheld: !ok,
             })
             .collect()
@@ -954,7 +958,8 @@ async fn read_stderr_interactive_impl<R: tokio::io::AsyncRead + Unpin>(
             // A prompt always ends in `:` or `: `, so only those two bytes
             // can complete one. Anything else can't, and re-scanning would
             // be wasted work.
-            if b == b':' || (b == b' ' && line_buf.len() >= 2 && line_buf[line_buf.len() - 2] == b':')
+            if b == b':'
+                || (b == b' ' && line_buf.len() >= 2 && line_buf[line_buf.len() - 2] == b':')
             {
                 let s = String::from_utf8_lossy(&line_buf);
                 if is_sudo_prompt(s.as_ref()) {
@@ -1084,7 +1089,11 @@ mod tests {
         }
     }
 
-    fn req(profile: ProfileSel, override_user: Option<&str>, profiles: Vec<ProfileInfo>) -> DeployRequest {
+    fn req(
+        profile: ProfileSel,
+        override_user: Option<&str>,
+        profiles: Vec<ProfileInfo>,
+    ) -> DeployRequest {
         DeployRequest {
             flake: ".".into(),
             node: "host".into(),
@@ -1105,8 +1114,14 @@ mod tests {
 
     fn sys_and_home() -> Vec<ProfileInfo> {
         vec![
-            ProfileInfo { name: "system".into(), user: Some("root".into()) },
-            ProfileInfo { name: "home".into(), user: Some("jd".into()) },
+            ProfileInfo {
+                name: "system".into(),
+                user: Some("root".into()),
+            },
+            ProfileInfo {
+                name: "home".into(),
+                user: Some("jd".into()),
+            },
         ]
     }
 
@@ -1117,7 +1132,11 @@ mod tests {
         let plan = req(ProfileSel::All, None, sys_and_home()).plan();
         assert_eq!(
             plan,
-            vec![Invocation { suffix: "".into(), ssh_user: None, override_withheld: false }]
+            vec![Invocation {
+                suffix: "".into(),
+                ssh_user: None,
+                override_withheld: false
+            }]
         );
     }
 
@@ -1131,8 +1150,16 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                Invocation { suffix: ".system".into(), ssh_user: Some("root".into()), override_withheld: false },
-                Invocation { suffix: ".home".into(), ssh_user: None, override_withheld: true },
+                Invocation {
+                    suffix: ".system".into(),
+                    ssh_user: Some("root".into()),
+                    override_withheld: false
+                },
+                Invocation {
+                    suffix: ".home".into(),
+                    ssh_user: None,
+                    override_withheld: true
+                },
             ]
         );
     }
@@ -1143,7 +1170,11 @@ mod tests {
         let plan = req(ProfileSel::All, Some("jd"), sys_and_home()).plan();
         assert_eq!(
             plan,
-            vec![Invocation { suffix: "".into(), ssh_user: Some("jd".into()), override_withheld: false }]
+            vec![Invocation {
+                suffix: "".into(),
+                ssh_user: Some("jd".into()),
+                override_withheld: false
+            }]
         );
     }
 
@@ -1152,7 +1183,11 @@ mod tests {
         let plan = req(ProfileSel::Home, Some("root"), sys_and_home()).plan();
         assert_eq!(
             plan,
-            vec![Invocation { suffix: ".home".into(), ssh_user: None, override_withheld: true }]
+            vec![Invocation {
+                suffix: ".home".into(),
+                ssh_user: None,
+                override_withheld: true
+            }]
         );
     }
 
@@ -1161,7 +1196,11 @@ mod tests {
         let plan = req(ProfileSel::System, Some("root"), sys_and_home()).plan();
         assert_eq!(
             plan,
-            vec![Invocation { suffix: ".system".into(), ssh_user: Some("root".into()), override_withheld: false }]
+            vec![Invocation {
+                suffix: ".system".into(),
+                ssh_user: Some("root".into()),
+                override_withheld: false
+            }]
         );
     }
 
@@ -1172,7 +1211,11 @@ mod tests {
         let plan = req(ProfileSel::All, Some("root"), Vec::new()).plan();
         assert_eq!(
             plan,
-            vec![Invocation { suffix: "".into(), ssh_user: Some("root".into()), override_withheld: false }]
+            vec![Invocation {
+                suffix: "".into(),
+                ssh_user: Some("root".into()),
+                override_withheld: false
+            }]
         );
     }
 
@@ -1188,9 +1231,18 @@ mod tests {
 
     #[test]
     fn override_fits_rules() {
-        let root = ProfileInfo { name: "system".into(), user: Some("root".into()) };
-        let jd = ProfileInfo { name: "home".into(), user: Some("jd".into()) };
-        let none = ProfileInfo { name: "x".into(), user: None };
+        let root = ProfileInfo {
+            name: "system".into(),
+            user: Some("root".into()),
+        };
+        let jd = ProfileInfo {
+            name: "home".into(),
+            user: Some("jd".into()),
+        };
+        let none = ProfileInfo {
+            name: "x".into(),
+            user: None,
+        };
         // Escalating to root needs no session of its own.
         assert!(override_fits(&root, "jd"));
         // Already the right user.
@@ -1235,7 +1287,10 @@ mod tests {
             seed: None,
             node_info: None,
         };
-        assert_eq!(req.target_with(&req.plan()[0].suffix), "/home/me/dotfiles#myhost");
+        assert_eq!(
+            req.target_with(&req.plan()[0].suffix),
+            "/home/me/dotfiles#myhost"
+        );
     }
 
     #[test]
@@ -1271,7 +1326,10 @@ mod tests {
             seed: None,
             node_info: None,
         };
-        assert_eq!(req.target_with(&req.plan()[0].suffix), "github:me/dotfiles#laptop.home");
+        assert_eq!(
+            req.target_with(&req.plan()[0].suffix),
+            "github:me/dotfiles#laptop.home"
+        );
     }
 
     // ---- Toggles ----
@@ -1409,7 +1467,10 @@ mod tests {
 
     #[tokio::test]
     async fn forward_lines_flushes_unterminated_tail() {
-        assert_eq!(run_forward(b"no trailing newline").await, vec!["no trailing newline"]);
+        assert_eq!(
+            run_forward(b"no trailing newline").await,
+            vec!["no trailing newline"]
+        );
     }
 
     #[tokio::test]
@@ -1417,7 +1478,11 @@ mod tests {
         // Without a cap this buffers forever and shows nothing until EOF.
         let blob = vec![b'x'; MAX_LINE * 2 + 10];
         let out = run_forward(&blob).await;
-        assert!(out.len() >= 2, "expected the blob to be chunked, got {} entries", out.len());
+        assert!(
+            out.len() >= 2,
+            "expected the blob to be chunked, got {} entries",
+            out.len()
+        );
         assert!(out.iter().all(|l| l.len() <= MAX_LINE));
     }
 

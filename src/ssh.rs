@@ -124,10 +124,22 @@ mod tests {
     #[test]
     fn any_field_makes_active() {
         let cases = vec![
-            SshOverride { hostname: Some("h".into()), ..Default::default() },
-            SshOverride { user: Some("u".into()), ..Default::default() },
-            SshOverride { identity: Some(PathBuf::from("/k")), ..Default::default() },
-            SshOverride { extra_opts: Some("Port=22".into()), ..Default::default() },
+            SshOverride {
+                hostname: Some("h".into()),
+                ..Default::default()
+            },
+            SshOverride {
+                user: Some("u".into()),
+                ..Default::default()
+            },
+            SshOverride {
+                identity: Some(PathBuf::from("/k")),
+                ..Default::default()
+            },
+            SshOverride {
+                extra_opts: Some("Port=22".into()),
+                ..Default::default()
+            },
         ];
         for o in cases {
             assert!(o.is_active(), "expected active for {o:?}");
@@ -136,20 +148,29 @@ mod tests {
 
     #[test]
     fn effective_host_prefers_override() {
-        let o = SshOverride { hostname: Some("10.0.0.1".into()), ..Default::default() };
+        let o = SshOverride {
+            hostname: Some("10.0.0.1".into()),
+            ..Default::default()
+        };
         assert_eq!(o.effective_host("fallback.example.com"), "10.0.0.1");
     }
 
     #[test]
     fn effective_host_falls_back() {
         let o = SshOverride::default();
-        assert_eq!(o.effective_host("fallback.example.com"), "fallback.example.com");
+        assert_eq!(
+            o.effective_host("fallback.example.com"),
+            "fallback.example.com"
+        );
     }
 
     #[test]
     fn effective_user_priority() {
         // Override wins over fallback.
-        let o = SshOverride { user: Some("admin".into()), ..Default::default() };
+        let o = SshOverride {
+            user: Some("admin".into()),
+            ..Default::default()
+        };
         assert_eq!(o.effective_user(Some("root")), Some("admin"));
 
         // No override → fallback.
@@ -178,9 +199,12 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "-i", "/home/me/.ssh/id_ed25519",
-                "-o", "Port=2222",
-                "-o", "ProxyJump=bastion",
+                "-i",
+                "/home/me/.ssh/id_ed25519",
+                "-o",
+                "Port=2222",
+                "-o",
+                "ProxyJump=bastion",
             ]
         );
     }

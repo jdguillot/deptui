@@ -138,7 +138,10 @@ exit 0"#,
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(all_stdout.contains("ARG:--boot"), "expected --boot in: {all_stdout}");
+    assert!(
+        all_stdout.contains("ARG:--boot"),
+        "expected --boot in: {all_stdout}"
+    );
 }
 
 #[tokio::test]
@@ -193,7 +196,10 @@ exit 0"#,
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(all_stdout.contains("ARG:-s"), "expected -s flag: {all_stdout}");
+    assert!(
+        all_stdout.contains("ARG:-s"),
+        "expected -s flag: {all_stdout}"
+    );
     assert!(
         all_stdout.contains("ARG:--magic-rollback"),
         "expected --magic-rollback: {all_stdout}"
@@ -235,11 +241,26 @@ exit 0"#,
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(all_stdout.contains("ARG:--hostname"), "expected --hostname: {all_stdout}");
-    assert!(all_stdout.contains("ARG:10.0.0.5"), "expected IP: {all_stdout}");
-    assert!(all_stdout.contains("ARG:--ssh-user"), "expected --ssh-user: {all_stdout}");
-    assert!(all_stdout.contains("ARG:admin"), "expected user: {all_stdout}");
-    assert!(all_stdout.contains("ARG:--ssh-opts"), "expected --ssh-opts: {all_stdout}");
+    assert!(
+        all_stdout.contains("ARG:--hostname"),
+        "expected --hostname: {all_stdout}"
+    );
+    assert!(
+        all_stdout.contains("ARG:10.0.0.5"),
+        "expected IP: {all_stdout}"
+    );
+    assert!(
+        all_stdout.contains("ARG:--ssh-user"),
+        "expected --ssh-user: {all_stdout}"
+    );
+    assert!(
+        all_stdout.contains("ARG:admin"),
+        "expected user: {all_stdout}"
+    );
+    assert!(
+        all_stdout.contains("ARG:--ssh-opts"),
+        "expected --ssh-opts: {all_stdout}"
+    );
 }
 
 #[tokio::test]

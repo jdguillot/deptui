@@ -143,8 +143,7 @@ impl AskpassServer {
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
             .context("locking down the askpass wrapper script")?;
 
-        let listener =
-            UnixListener::bind(&socket_path).context("binding askpass Unix socket")?;
+        let listener = UnixListener::bind(&socket_path).context("binding askpass Unix socket")?;
         // The 0700 temp dir is the real boundary — nobody else can even
         // traverse into it — but the socket's own mode is left to the
         // umask by `bind`, and a lax umask would make it group-writable.
@@ -188,11 +187,7 @@ impl AskpassServer {
             // the whole mechanism down with it.
             let mut reader = BufReader::new(reader).take(MAX_PROMPT_BYTES);
             let mut raw = String::new();
-            let read = tokio::time::timeout(
-                PROMPT_READ_TIMEOUT,
-                reader.read_line(&mut raw),
-            )
-            .await;
+            let read = tokio::time::timeout(PROMPT_READ_TIMEOUT, reader.read_line(&mut raw)).await;
             if !matches!(read, Ok(Ok(_))) {
                 continue;
             }
@@ -370,9 +365,7 @@ mod tests {
                 let mut writer = std::io::BufWriter::new(&stream);
                 writeln!(writer, "Enter passphrase for key: ").unwrap();
                 writer.flush().unwrap();
-                stream
-                    .shutdown(std::net::Shutdown::Write)
-                    .unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
 
                 let mut reader = std::io::BufReader::new(&stream);
                 let mut password = String::new();

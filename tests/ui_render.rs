@@ -96,10 +96,7 @@ fn renders_at_awkward_terminal_sizes() {
             log_line(&mut app, &format!("line {i}"), "alpha");
         }
         let out = render(&mut app, w, h);
-        assert!(
-            !out.is_empty(),
-            "empty render at {w}x{h}",
-        );
+        assert!(!out.is_empty(), "empty render at {w}x{h}",);
     }
 }
 
@@ -206,7 +203,10 @@ fn password_popup_masks_the_buffer() {
         source: deptui::app::PromptSource::SudoPre,
     };
     let out = render(&mut app, 120, 40);
-    assert!(!out.contains("hunter2"), "password rendered in clear: {out}");
+    assert!(
+        !out.contains("hunter2"),
+        "password rendered in clear: {out}"
+    );
     assert!(out.contains("•••••••"), "mask missing: {out}");
 }
 
@@ -215,7 +215,10 @@ fn help_popup_renders_and_scrolls() {
     let mut app = App::new(".".into(), nodes());
     app.show_help = true;
     let first = render(&mut app, 120, 40);
-    assert!(first.contains("visual selection"), "help body missing: {first}");
+    assert!(
+        first.contains("visual selection"),
+        "help body missing: {first}"
+    );
 
     // The cheat sheet is taller than the popup, so the newer keys only
     // appear once it is scrolled. Walk down until they show up — this

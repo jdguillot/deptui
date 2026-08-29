@@ -81,7 +81,6 @@ impl Node {
     }
 }
 
-
 /// Run `nix eval --json` on the flake and parse the resulting attrset.
 pub async fn discover(flake: &str) -> Result<Vec<Node>> {
     // Apply function strips the heavy `path` derivations and keeps only the
@@ -138,7 +137,13 @@ mod tests {
     #[test]
     fn has_system_true() {
         let mut profiles = BTreeMap::new();
-        profiles.insert("system".into(), Profile { user: None, ssh_user: None });
+        profiles.insert(
+            "system".into(),
+            Profile {
+                user: None,
+                ssh_user: None,
+            },
+        );
         let node = Node {
             name: "host".into(),
             hostname: "host".into(),
@@ -153,7 +158,13 @@ mod tests {
     #[test]
     fn has_home_true() {
         let mut profiles = BTreeMap::new();
-        profiles.insert("home".into(), Profile { user: Some("jd".into()), ssh_user: None });
+        profiles.insert(
+            "home".into(),
+            Profile {
+                user: Some("jd".into()),
+                ssh_user: None,
+            },
+        );
         let node = Node {
             name: "host".into(),
             hostname: "host".into(),
@@ -168,8 +179,20 @@ mod tests {
     #[test]
     fn has_both() {
         let mut profiles = BTreeMap::new();
-        profiles.insert("system".into(), Profile { user: None, ssh_user: None });
-        profiles.insert("home".into(), Profile { user: Some("jd".into()), ssh_user: None });
+        profiles.insert(
+            "system".into(),
+            Profile {
+                user: None,
+                ssh_user: None,
+            },
+        );
+        profiles.insert(
+            "home".into(),
+            Profile {
+                user: Some("jd".into()),
+                ssh_user: None,
+            },
+        );
         let node = Node {
             name: "host".into(),
             hostname: "host".into(),
@@ -185,8 +208,20 @@ mod tests {
     fn ordered_profiles_defaults_system_first() {
         // BTreeMap would yield home, system — deploy-rs does the reverse.
         let mut profiles = BTreeMap::new();
-        profiles.insert("system".into(), Profile { user: None, ssh_user: None });
-        profiles.insert("home".into(), Profile { user: Some("jd".into()), ssh_user: None });
+        profiles.insert(
+            "system".into(),
+            Profile {
+                user: None,
+                ssh_user: None,
+            },
+        );
+        profiles.insert(
+            "home".into(),
+            Profile {
+                user: Some("jd".into()),
+                ssh_user: None,
+            },
+        );
         let node = Node {
             name: "host".into(),
             hostname: "host".into(),
@@ -200,9 +235,27 @@ mod tests {
     #[test]
     fn ordered_profiles_honours_explicit_order() {
         let mut profiles = BTreeMap::new();
-        profiles.insert("system".into(), Profile { user: None, ssh_user: None });
-        profiles.insert("home".into(), Profile { user: Some("jd".into()), ssh_user: None });
-        profiles.insert("extra".into(), Profile { user: None, ssh_user: None });
+        profiles.insert(
+            "system".into(),
+            Profile {
+                user: None,
+                ssh_user: None,
+            },
+        );
+        profiles.insert(
+            "home".into(),
+            Profile {
+                user: Some("jd".into()),
+                ssh_user: None,
+            },
+        );
+        profiles.insert(
+            "extra".into(),
+            Profile {
+                user: None,
+                ssh_user: None,
+            },
+        );
         let node = Node {
             name: "host".into(),
             hostname: "host".into(),
@@ -262,7 +315,10 @@ mod tests {
         let raw: BTreeMap<String, Node> = serde_json::from_str(json).unwrap();
         let nodes: Vec<Node> = raw
             .into_iter()
-            .map(|(name, mut node)| { node.name = name; node })
+            .map(|(name, mut node)| {
+                node.name = name;
+                node
+            })
             .collect();
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].name, "alpha");

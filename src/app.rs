@@ -13,10 +13,10 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use zeroize::Zeroizing;
 use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 use crate::askpass::{AskpassEnv, AskpassServer};
 use crate::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
@@ -711,8 +711,7 @@ impl App {
         let askpass_server = AskpassServer::new().context("setting up SSH_ASKPASS")?;
         self.askpass_env = askpass_server.env.clone();
         let (askpass_prompt_tx, askpass_prompt_rx) = mpsc::channel::<String>(4);
-        let (askpass_password_tx, askpass_password_rx) =
-            mpsc::channel::<Zeroizing<String>>(4);
+        let (askpass_password_tx, askpass_password_rx) = mpsc::channel::<Zeroizing<String>>(4);
         self.askpass_password_tx = askpass_password_tx;
         self.askpass_prompt_rx = askpass_prompt_rx;
         self._askpass_task = Some(tokio::spawn(async move {
@@ -1165,8 +1164,7 @@ impl App {
 
         // `n`/`N` jump between search matches from any pane — the search
         // is global so navigating results should be too.
-        if self.log_search.is_some()
-            && matches!(self.log_search_target, Some(SearchTarget::JobLog))
+        if self.log_search.is_some() && matches!(self.log_search_target, Some(SearchTarget::JobLog))
         {
             match key.code {
                 KeyCode::Char('n') if !shift => {
@@ -1712,10 +1710,7 @@ impl App {
                 // otherwise pop the pre-prompt widget and stash the
                 // deploy parameters until Enter is pressed.
                 if self.toggles.interactive_sudo && self.cached_password.is_none() {
-                    let first_host = hosts
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "host".into());
+                    let first_host = hosts.first().cloned().unwrap_or_else(|| "host".into());
                     self.pending_deploy = Some((hosts, mode, profile));
                     self.input = InputMode::PasswordPrompt {
                         prompt: format!("sudo password for {first_host}: "),
@@ -1879,10 +1874,7 @@ impl App {
                         if let Some(tx) = &self.deploy_stdin_tx {
                             let _ = tx.try_send(secret.to_string());
                         } else {
-                            self.push_log(
-                                "! no stdin channel available for sudo password",
-                                true,
-                            );
+                            self.push_log("! no stdin channel available for sudo password", true);
                         }
                         self.input = InputMode::Normal;
                     }
@@ -2080,12 +2072,7 @@ impl App {
         self.log
             .iter()
             .enumerate()
-            .filter_map(|(i, e)| {
-                e.host
-                    .as_deref()
-                    .filter(|h| active.contains(*h))
-                    .map(|_| i)
-            })
+            .filter_map(|(i, e)| e.host.as_deref().filter(|h| active.contains(*h)).map(|_| i))
             .collect()
     }
 
@@ -2141,7 +2128,7 @@ impl App {
         self.selected = next as usize;
     }
 
-        /// Same contract as [`scroll_log`] but for the job log pane. The
+    /// Same contract as [`scroll_log`] but for the job log pane. The
     /// job log only shows the active host set's entries, so we clamp
     /// against that filtered count.
     fn scroll_job_log(&mut self, delta: i32) {
@@ -2269,8 +2256,12 @@ impl App {
 
         if yank_to_clipboard(&text) {
             self.push_log(
-                format!("→ yanked {} line{} to clipboard", total, if total == 1 { "" } else { "s" })
-                    .as_str(),
+                format!(
+                    "→ yanked {} line{} to clipboard",
+                    total,
+                    if total == 1 { "" } else { "s" }
+                )
+                .as_str(),
                 false,
             );
         } else {
@@ -2908,10 +2899,7 @@ resolve the paths so they can be seeded",
                 // only append nodes that weren't known before.
                 for node in new_nodes {
                     if !self.nodes.iter().any(|n| n.name == node.name) {
-                        self.push_log(
-                            &format!("→ new node discovered: {}", node.name),
-                            false,
-                        );
+                        self.push_log(&format!("→ new node discovered: {}", node.name), false);
                         self.nodes.push(node);
                     }
                 }
@@ -3259,11 +3247,7 @@ resolve the paths so they can be seeded",
             };
             if !self.extra_build_args.is_empty() {
                 self.push_log_tagged(
-                    format!(
-                        "• extra build args: {}",
-                        self.extra_build_args.join(" ")
-                    )
-                    .as_str(),
+                    format!("• extra build args: {}", self.extra_build_args.join(" ")).as_str(),
                     false,
                     Some(node.name.clone()),
                 );
@@ -3302,7 +3286,9 @@ target's store instead.",
             // child's controlling tty. Clone so our cache survives for
             // replay on subsequent hosts in the queue.
             let sudo_pw = if self.toggles.interactive_sudo {
-                self.cached_password.as_deref().map(|s| Zeroizing::new(s.clone()))
+                self.cached_password
+                    .as_deref()
+                    .map(|s| Zeroizing::new(s.clone()))
             } else {
                 None
             };
@@ -3467,7 +3453,7 @@ target's store instead.",
                 self.deploy_rx = None;
                 self.deploy_cancel = None;
                 self.deploy_stdin_tx = None;
-    
+
                 if matches!(self.input, InputMode::PasswordPrompt { .. }) {
                     self.input = InputMode::Normal;
                 }
@@ -3942,13 +3928,25 @@ fn yank_to_clipboard(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use crate::flake::{Node, Profile};
+    use std::collections::BTreeMap;
 
     fn sample_nodes() -> Vec<Node> {
         let mut profiles = BTreeMap::new();
-        profiles.insert("system".into(), Profile { user: None, ssh_user: None });
-        profiles.insert("home".into(), Profile { user: Some("jd".into()), ssh_user: None });
+        profiles.insert(
+            "system".into(),
+            Profile {
+                user: None,
+                ssh_user: None,
+            },
+        );
+        profiles.insert(
+            "home".into(),
+            Profile {
+                user: Some("jd".into()),
+                ssh_user: None,
+            },
+        );
         vec![
             Node {
                 name: "alpha".into(),
@@ -3963,7 +3961,13 @@ mod tests {
                 ssh_user: None,
                 profiles: {
                     let mut p = BTreeMap::new();
-                    p.insert("system".into(), Profile { user: None, ssh_user: None });
+                    p.insert(
+                        "system".into(),
+                        Profile {
+                            user: None,
+                            ssh_user: None,
+                        },
+                    );
                     p
                 },
                 profiles_order: None,
@@ -4022,7 +4026,10 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         let inert = inert_remote_build_args(&args);
-        assert_eq!(inert, vec!["extra-substituters", "extra-trusted-public-keys"]);
+        assert_eq!(
+            inert,
+            vec!["extra-substituters", "extra-trusted-public-keys"]
+        );
     }
 
     #[test]
@@ -4036,7 +4043,11 @@ mod tests {
 
     #[test]
     fn describe_plan_names_what_will_be_compiled() {
-        let p = plan(&["ollama-0.5.4", "cuda-merged-12.4"], &["hello-2.12"], Some(1024 * 1024));
+        let p = plan(
+            &["ollama-0.5.4", "cuda-merged-12.4"],
+            &["hello-2.12"],
+            Some(1024 * 1024),
+        );
         let lines = describe_plan("gpu", "system", &p);
         let joined = lines
             .iter()
@@ -4044,10 +4055,15 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("ollama-0.5.4"), "{joined}");
-        assert!(joined.contains("2 derivation(s) will be COMPILED"), "{joined}");
+        assert!(
+            joined.contains("2 derivation(s) will be COMPILED"),
+            "{joined}"
+        );
         assert!(joined.contains("1.0 MiB download"), "{joined}");
         // Compiling is the part that has to stand out.
-        assert!(lines.iter().any(|(t, is_err)| *is_err && t.contains("ollama")));
+        assert!(lines
+            .iter()
+            .any(|(t, is_err)| *is_err && t.contains("ollama")));
     }
 
     #[test]
@@ -4065,7 +4081,10 @@ mod tests {
         let p = plan(&[], &[], None);
         let lines = describe_plan("host", "system", &p);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].0.contains("nothing to build or fetch"), "{lines:?}");
+        assert!(
+            lines[0].0.contains("nothing to build or fetch"),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -4078,7 +4097,10 @@ mod tests {
             "a 40-entry build list must not flood the log: {} lines",
             lines.len(),
         );
-        assert!(lines.iter().any(|(t, _)| t.contains("+28 more")), "{lines:?}");
+        assert!(
+            lines.iter().any(|(t, _)| t.contains("+28 more")),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -4188,7 +4210,10 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.visual_sel.is_none());
-        assert!(app.log_search.is_some(), "search must survive the first Esc");
+        assert!(
+            app.log_search.is_some(),
+            "search must survive the first Esc"
+        );
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.log_search.is_none());
@@ -4536,7 +4561,9 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(matches!(app.input, InputMode::Normal));
-        let reply = rx.try_recv().expect("server must receive a reply on dismiss");
+        let reply = rx
+            .try_recv()
+            .expect("server must receive a reply on dismiss");
         assert!(reply.is_empty(), "dismissal must not send the typed prefix");
         // And the half-typed password must not have been cached.
         assert!(app.cached_password.is_none());
