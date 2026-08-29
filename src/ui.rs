@@ -28,6 +28,7 @@ use crate::host::{Reachability, UpdateState};
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
 pub fn init() -> Result<Tui> {
+    install_panic_hook();
     enable_raw_mode().context("enabling raw mode")?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)
@@ -37,6 +38,30 @@ pub fn init() -> Result<Tui> {
     Ok(terminal)
 }
 
+/// Put the terminal back the way we found it before a panic message is
+/// printed.
+///
+/// `main` calls [`restore`] after `App::run` returns, but a panic unwinds
+/// straight past it. The user is then left in raw mode inside the
+/// alternate screen: no echo, no line editing, and the panic message
+/// itself written to a screen that is about to be discarded — so they see
+/// nothing and have to blind-type `reset`. The hook chains to the
+/// previous one so the message still reaches the real terminal.
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Already panicking — every step here is best-effort.
+            let _ = restore();
+            previous(info);
+        }));
+    });
+}
+
+/// Leave the alternate screen and raw mode. Safe to call when neither is
+/// active, and safe to call more than once — the panic hook and `main`
+/// can both reach it.
 pub fn restore() -> Result<()> {
     let mut out = stdout();
     execute!(out, LeaveAlternateScreen).ok();
@@ -139,7 +164,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         profile,
     } = &app.input
     {
-        draw_confirm_popup(frame, area, hosts, *mode, *profile);
+        draw_confirm_popup(frame, area, app, hosts, *mode, *profile);
     }
     if let InputMode::ConfirmQuit { deploy_running } = &app.input {
         draw_confirm_quit_popup(frame, area, *deploy_running);
@@ -733,7 +758,7 @@ fn size_delta_span(local: u64, remote: u64) -> Span<'static> {
 
 /// Bytes → short human-readable string (B / KiB / MiB / GiB). Uses
 /// binary prefixes to match `nix`.
-fn humanise_bytes(b: u64) -> String {
+pub fn humanise_bytes(b: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = b as f64;
     let mut unit = 0;
@@ -867,6 +892,8 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
             ]),
         },
     ];
+    lines.push(build_plan_summary_line(&status, app.tick_counter));
+    lines.push(cache_drift_summary_line(&status, app.tick_counter));
     if let Some(err) = &status.last_error {
         lines.push(Line::from(vec![
             Span::styled("error    ", Style::default().fg(Color::Red)),
@@ -875,6 +902,122 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// One-line build-plan verdict for the details pane.
+///
+/// Aggregates every profile that has been preflighted, because what the
+/// user wants at a glance is "does this deploy compile anything", not a
+/// per-profile breakdown — the job log has the detail.
+fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<'static> {
+    let label = Span::styled("plan     ", Style::default().fg(Color::DarkGray));
+    if status.checking_plan {
+        return Line::from(vec![
+            label,
+            Span::styled(
+                format!(
+                    "{} preflighting build…",
+                    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]);
+    }
+    if status.build_plans.is_empty() {
+        return Line::from(vec![
+            label,
+            Span::styled("not checked (Shift+P)", Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+    let builds: usize = status.build_plans.values().map(|p| p.to_build.len()).sum();
+    let fetches: usize = status.build_plans.values().map(|p| p.to_fetch.len()).sum();
+    let download: u64 = status
+        .build_plans
+        .values()
+        .filter_map(|p| p.download_bytes)
+        .sum();
+    if builds == 0 && fetches == 0 {
+        return Line::from(vec![
+            label,
+            Span::styled("nothing to build or fetch", Style::default().fg(Color::Green)),
+        ]);
+    }
+    let mut spans = vec![label];
+    if builds > 0 {
+        spans.push(Span::styled(
+            format!("{builds} to compile"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "nothing to compile".to_string(),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    if fetches > 0 {
+        let size = if download > 0 {
+            format!(" ({})", humanise_bytes(download))
+        } else {
+            String::new()
+        };
+        spans.push(Span::styled(
+            format!(", {fetches} to fetch{size}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// One-line substituter-drift verdict for the details pane.
+///
+/// "Not checked" gets its own dim wording rather than defaulting to the
+/// green "ok" state — the whole point of the check is that a deploy
+/// looks fine right up until it spends 40 minutes compiling.
+fn cache_drift_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<'static> {
+    let label = Span::styled("cache    ", Style::default().fg(Color::DarkGray));
+    if status.checking_cache {
+        return Line::from(vec![
+            label,
+            Span::styled(
+                format!(
+                    "{} checking substituters…",
+                    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]);
+    }
+    match &status.cache_drift {
+        None => Line::from(vec![
+            label,
+            Span::styled("not checked (Shift+C)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Some(d) if d.has_drift() => Line::from(vec![
+            label,
+            Span::styled(
+                format!(
+                    "adds {} unusable cache(s) for the {} build",
+                    d.added_substituters.len().max(d.added_keys.len()),
+                    d.site.label()
+                ),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Some(d) if d.ssh_user_trusted == Some(false) => Line::from(vec![
+            label,
+            Span::styled(
+                "no new caches, but the ssh user is not trusted",
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Some(d) => Line::from(vec![
+            label,
+            Span::styled(
+                format!("no new caches for the {} build", d.site.label()),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+    }
 }
 
 /// Palette used to colour host prefixes in the job-log pane. Chosen
@@ -1223,21 +1366,56 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         None
     };
-    let mut match_counter = 0usize;
-
     // Snapshot visual selection state (if any) for line building below.
     let visual_range = app.visual_sel.as_ref().map(|sel| {
         let ((sl, sc), (el, ec)) = sel.normalized();
         (sel.mode, sl, sc, el, ec)
     });
 
-    // Build every filtered line up-front and clamp scroll before the
-    // title reads it.
+    let visible = inner.height as usize;
+    app.job_log_viewport_height = visible;
+    if app.job_log_scroll >= tagged.len() {
+        app.job_log_scroll = tagged.len().saturating_sub(1);
+    }
+
+    // Only the tail of the buffer can ever be on screen, so only that
+    // tail gets turned into styled `Line`s. Building all 2000 capped
+    // entries every frame — each one allocating a handful of `Span`
+    // strings, then handed to a `Paragraph` that re-wraps every one of
+    // them before throwing away the ones above the scroll offset — made
+    // the frame cost grow with the log, which is exactly when frames
+    // matter most. `+ 2` of slack covers the partially-visible entries
+    // at both edges; every entry occupies at least one row, so a window
+    // of `scroll + visible + 2` entries always covers `visible` rows
+    // above the tail slice.
+    let window_len = app.job_log_scroll + visible + 2;
+    let window_start = tagged.len().saturating_sub(window_len);
+
+    // The two pieces of state that accumulate across the *whole* pane
+    // have to be caught up over the entries the window skips. Both are
+    // plain prefix tests — far cheaper than building their lines.
     let mut size_locals: HashMap<String, u64> = HashMap::new();
-    let all_lines: Vec<Line> = tagged
+    let mut match_counter = 0usize;
+    for entry in &tagged[..window_start] {
+        let host = entry.host.as_deref().unwrap_or("");
+        if let Some(local) = parse_size_bytes(&entry.text, "[size] local: ") {
+            size_locals.insert(host.to_string(), local);
+        }
+        if parse_size_bytes(&entry.text, "[size] remote: ").is_some() {
+            size_locals.remove(host);
+        }
+        if let Some(q) = query {
+            if !q.is_empty() {
+                match_counter += entry.text.matches(q).count();
+            }
+        }
+    }
+
+    let all_lines: Vec<Line> = tagged[window_start..]
         .iter()
         .enumerate()
-        .map(|(line_idx, entry)| {
+        .map(|(win_idx, entry)| {
+            let line_idx = win_idx + window_start;
             let host = entry.host.as_deref().unwrap_or("");
             let pad = width.saturating_sub(host.len());
             let color = job_log_color(host);
@@ -1339,8 +1517,11 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let visible = inner.height as usize;
-    app.job_log_viewport_height = visible;
+    // `compute_tail_scroll_offset` works purely off row counts relative to
+    // the tail, so running it over the window yields the same offset it
+    // would over the full list. Its scroll clamp only ever bites when the
+    // window already reaches entry 0 — at any smaller scroll the window
+    // provably holds more rows than the clamp needs.
     let y_offset = if tagged.is_empty() {
         app.job_log_scroll = 0;
         0
@@ -1435,7 +1616,7 @@ fn compute_tail_scroll_offset(
         .iter()
         .map(|line| {
             let lw = line.width();
-            if lw <= w { 1 } else { (lw + w - 1) / w }
+            if lw <= w { 1 } else { lw.div_ceil(w) }
         })
         .collect();
     let total_rows: usize = per_entry_rows.iter().sum();
@@ -2048,8 +2229,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         Line::raw(""),
 
         section("visual selection (job log)"),
-        key_line("V", "enter visual line mode — select whole lines with j/k"),
-        key_line("v", "enter visual char mode — select by character with j/k/h/l"),
+        key_line("V", "enter visual line mode — select whole lines with j/k (from any pane)"),
+        key_line("v", "enter visual char mode — select by character with j/k/h/l (from any pane)"),
         key_line("y", "yank selected text to clipboard (wl-copy / xclip / xsel / pbcopy)"),
         key_line("Esc", "cancel visual selection without copying"),
         Line::raw(""),
@@ -2064,6 +2245,34 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
             "Shift+U",
             "closure size delta + package diff (needs prior u)",
         ),
+        key_line(
+            "Shift+P",
+            "build plan preflight: what this deploy compiles + download size",
+        ),
+        Line::from(Span::styled(
+            "              runs `nix build --dry-run` the way deploy-rs would — against the",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "              target's store when toggle 4 (--remote-build) is on, else locally.",
+            dim,
+        )),
+        key_line(
+            "Shift+C",
+            "substituter drift: does this deploy add a cache its own build can't use?",
+        ),
+        Line::from(Span::styled(
+            "              a new nix.settings.substituters entry only goes live after nix-daemon",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "              restarts — which happens *after* the build. Compares against the",
+            dim,
+        )),
+        Line::from(Span::styled(
+            "              target's nix.conf for remote builds, this machine's for local ones.",
+            dim,
+        )),
         Line::from(Span::styled(
             "              badges: ✓ up-to-date   ↑ behind   — not deployed   ! error   ? unchecked   - n/a   ⠋ checking",
             dim,
@@ -2264,6 +2473,7 @@ fn key_line(keys: &str, desc: &str) -> Line<'static> {
 fn draw_confirm_popup(
     frame: &mut Frame,
     area: Rect,
+    app: &App,
     hosts: &[String],
     mode: Mode,
     profile: ProfileSel,
@@ -2339,6 +2549,8 @@ fn draw_confirm_popup(
         ]));
     }
     lines.push(Line::raw(""));
+    lines.extend(build_plan_warning_lines(app, hosts));
+    lines.extend(cache_drift_warning_lines(app, hosts));
     lines.push(Line::from(vec![
         Span::styled(
             "  y / Enter ",
@@ -2359,6 +2571,129 @@ fn draw_confirm_popup(
     ]));
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// The build-plan banner shown inside the deploy confirmation: what this
+/// deploy is about to compile, before the user commits to it.
+fn build_plan_warning_lines(app: &App, hosts: &[String]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for name in hosts {
+        let status = app.status_for(name);
+        if status.build_plans.is_empty() {
+            continue;
+        }
+        let builds: Vec<String> = status
+            .build_plans
+            .values()
+            .flat_map(|p| p.build_labels())
+            .collect();
+        if builds.is_empty() {
+            continue;
+        }
+        let download: u64 = status
+            .build_plans
+            .values()
+            .filter_map(|p| p.download_bytes)
+            .sum();
+        let suffix = if download > 0 {
+            format!(", {} to fetch", humanise_bytes(download))
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                " plan ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {name}: compiles {}{suffix}", builds.len()),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+        for b in builds.iter().take(4) {
+            lines.push(Line::styled(
+                format!("    ⚒ {b}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if builds.len() > 4 {
+            lines.push(Line::styled(
+                format!("    … +{} more", builds.len() - 4),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    if !lines.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+/// The substituter-drift banner shown inside the deploy confirmation.
+///
+/// Deliberately distinguishes "checked, and this deploy adds a cache it
+/// can't use" from "never checked" — the second is not reassurance, and
+/// showing nothing would read as if it were.
+fn cache_drift_warning_lines(app: &App, hosts: &[String]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut unchecked = Vec::new();
+    for name in hosts {
+        let status = app.status_for(name);
+        match status.cache_drift {
+            Some(drift) if drift.has_drift() => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        " cache ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Red)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            " {name}: adds {} cache(s) this {} build cannot use",
+                            drift.added_substituters.len(),
+                            drift.site.label()
+                        ),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]));
+                for url in drift.added_substituters.iter().take(3) {
+                    lines.push(Line::styled(
+                        format!("    + {url}"),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+                if drift.ssh_user_trusted == Some(false) {
+                    lines.push(Line::styled(
+                        format!(
+                            "    `{}` is not in trusted-users — overrides are ignored silently",
+                            drift.ssh_user.as_deref().unwrap_or("ssh user"),
+                        ),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+            }
+            Some(_) => {}
+            None => unchecked.push(name.clone()),
+        }
+    }
+    if !unchecked.is_empty() {
+        lines.push(Line::styled(
+            format!(
+                "  substituter drift not checked for {} host(s) — Shift+C",
+                unchecked.len()
+            ),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if !lines.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    lines
 }
 
 fn draw_confirm_quit_popup(frame: &mut Frame, area: Rect, deploy_running: bool) {
@@ -2423,7 +2758,7 @@ fn draw_password_popup(
     frame: &mut Frame,
     area: Rect,
     prompt: &str,
-    buf: &str,
+    buf: &crate::app::SecretBuf,
     source: &PromptSource,
 ) {
     let popup = centered_rect(50, 30, area);
@@ -2448,14 +2783,15 @@ fn draw_password_popup(
     frame.render_widget(block, popup);
 
     let label = {
-        let p = prompt.trim_end_matches(|c: char| c == ' ');
+        let p = prompt.trim_end_matches(' ');
         if p.ends_with(':') {
             format!("{p} ")
         } else {
             format!("{p}: ")
         }
     };
-    let masked: String = "•".repeat(buf.chars().count());
+    // Only ever the length is read — the plaintext never reaches a widget.
+    let masked: String = "•".repeat(buf.char_count());
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));

@@ -52,6 +52,9 @@ fn basic_request() -> DeployRequest {
             socket_path: "/dev/null".into(),
         },
         profiles: Vec::new(),
+        extra_build_args: Vec::new(),
+        seed: None,
+        node_info: None,
     }
 }
 
@@ -295,4 +298,91 @@ exit 0"#,
         all_stdout.contains("ARG:.#myhost.system"),
         "expected .#myhost.system in: {all_stdout}"
     );
+}
+
+/// Cancelling must take down the whole process group, not just the
+/// direct `deploy` child. The shim forks a background sleeper — standing
+/// in for the `nix` builders and `ssh` that a real deploy leaves behind —
+/// and reports its pid so the test can check it actually died.
+#[tokio::test]
+#[serial]
+async fn cancel_kills_the_whole_process_group() {
+    let _dir = install_deploy_shim(
+        r#"sleep 60 &
+echo "GRANDCHILD:$!"
+sleep 60"#,
+    );
+
+    let mut handle = deploy::run(basic_request(), None);
+
+    // Wait for the shim to report the pid of its background process.
+    let mut grandchild = None;
+    while let Some(line) = handle.rx.recv().await {
+        if let LogLine::Stdout(s) = line {
+            if let Some(pid) = s.strip_prefix("GRANDCHILD:") {
+                grandchild = pid.trim().parse::<i32>().ok();
+                break;
+            }
+        }
+    }
+    let grandchild = grandchild.expect("shim reported no background pid");
+
+    // Alive before the cancel, or the test proves nothing.
+    assert_eq!(
+        unsafe { libc::kill(grandchild, 0) },
+        0,
+        "background process {grandchild} should be running before cancel",
+    );
+
+    handle.cancel.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle.task).await;
+
+    // `kill(pid, 0)` returns -1/ESRCH once the process is gone. The shim
+    // is not our child, so there is no zombie to keep the pid alive.
+    let mut gone = false;
+    for _ in 0..100 {
+        if unsafe { libc::kill(grandchild, 0) } != 0 {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        gone,
+        "background process {grandchild} survived the cancel — the deploy's \
+process group was not signalled",
+    );
+}
+
+/// `--build-arg` values must land after deploy-rs's `--` separator, or
+/// they'd be parsed as deploy-rs's own flags instead of nix build args.
+#[tokio::test]
+#[serial]
+async fn extra_build_args_are_passed_after_the_separator() {
+    let _dir = install_deploy_shim(r#"for arg in "$@"; do echo "ARG:$arg"; done"#);
+
+    let mut req = basic_request();
+    req.extra_build_args = vec![
+        "--option".into(),
+        "extra-substituters".into(),
+        "https://cuda".into(),
+    ];
+    let lines = collect_lines(deploy::run(req, None)).await;
+    let all: Vec<String> = lines
+        .iter()
+        .filter_map(|l| match l {
+            LogLine::Stdout(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    let joined = all.join("\n");
+    assert!(joined.contains("ARG:--"), "missing separator: {joined}");
+    assert!(joined.contains("ARG:extra-substituters"), "{joined}");
+
+    let sep = all.iter().position(|a| a == "ARG:--").expect("separator");
+    let opt = all
+        .iter()
+        .position(|a| a == "ARG:extra-substituters")
+        .expect("build arg");
+    assert!(sep < opt, "build args must follow the separator: {joined}");
 }

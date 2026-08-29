@@ -10,9 +10,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
@@ -116,6 +117,19 @@ pub struct Invocation {
     pub override_withheld: bool,
 }
 
+/// Store paths to pull into the target's store from caches the deploy is
+/// about to add, before the build runs.
+///
+/// This is the additive fix for the substituter trap (see
+/// `host::seed_substituters`): purely a store population step, so
+/// there is nothing to roll back if the deploy fails or is cancelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedPlan {
+    pub substituters: Vec<String>,
+    pub keys: Vec<String>,
+    pub paths: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeployRequest {
     pub flake: String,
@@ -132,6 +146,14 @@ pub struct DeployRequest {
     /// report any, in which case we fall back to the old single-invocation
     /// behaviour rather than guessing.
     pub profiles: Vec<ProfileInfo>,
+    /// Extra arguments forwarded to `nix build` via deploy-rs's
+    /// `-- <EXTRA_BUILD_ARGS>…` tail. Empty for the common case.
+    pub extra_build_args: Vec<String>,
+    /// Cache seeding to perform before the first build. `None` when no
+    /// substituter drift was detected (or nothing was known about it).
+    pub seed: Option<SeedPlan>,
+    /// The node, needed to build the ssh target for the seeding step.
+    pub node_info: Option<crate::flake::Node>,
 }
 
 /// Can the ssh-user override be applied to this profile without breaking
@@ -248,10 +270,36 @@ pub enum LogLine {
     Error(String),
 }
 
+/// Stops a running deploy and everything it spawned.
+///
+/// Aborting the [`DeployHandle::task`] is *not* enough: `kill_on_drop`
+/// only signals the direct `deploy` child, and because we `setsid()` in
+/// `pre_exec` that child leads its own process group. Its descendants —
+/// `nix` and the builders it forks, `ssh` — survive the leader and keep
+/// burning CPU long after the user pressed `x`. Cancelling through this
+/// handle signals the whole group instead, and does it from inside the
+/// deploy task while it still owns the child, so the pid can't be
+/// recycled between the TERM and the KILL.
+#[derive(Debug, Clone)]
+pub struct DeployCanceller {
+    tx: watch::Sender<bool>,
+}
+
+impl DeployCanceller {
+    /// Ask the running deploy to stop. Idempotent; safe to call when
+    /// nothing is running.
+    pub fn cancel(&self) {
+        let _ = self.tx.send(true);
+    }
+}
+
 pub struct DeployHandle {
     pub rx: mpsc::Receiver<LogLine>,
-    /// Background task that owns the child. Drop or `.abort()` to cancel.
+    /// Background task that owns the child. Drop to detach; call
+    /// [`DeployHandle::cancel`] first so the process group is torn down.
     pub task: JoinHandle<()>,
+    /// Stops the deploy and its whole process group.
+    pub cancel: DeployCanceller,
     /// When `interactive_sudo` is enabled, send the sudo password here and
     /// it will be written to the child's piped stdin followed by a newline.
     /// `None` when the deploy was started without `--interactive-sudo`.
@@ -279,15 +327,47 @@ pub fn run(req: DeployRequest, sudo_password: Option<Zeroizing<String>>) -> Depl
     } else {
         (None, None)
     };
+    let (cancel_tx, cancel_rx) = watch::channel(false);
     let task = tokio::spawn(async move {
-        if let Err(e) = run_inner(req, tx.clone(), stdin_rx, sudo_password).await {
+        if let Err(e) = run_inner(req, tx.clone(), stdin_rx, sudo_password, cancel_rx).await {
             let _ = tx.send(LogLine::Error(format!("{e:#}"))).await;
         }
     });
     DeployHandle {
         rx,
         task,
+        cancel: DeployCanceller { tx: cancel_tx },
         stdin_tx,
+    }
+}
+
+/// How long the deploy tree gets to wind down after `SIGTERM` before we
+/// escalate to `SIGKILL`. Cancellation always takes at least this long
+/// (see the comment in `run_one`), so keep it short enough that quitting
+/// mid-deploy doesn't feel hung.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Send `sig` to the process group led by `pid`.
+///
+/// The `deploy` child is always a process-group leader (see the
+/// `setsid()` hook in `AskpassEnv::pre_exec_setsid`), so its pid is also
+/// its pgid and one `killpg` reaches every process it forked.
+fn signal_group(pid: u32, sig: libc::c_int) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: `killpg` with a valid signal number. A stale pgid yields
+    // ESRCH, which we ignore.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, sig);
+    }
+}
+
+/// Resolve once the cancel flag flips to `true`. Never resolves if the
+/// sender is dropped, which is what we want inside a `select!`.
+async fn cancelled(rx: &mut watch::Receiver<bool>) {
+    if rx.wait_for(|v| *v).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -319,6 +399,7 @@ async fn run_inner(
     tx: mpsc::Sender<LogLine>,
     stdin_rx: Option<mpsc::Receiver<String>>,
     sudo_password: Option<Zeroizing<String>>,
+    cancel: watch::Receiver<bool>,
 ) -> Result<()> {
     let plan = req.plan();
     let multi = plan.len() > 1;
@@ -327,6 +408,16 @@ async fn run_inner(
     // lets each child's writer task take it in turn instead of the first
     // one consuming it for good.
     let stdin_rx = stdin_rx.map(|r| Arc::new(TokioMutex::new(r)));
+
+    // Seed the target's store before anything is built. Done here rather
+    // than in the App so it is naturally sequenced ahead of the first
+    // child and shares the deploy's cancellation.
+    if let (Some(seed), Some(node)) = (req.seed.clone(), req.node_info.clone()) {
+        if *cancel.borrow() {
+            return Ok(());
+        }
+        run_seed(&req, &node, &seed, &tx, cancel.clone()).await;
+    }
 
     let mut code = 0;
     for (idx, inv) in plan.iter().enumerate() {
@@ -359,14 +450,106 @@ there. Using the flake's sshUser for it instead."
                 .await;
         }
 
-        code = run_one(&req, inv, &tx, stdin_rx.clone(), sudo_password.as_ref()).await?;
-        if code != 0 {
+        code = run_one(
+            &req,
+            inv,
+            &tx,
+            stdin_rx.clone(),
+            sudo_password.as_ref(),
+            cancel.clone(),
+        )
+        .await?;
+        // A non-zero code covers cancellation too (the child dies from a
+        // signal), so this also stops us starting the next profile after
+        // the user pressed `x`.
+        if code != 0 || *cancel.borrow() {
             break;
         }
     }
 
     let _ = tx.send(LogLine::Exit(code)).await;
     Ok(())
+}
+
+/// Run the cache-seeding step, forwarding its progress into the log.
+///
+/// Failures are reported and then ignored: seeding is an optimisation,
+/// and a deploy that would have compiled anyway is not made worse by a
+/// cache that turned out to be unreachable.
+async fn run_seed(
+    req: &DeployRequest,
+    node: &crate::flake::Node,
+    seed: &SeedPlan,
+    tx: &mpsc::Sender<LogLine>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
+    let forward_tx = tx.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(line) = prog_rx.recv().await {
+            if forward_tx.send(LogLine::Stdout(line)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let work = crate::host::seed_substituters(
+        node,
+        &req.ssh_override,
+        &req.askpass,
+        &seed.substituters,
+        &seed.keys,
+        &seed.paths,
+        prog_tx,
+    );
+
+    let result = tokio::select! {
+        r = work => Some(r),
+        _ = cancelled(&mut cancel) => None,
+    };
+    let _ = forwarder.await;
+
+    match result {
+        None => {
+            let _ = tx
+                .send(LogLine::Stderr("! cache seeding cancelled".to_string()))
+                .await;
+        }
+        Some(Ok(outcome)) => {
+            let _ = tx
+                .send(LogLine::Stdout(format!(
+                    "• [seed] {} path(s) copied into the target's store, {} not in the new cache(s)",
+                    outcome.copied, outcome.missed
+                )))
+                .await;
+            if outcome.skipped > 0 {
+                // Never let a capped run read as a complete one.
+                let _ = tx
+                    .send(LogLine::Stderr(format!(
+                        "! [seed] {} further path(s) were not attempted (per-deploy cap)",
+                        outcome.skipped
+                    )))
+                    .await;
+            }
+            if outcome.copied == 0 {
+                let _ = tx
+                    .send(LogLine::Stderr(
+                        "! [seed] nothing was copied — the cache may not have these paths, or \
+the ssh user may not be in the target's `trusted-users` (nix ignores the key option \
+silently for untrusted users)"
+                            .to_string(),
+                    ))
+                    .await;
+            }
+        }
+        Some(Err(e)) => {
+            let _ = tx
+                .send(LogLine::Stderr(format!(
+                    "! [seed] failed, continuing without it: {e:#}"
+                )))
+                .await;
+        }
+    }
 }
 
 /// Spawn a single `deploy` child for one [`Invocation`] and stream its
@@ -378,6 +561,7 @@ async fn run_one(
     tx: &mpsc::Sender<LogLine>,
     stdin_rx: Option<Arc<TokioMutex<mpsc::Receiver<String>>>>,
     sudo_password: Option<&Zeroizing<String>>,
+    mut cancel: watch::Receiver<bool>,
 ) -> Result<i32> {
     let mut cmd = Command::new("deploy");
     cmd.arg(req.target_with(&inv.suffix));
@@ -424,6 +608,13 @@ async fn run_one(
     }
     if let Some(opts) = req.ssh_override.deploy_ssh_opts() {
         cmd.args(["--ssh-opts", &opts]);
+    }
+
+    // deploy-rs takes extra `nix build` arguments after a `--`
+    // separator, so this has to stay the last thing appended.
+    if !req.extra_build_args.is_empty() {
+        cmd.arg("--");
+        cmd.args(&req.extra_build_args);
     }
 
     // When interactive_sudo is enabled, pipe stdin so the TUI can forward
@@ -511,28 +702,37 @@ async fn run_one(
         let tx_pty = tx.clone();
         tokio::task::spawn_blocking(move || {
             use std::io::{BufReader, Read};
-            let mut reader = BufReader::new(master);
-            let mut line_buf: Vec<u8> = Vec::new();
-            let mut byte = [0u8; 1];
-            loop {
-                match reader.read(&mut byte) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if byte[0] == b'\n' {
-                            let s = String::from_utf8_lossy(&line_buf);
-                            let line = s.trim_end_matches('\r').to_string();
+            let mut reader = BufReader::with_capacity(READ_CHUNK, master);
+            let mut line_buf: Vec<u8> = Vec::with_capacity(256);
+            let mut chunk = [0u8; READ_CHUNK];
+            'outer: loop {
+                let n = match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                for &b in &chunk[..n] {
+                    if b == b'\n' || b == b'\r' {
+                        if line_buf.is_empty() {
+                            continue;
+                        }
+                        let line = strip_ansi(&String::from_utf8_lossy(&line_buf));
+                        line_buf.clear();
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        if tx_pty.blocking_send(LogLine::Stderr(line)).is_err() {
+                            break 'outer;
+                        }
+                    } else {
+                        line_buf.push(b);
+                        if line_buf.len() >= MAX_LINE {
+                            let line = strip_ansi(&String::from_utf8_lossy(&line_buf));
                             line_buf.clear();
-                            if line.is_empty() {
-                                continue;
+                            if tx_pty.blocking_send(LogLine::Stderr(line)).is_err() {
+                                break 'outer;
                             }
-                            if tx_pty
-                                .blocking_send(LogLine::Stderr(strip_ansi(&line)))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        } else {
-                            line_buf.push(byte[0]);
                         }
                     }
                 }
@@ -568,16 +768,7 @@ async fn run_one(
 
     let tx_out = tx.clone();
     let stdout_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if tx_out
-                .send(LogLine::Stdout(strip_ansi(&line)))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
+        forward_lines(stdout, tx_out, false).await;
     });
 
     let interactive_sudo = req.toggles.interactive_sudo;
@@ -586,20 +777,38 @@ async fn run_one(
         if interactive_sudo {
             read_stderr_interactive(stderr, tx_err).await;
         } else {
-            let mut reader = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = reader.next_line().await {
-                if tx_err
-                    .send(LogLine::Stderr(strip_ansi(&line)))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
+            forward_lines(stderr, tx_err, true).await;
         }
     });
 
-    let status = child.wait().await.context("waiting for `deploy`")?;
+    // The child leads its own process group, so `pid == pgid`.
+    let pgid = child.id().unwrap_or(0);
+
+    let status = tokio::select! {
+        r = child.wait() => r.context("waiting for `deploy`")?,
+        _ = cancelled(&mut cancel) => {
+            let _ = tx
+                .send(LogLine::Stderr(
+                    "! stopping deploy — signalling the build process group".to_string(),
+                ))
+                .await;
+            // SIGTERM first so `nix` gets a chance to unwind its builds;
+            // signalling `deploy` alone would leave them running.
+            signal_group(pgid, libc::SIGTERM);
+            // Sleep rather than race `child.wait()`: waiting *reaps* the
+            // leader, and the instant it is reaped its pid — which is
+            // also the pgid — becomes available for reuse, so the
+            // follow-up SIGKILL could land on an unrelated process
+            // group. Holding the child unreaped keeps it a zombie, and a
+            // zombie member keeps the pgid reserved for us.
+            tokio::time::sleep(CANCEL_GRACE).await;
+            // Catches anything that ignored SIGTERM or was forked after
+            // it. A no-op (ESRCH) once the group is already empty.
+            signal_group(pgid, libc::SIGKILL);
+            child.wait().await.context("waiting for `deploy`")?
+        }
+    };
+
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
@@ -710,50 +919,133 @@ async fn read_stderr_interactive(stderr: ChildStderr, tx: mpsc::Sender<LogLine>)
 
 /// Inner implementation — generic over any `AsyncRead + Unpin` so it can be
 /// tested without a live child process.
+///
+/// Reads in chunks (not one byte per `await`) and only re-scans the
+/// accumulated buffer for a prompt when the byte just pushed could
+/// actually terminate one. The previous version ran
+/// `String::from_utf8_lossy` over the whole partial line after *every*
+/// byte, which is quadratic — a few long `nix` lines were enough to
+/// starve the reader and make the log look frozen.
 async fn read_stderr_interactive_impl<R: tokio::io::AsyncRead + Unpin>(
     source: R,
     tx: mpsc::Sender<LogLine>,
 ) {
-    let mut reader = BufReader::new(source);
-    let mut line_buf: Vec<u8> = Vec::new();
-    let mut byte = [0u8; 1];
+    let mut reader = BufReader::with_capacity(READ_CHUNK, source);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut chunk = [0u8; READ_CHUNK];
     loop {
-        match reader.read(&mut byte).await {
+        let n = match reader.read(&mut chunk).await {
             Ok(0) => break, // EOF
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    // Complete line — strip CR if present.
-                    let s = String::from_utf8_lossy(&line_buf);
-                    let line = s.trim_end_matches('\r').to_string();
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        for &b in &chunk[..n] {
+            // `\r` terminates a line too: `nix` repaints progress with a
+            // bare carriage return, and treating it as ordinary content
+            // buffers the output until some later `\n` that may never come.
+            if b == b'\n' || b == b'\r' {
+                if !flush_line(&mut line_buf, &tx, true).await {
+                    return;
+                }
+                continue;
+            }
+            line_buf.push(b);
+            // A prompt always ends in `:` or `: `, so only those two bytes
+            // can complete one. Anything else can't, and re-scanning would
+            // be wasted work.
+            if b == b':' || (b == b' ' && line_buf.len() >= 2 && line_buf[line_buf.len() - 2] == b':')
+            {
+                let s = String::from_utf8_lossy(&line_buf);
+                if is_sudo_prompt(s.as_ref()) {
+                    let prompt = strip_ansi(s.as_ref());
                     line_buf.clear();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if tx.send(LogLine::Stderr(strip_ansi(&line))).await.is_err() {
-                        break;
-                    }
-                } else {
-                    line_buf.push(byte[0]);
-                    // After each byte, check whether the accumulated buffer
-                    // looks like a password prompt waiting for input.
-                    let s = String::from_utf8_lossy(&line_buf);
-                    if is_sudo_prompt(s.as_ref()) {
-                        let prompt = s.to_string();
-                        line_buf.clear();
-                        if tx.send(LogLine::SudoPrompt(strip_ansi(&prompt))).await.is_err() {
-                            break;
-                        }
+                    if tx.send(LogLine::SudoPrompt(prompt)).await.is_err() {
+                        return;
                     }
                 }
+            } else if line_buf.len() >= MAX_LINE && !flush_line(&mut line_buf, &tx, true).await {
+                return;
             }
-            Err(_) => break,
         }
     }
     // Flush any remaining partial line that didn't end with a newline.
-    if !line_buf.is_empty() {
-        let s = String::from_utf8_lossy(&line_buf).to_string();
-        let _ = tx.send(LogLine::Stderr(strip_ansi(&s))).await;
+    let _ = flush_line(&mut line_buf, &tx, true).await;
+}
+
+/// Size of both the `BufReader` capacity and the userspace read buffer
+/// used by the output forwarders.
+const READ_CHUNK: usize = 8192;
+
+/// Hard cap on how much a single unterminated line may buffer before we
+/// forward it anyway. Without this a child that emits a large blob with
+/// no line terminator would grow the buffer without bound and show
+/// nothing in the TUI until EOF.
+const MAX_LINE: usize = 16 * 1024;
+
+/// Forward a child output stream to the log channel, one line at a time.
+///
+/// Deliberately byte-oriented instead of `AsyncBufReadExt::lines()`:
+///
+/// - `lines()` yields `Err` on the first byte sequence that isn't valid
+///   UTF-8, and the `while let Ok(Some(_))` loop that consumed it ended
+///   there — silently swallowing the rest of the deploy's output *and*
+///   dropping the pipe, which SIGPIPEs the child mid-deploy. Nested
+///   `nix` / `ssh` output is not guaranteed to be UTF-8, so decode
+///   lossily and keep reading.
+/// - `lines()` splits on `\n` only. Progress output that repaints with a
+///   bare `\r` never produced a line at all, so the log appeared to stall
+///   on whichever package was building.
+async fn forward_lines<R: tokio::io::AsyncRead + Unpin>(
+    source: R,
+    tx: mpsc::Sender<LogLine>,
+    is_err: bool,
+) {
+    let mut reader = BufReader::with_capacity(READ_CHUNK, source);
+    let mut line_buf: Vec<u8> = Vec::with_capacity(256);
+    let mut chunk = [0u8; READ_CHUNK];
+    loop {
+        let n = match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        for &b in &chunk[..n] {
+            if b == b'\n' || b == b'\r' {
+                if !flush_line(&mut line_buf, &tx, is_err).await {
+                    return;
+                }
+            } else {
+                line_buf.push(b);
+                if line_buf.len() >= MAX_LINE && !flush_line(&mut line_buf, &tx, is_err).await {
+                    return;
+                }
+            }
+        }
     }
+    let _ = flush_line(&mut line_buf, &tx, is_err).await;
+}
+
+/// Send `buf` as one log line and clear it. Blank lines are dropped —
+/// this is what keeps a `\r\n` pair from producing a spurious empty
+/// entry now that both bytes terminate a line. Returns `false` when the
+/// receiver is gone and the caller should stop reading.
+async fn flush_line(buf: &mut Vec<u8>, tx: &mpsc::Sender<LogLine>, is_err: bool) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    let text = strip_ansi(&String::from_utf8_lossy(buf));
+    buf.clear();
+    if text.trim().is_empty() {
+        return true;
+    }
+    let line = if is_err {
+        LogLine::Stderr(text)
+    } else {
+        LogLine::Stdout(text)
+    };
+    tx.send(line).await.is_ok()
 }
 
 /// Return `true` when `s` looks like a sudo/SSH password or passphrase
@@ -805,6 +1097,9 @@ mod tests {
             },
             askpass: dummy_askpass(),
             profiles,
+            extra_build_args: Vec::new(),
+            seed: None,
+            node_info: None,
         }
     }
 
@@ -936,6 +1231,9 @@ mod tests {
             ssh_override: SshOverride::default(),
             askpass: dummy_askpass(),
             profiles: Vec::new(),
+            extra_build_args: Vec::new(),
+            seed: None,
+            node_info: None,
         };
         assert_eq!(req.target_with(&req.plan()[0].suffix), "/home/me/dotfiles#myhost");
     }
@@ -951,6 +1249,9 @@ mod tests {
             ssh_override: SshOverride::default(),
             askpass: dummy_askpass(),
             profiles: Vec::new(),
+            extra_build_args: Vec::new(),
+            seed: None,
+            node_info: None,
         };
         assert_eq!(req.target_with(&req.plan()[0].suffix), ".#server1.system");
     }
@@ -966,6 +1267,9 @@ mod tests {
             ssh_override: SshOverride::default(),
             askpass: dummy_askpass(),
             profiles: Vec::new(),
+            extra_build_args: Vec::new(),
+            seed: None,
+            node_info: None,
         };
         assert_eq!(req.target_with(&req.plan()[0].suffix), "github:me/dotfiles#laptop.home");
     }
@@ -1041,6 +1345,80 @@ mod tests {
         // This is intentional: a false positive here is a recoverable UX
         // issue (user presses Esc), while a false negative would silently hang.
         assert!(is_sudo_prompt("Password:"));
+    }
+
+    // ---- forward_lines ----
+
+    async fn run_forward(input: &[u8]) -> Vec<String> {
+        use tokio::io::AsyncWriteExt;
+        let (mut w, r) = tokio::io::duplex(4096);
+        // The writer runs concurrently: inputs larger than the duplex
+        // buffer would otherwise block before the reader ever starts.
+        let data = input.to_vec();
+        let writer = tokio::spawn(async move {
+            let _ = w.write_all(&data).await;
+            drop(w); // signal EOF
+        });
+        let (tx, mut rx) = mpsc::channel(64);
+        let reader = tokio::spawn(async move { forward_lines(r, tx, false).await });
+
+        let mut out = Vec::new();
+        while let Some(line) = rx.recv().await {
+            match line {
+                LogLine::Stdout(s) => out.push(s),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        writer.await.unwrap();
+        reader.await.unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn forward_lines_splits_on_newline() {
+        assert_eq!(run_forward(b"one\ntwo\n").await, vec!["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn forward_lines_survives_invalid_utf8() {
+        // The old `lines()`-based reader returned Err here and stopped
+        // forwarding for the rest of the deploy — the log "just stopped".
+        let out = run_forward(b"before\n\xff\xfe bad\nafter\n").await;
+        assert_eq!(out.first().map(String::as_str), Some("before"));
+        assert_eq!(
+            out.last().map(String::as_str),
+            Some("after"),
+            "output after a non-UTF-8 byte must still be forwarded: {out:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_lines_treats_carriage_return_as_a_line_break() {
+        // nix repaints build progress with a bare `\r`. Buffering those
+        // until a `\n` that never arrives looked like a stalled log.
+        assert_eq!(
+            run_forward(b"building foo\rbuilding bar\r").await,
+            vec!["building foo", "building bar"],
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_lines_crlf_makes_one_entry() {
+        assert_eq!(run_forward(b"one\r\ntwo\r\n").await, vec!["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn forward_lines_flushes_unterminated_tail() {
+        assert_eq!(run_forward(b"no trailing newline").await, vec!["no trailing newline"]);
+    }
+
+    #[tokio::test]
+    async fn forward_lines_caps_a_terminator_free_stream() {
+        // Without a cap this buffers forever and shows nothing until EOF.
+        let blob = vec![b'x'; MAX_LINE * 2 + 10];
+        let out = run_forward(&blob).await;
+        assert!(out.len() >= 2, "expected the blob to be chunked, got {} entries", out.len());
+        assert!(out.iter().all(|l| l.len() <= MAX_LINE));
     }
 
     // ---- read_stderr_interactive_impl ----

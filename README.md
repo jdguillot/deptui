@@ -40,9 +40,119 @@ immediate switch or as a new boot entry for next boot.
 - **Toggles** for the deploy-rs flags you reach for most:
   `--skip-checks`, `--magic-rollback`, `--auto-rollback`,
   `--remote-build`, `--interactive-sudo`. Always-visible state strip.
-- **Pane-jump keys** (`f`/`i`/`v`/`t`/`c`) for instant focus on any
+- **Pane-jump keys** (`f`/`i`/`p`/`t`/`c`) for instant focus on any
   pane; `Tab`/`Shift+Tab` for sequential cycling.
+- **Build plan preflight** (`Shift+P`) — runs the dry-run deploy-rs
+  would run and reports what will be compiled, what will be fetched, and
+  how much it downloads, *before* you commit. Shown in the deploy
+  confirmation too.
+- **Substituter drift check** (`Shift+C`) — catches the trap where a
+  deploy that *adds* a binary cache can't use it (see below).
 - **Help popup** (`?`) with a full guide to every key, badge, and toggle.
+
+## Build plan preflight (`Shift+P`)
+
+Runs the same dry-run deploy-rs would, and reports the plan before you
+commit to it:
+
+```
+[plan] gpu.system: 2 derivation(s) will be COMPILED
+[plan]   ⚒ cuda-merged-12.4
+[plan]   ⚒ ollama-0.5.4
+[plan] gpu.system: 41 path(s) will be fetched (1.2 GiB download)
+```
+
+It follows the node's build mode, because the answer differs:
+
+- local build: `nix build --dry-run <flake>#deploy.nodes.<n>.profiles.<p>.path`
+- remote build: `nix build --dry-run <drv>^out --eval-store auto
+  --store ssh-ng://<target>`, preceded by
+  `nix copy --derivation --to ssh-ng://<target>` — the remote store can
+  only reason about a derivation it has, and this is the same step
+  deploy-rs performs before a remote build. Nothing is realised; only a
+  `.drv` is added to the target's store.
+
+The result also appears in the deploy confirmation popup, so "this
+deploy will compile ollama-cuda" arrives before you press `y` rather
+than forty minutes later. A successful deploy clears the cached plan,
+since it described the closure that was just pushed.
+
+## Automatic cache seeding
+
+When `Shift+C` finds drift on a `--remote-build` node it chains straight
+into `Shift+P`, and the next deploy to that node **seeds the target's
+store before building**: for every path the plan says would be compiled
+or fetched, deptui asks the target to `nix copy --from <new-cache>` it.
+Paths the cache has land in the store and the build skips them; paths it
+doesn't have are a no-op.
+
+This is deliberately additive. Nothing on the target is rewritten and
+nothing needs restoring — if the deploy fails, is cancelled, or the
+process dies, the only trace is some extra store paths, which is exactly
+what a normal fetch would have left. Copies are attempted one path at a
+time because `nix copy` fails a whole batch when any single path is
+missing from the cache, and missing is the normal case.
+
+The new cache's key is passed as `--option extra-trusted-public-keys`,
+which **nix honours only for a trusted user** — hence the `trusted-users`
+check. If nothing gets copied, deptui says so and names that as the
+likely reason rather than letting the deploy quietly compile anyway. The
+per-deploy attempt cap is 200 paths; anything beyond that is reported,
+never silently dropped.
+
+## Substituter drift (`Shift+C`)
+
+Adding a binary cache to a NixOS config and deploying it in one step does
+not work, and nothing in the toolchain tells you why. `nixos-rebuild` and
+deploy-rs **build before they activate**, and `/etc/nix/nix.conf` is a
+`restartTrigger` for `nix-daemon.service` — so the new substituter only
+goes live once every build has already finished. The first deploy
+compiles from source exactly the things the new cache was supposed to
+supply.
+
+Concretely: adding `https://cache.nixos-cuda.org` alongside
+`services.ollama.package = pkgs.ollama-cuda` should be one 1.2 GiB fetch.
+Without the cache in place first, `cuda-merged-12` and `ollama` build
+locally.
+
+`Shift+C` evaluates `nixosConfigurations.<node>.config.nix.settings`
+(an eval, not a build) and compares its substituters and
+trusted-public-keys against the nix installation that will actually do
+the building. That last part is the whole point:
+
+| build mode           | who fetches                  | compared against            |
+| -------------------- | ---------------------------- | --------------------------- |
+| local (default)      | this machine's nix           | local `nix config show`     |
+| `--remote-build` (4) | the target's `nix-daemon`    | target's `nix config show`  |
+
+For a **local** build the fix is just extra build args:
+
+```
+deploy … -- --option extra-substituters <url> \
+            --option extra-trusted-public-keys <key>
+```
+
+For a **remote** build that does nothing. `--remote-build` is not
+`ssh host nix build`; it is a local nix client driving a remote store
+(`nix build … --eval-store auto --store ssh-ng://…`), so `--option`
+configures the *local* client while the fetching is done by the target's
+daemon out of the target's own `nix.conf`. The setting does not cross the
+store boundary. Measured against a live target:
+
+| experiment                                          | derivations built |
+| --------------------------------------------------- | ----------------- |
+| ssh-ng store, no options                             | 17 (incl. ollama) |
+| ssh-ng store + `--option extra-substituters`         | 17 — **inert**    |
+| cache in the target's `~/.config/nix/nix.conf`       | 16, ollama fetched|
+| run directly on the target + `--option`              | fetched (1.2 GiB) |
+
+So for remote builds the cache has to be configured **on the target**,
+either in the system `nix.conf` (the chicken-and-egg case) or in the ssh
+user's `~/.config/nix/nix.conf`, which `nix daemon --stdio` reads.
+
+`Shift+C` also checks `trusted-users` on the target. If the deploy's ssh
+user isn't trusted, nix **silently ignores** substituter overrides — no
+warning, it just builds. That check is why the report names the user.
 
 ## Requirements
 
@@ -50,8 +160,10 @@ immediate switch or as a new boot entry for next boot.
   [deploy-rs README](https://github.com/serokell/deploy-rs#overall-usage).
 - `nix`, `deploy` (from deploy-rs), and `ssh` on `PATH` — the dev shell
   in this repo provides them.
-- SSH access to your hosts using key auth (`BatchMode=yes` is set, so
-  password prompts will fail fast).
+- SSH access to your hosts. Key auth is the smooth path; password and
+  passphrase prompts are supported too — they are routed through
+  `SSH_ASKPASS` into a masked popup rather than to the terminal (which
+  would corrupt the TUI).
 
 ## Building
 
@@ -86,6 +198,7 @@ Optional flags:
 | flag         | purpose                                          |
 | ------------ | ------------------------------------------------ |
 | `--log-file` | write tracing logs to a file (TUI stays clean)   |
+| `--build-arg` | extra `nix build` arg, forwarded after deploy-rs's `--` (repeatable) |
 
 ## Key bindings
 
@@ -93,18 +206,22 @@ Optional flags:
 | -------------- | ------------------------------------------------------------ |
 | `?`            | open the in-app help popup (full reference)                  |
 | `q` / `Ctrl-C` | quit (shows confirmation; warns if deploy is running)        |
-| `Esc`          | clear active search, visual selection, or cancel modal       |
+| `Esc`          | cancel visual selection, then clear search, or close modal   |
 | `j` / `k`      | move selection / scroll log                                  |
 | `g` / `G`      | jump to top / snap to tail                                   |
 | `Space`        | mark/unmark host for batch operations                        |
 | `Tab` / `Shift+Tab` | cycle focus forward / backward                          |
-| `f`/`i`/`v`/`t`/`c` | jump to hosts / details / job log / toggles / commands  |
+| `f`/`i`/`p`/`t`/`c` | jump to hosts / details / job log / toggles / commands  |
 | `r`            | refresh online/offline for every host                        |
 | `u`            | cheap-tier update check (paths + activation time)            |
 | `Shift+U`      | full update check: closure size delta + package diff         |
+| `Shift+P`      | build plan preflight: what gets compiled + download size     |
+| `Shift+C`      | substituter drift: caches this deploy adds but can't use     |
 | `a` / `y` / `h` | target all profiles / system (sYs) / home (home-manager)   |
 | `s` / `b` / `d` | deploy: switch now / boot entry / dry run                  |
-| `x`            | cancel the running deploy                                    |
+| `x`            | cancel the running deploy (kills its whole process group)    |
+| `v` / `V`      | select job-log text by char / by line (works from any pane)  |
+| `y`            | yank the visual selection to the clipboard                   |
 | `/`            | search the job log (works from any pane)                     |
 | `n` / `N`      | next / previous search match (works from any pane)           |
 | `1`–`5`        | toggle deploy-rs flags (see below)                           |
@@ -195,18 +312,55 @@ re-run or after a successful deploy.
   as offline even if they are otherwise up.
 - The home-update probe assumes `~/.local/state/nix/profiles/home-manager`
   or `~/.nix-profile`. Custom profile locations aren't auto-detected.
-- `--interactive-sudo` (toggle `5`) is supported. When enabled, the TUI
-  pipes stdin to the `deploy` child and listens on stderr for a sudo
-  password prompt. When the prompt arrives, a masked input widget (showing
-  `•` characters) appears in the bottom strip. Type the password and press
-  Enter to send it; Esc dismisses the prompt (the deploy will stall — press
-  `x` to cancel). The password is never written to the log or stored after
-  it is sent.
-- The TUI shells out to `deploy` for the actual push — anything else
-  that requires interactive input (e.g. host-key confirmations on a
-  fresh host) won't work. Use `ssh-copy-id` first or set
-  `StrictHostKeyChecking=accept-new` via the override `-o` opts.
+- `--interactive-sudo` (toggle `5`) is supported. deploy-rs reads the
+  sudo password from `/dev/tty`, so the TUI asks for it up front and
+  pre-writes it into a PTY it allocates for the child. A masked popup
+  (`•` characters) collects it; Enter sends, Esc cancels the deploy
+  before it starts. The password is never written to the log.
+- Host-key confirmations on a brand-new host are not interactive. The
+  status probes pass `StrictHostKeyChecking=accept-new`, so an unknown
+  host is trusted on first contact — see **Security notes** below.
 - SSH overrides are session-only. They feed `deploy` and the status
   checks but are not persisted between runs. If you want them to stick,
   add them to your `~/.ssh/config` or to `deploy.nodes.<name>` in the
   flake.
+
+## Security notes
+
+The parts of this worth knowing about, since the tool holds passwords
+and talks to machines you care about.
+
+**Passwords.** Typed into a masked popup, never written to the log, and
+never persisted. In memory they live in `SecretBuf` / `Zeroizing`
+buffers that are wiped on drop; the buffer reserves capacity up front so
+growing it can't strand un-wiped copies on the heap, and it redacts its
+own `Debug` so a stray trace call can't leak it into `--log-file`. The
+cached password is `mlock`ed against swap, and core dumps are disabled
+at startup (`RLIMIT_CORE = 0`).
+
+**The askpass socket.** SSH password and passphrase prompts are relayed
+over a Unix socket to the TUI. The socket lives in a `0700` temp dir and
+is itself `0600`, so only your own uid can reach it — but there is no
+authentication beyond those file permissions. Anything running as you
+can ask the socket to put a password dialog in front of you. Prompts are
+length-capped and stripped of control bytes before being rendered.
+
+**Host keys.** The status probes (`u`, `Shift+U`, `Shift+C`, `Shift+P`)
+pass `StrictHostKeyChecking=accept-new`, which trusts an unknown host on
+first contact. Note this **overrides** a stricter setting in your
+`~/.ssh/config` for those probes. The deploy itself does not go through
+this path — it runs `deploy`, which uses your ssh config unmodified. If
+you rely on strict host-key checking, be aware the probes are more
+permissive than your config, and verify new hosts before probing them.
+
+**Remote writes.** deptui writes to a target's store in exactly two
+places, both additive and both `nix`-mediated: `nix copy --derivation`
+during the remote build-plan preflight, and the automatic cache seeding
+(`nix copy --from <cache>`). Neither modifies configuration or any file
+outside the nix store, so nothing needs restoring if a deploy fails or
+is cancelled. Every value interpolated into a remote shell command is
+single-quoted, with the quoting verified against a real `sh` in the test
+suite.
+
+**Dependencies.** `cargo audit` is clean. `cargo clippy --all-targets --
+-D warnings` passes.

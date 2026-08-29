@@ -22,7 +22,10 @@ use crate::askpass::{AskpassEnv, AskpassServer};
 use crate::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
 use crate::event::{spawn as spawn_events, AppEvent};
 use crate::flake::Node;
-use crate::host::{self, HostStatus, ProfileCheck, ProfileExtra, Reachability, UpdateState};
+use crate::host::{
+    self, BuildPlan, BuildSite, HostStatus, ProfileCheck, ProfileExtra, Reachability,
+    SubstituterDrift, UpdateState,
+};
 use crate::ssh::SshOverride;
 use crate::ui::{self, Tui};
 
@@ -173,6 +176,97 @@ impl VisualSel {
     }
 }
 
+/// A password being typed into the prompt widget.
+///
+/// A plain `String` here leaked three ways, all of which matter given the
+/// lengths the rest of this file goes to (mlock, zeroize, core dumps
+/// disabled):
+///
+/// 1. `String::push` reallocates as it grows and frees the old buffer
+///    without wiping it, scattering plaintext prefixes across the heap.
+///    We reserve up front, and grow by hand so the old allocation is
+///    zeroed before it is released.
+/// 2. Dropping it left the bytes in freed memory. `Zeroizing` wipes them.
+/// 3. `InputMode` derives `Debug`, so one stray `tracing::debug!` of the
+///    input state would have written the plaintext to `--log-file`. The
+///    `Debug` impl below redacts.
+#[derive(Clone, Default)]
+pub struct SecretBuf(Zeroizing<String>);
+
+/// Reserved capacity. Comfortably longer than any real password, so the
+/// grow path below is a safety net rather than a routine occurrence.
+const SECRET_BUF_CAPACITY: usize = 512;
+
+impl SecretBuf {
+    pub fn new() -> Self {
+        Self(Zeroizing::new(String::with_capacity(SECRET_BUF_CAPACITY)))
+    }
+
+    pub fn push(&mut self, c: char) {
+        if self.0.len() + c.len_utf8() > self.0.capacity() {
+            // Grow explicitly: `String::push` would copy into a new
+            // allocation and free the old one with the password still in
+            // it. Moving the old buffer into a `Zeroizing` wipes it on
+            // drop instead.
+            let mut bigger =
+                String::with_capacity((self.0.capacity() * 2).max(SECRET_BUF_CAPACITY));
+            bigger.push_str(&self.0);
+            let old = std::mem::replace(&mut *self.0, bigger);
+            drop(Zeroizing::new(old));
+        }
+        self.0.push(c);
+    }
+
+    pub fn pop(&mut self) {
+        self.0.pop();
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Number of characters, for the masked `•` rendering.
+    pub fn char_count(&self) -> usize {
+        self.0.chars().count()
+    }
+
+    /// Take the inner buffer. Still `Zeroizing`, so whatever the caller
+    /// does with it, it is wiped when they drop it.
+    pub fn into_inner(self) -> Zeroizing<String> {
+        self.0
+    }
+}
+
+impl From<&str> for SecretBuf {
+    fn from(s: &str) -> Self {
+        let mut buf = Self::new();
+        for c in s.chars() {
+            buf.push(c);
+        }
+        buf
+    }
+}
+
+/// Comparison against a plain `&str`, for tests and assertions. Not
+/// constant-time; never use it to check a password against a secret.
+impl PartialEq<str> for SecretBuf {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for SecretBuf {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl std::fmt::Debug for SecretBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SecretBuf(<redacted, {} chars>)", self.char_count())
+    }
+}
+
 /// Top-level input mode. The vast majority of the time we're in `Normal`;
 /// when the user opens an override prompt or the overrides menu we route
 /// keys differently.
@@ -234,8 +328,9 @@ pub enum InputMode {
         /// Raw prompt text, e.g. `[sudo] password for root: ` or
         /// `Enter passphrase for key '…': `.
         prompt: String,
-        /// Password being typed. Rendered as `•` characters.
-        buf: String,
+        /// Password being typed. Rendered as `•` characters, wiped on
+        /// drop, and redacted in `Debug` — see [`SecretBuf`].
+        buf: SecretBuf,
         /// Where to send the password on Enter.
         source: PromptSource,
     },
@@ -301,6 +396,17 @@ enum StatusUpdate {
         node: String,
         profile: String,
         result: Result<String, String>,
+    },
+    /// Build-plan preflight result (`Shift+P`).
+    BuildPlanProbe {
+        node: String,
+        profile: String,
+        result: Result<BuildPlan, String>,
+    },
+    /// Substituter-drift check result (`Shift+C`).
+    CacheDriftProbe {
+        node: String,
+        result: Result<SubstituterDrift, String>,
     },
     /// Free-form progress line from a long-running probe (currently
     /// only the package diff). Forwarded into the host-tagged log so
@@ -402,6 +508,14 @@ pub struct App {
     /// task handle so we can cancel.
     deploy_rx: Option<mpsc::Receiver<LogLine>>,
     deploy_task: Option<JoinHandle<()>>,
+    /// Extra `nix build` arguments from `--build-arg`, forwarded to
+    /// deploy-rs after `--`.
+    pub extra_build_args: Vec<String>,
+    /// Tears down the deploy's whole process group. Aborting
+    /// `deploy_task` only reaches the direct `deploy` child, leaving the
+    /// `nix` builders and `ssh` it forked running — which is why the
+    /// machine stayed busy after a cancel.
+    deploy_cancel: Option<deploy::DeployCanceller>,
     /// When the in-flight deploy was started with `--interactive-sudo`, this
     /// sender lets the TUI write the sudo password to the child's piped
     /// stdin. `None` otherwise. Dropped on cancel or deploy completion.
@@ -412,7 +526,7 @@ pub struct App {
     askpass_env: AskpassEnv,
     /// Send passwords to the askpass server (which relays them to the
     /// SSH_ASKPASS helper over the Unix socket).
-    askpass_password_tx: mpsc::Sender<String>,
+    askpass_password_tx: mpsc::Sender<Zeroizing<String>>,
     /// Receives prompt text from the askpass server — polled in the
     /// main `select!` loop.
     askpass_prompt_rx: mpsc::Receiver<String>,
@@ -469,7 +583,7 @@ impl App {
         // is started in `run()` which has a tokio runtime. Until then
         // `askpass_env` holds a dummy value — it's overwritten before
         // any SSH commands are spawned.
-        let (askpass_password_tx, _placeholder_rx) = mpsc::channel::<String>(4);
+        let (askpass_password_tx, _placeholder_rx) = mpsc::channel::<Zeroizing<String>>(4);
         let (_placeholder_tx, askpass_prompt_rx) = mpsc::channel::<String>(4);
 
         Self {
@@ -505,6 +619,8 @@ impl App {
             status_rx,
             deploy_rx: None,
             deploy_task: None,
+            extra_build_args: Vec::new(),
+            deploy_cancel: None,
             deploy_stdin_tx: None,
             askpass_env: AskpassEnv {
                 script_path: "/dev/null".into(),
@@ -527,9 +643,9 @@ impl App {
     }
 
     /// Cache a password in memory, locking its pages to prevent swapping.
-    fn set_cached_password(&mut self, password: String) {
+    fn set_cached_password(&mut self, password: &str) {
         self.clear_cached_password();
-        let pw = Zeroizing::new(password);
+        let pw = Zeroizing::new(password.to_string());
         // Best-effort: lock the heap buffer into RAM so it can't be swapped
         // to disk. Failure (e.g. low RLIMIT_MEMLOCK) is non-fatal.
         unsafe {
@@ -595,7 +711,8 @@ impl App {
         let askpass_server = AskpassServer::new().context("setting up SSH_ASKPASS")?;
         self.askpass_env = askpass_server.env.clone();
         let (askpass_prompt_tx, askpass_prompt_rx) = mpsc::channel::<String>(4);
-        let (askpass_password_tx, askpass_password_rx) = mpsc::channel::<String>(4);
+        let (askpass_password_tx, askpass_password_rx) =
+            mpsc::channel::<Zeroizing<String>>(4);
         self.askpass_password_tx = askpass_password_tx;
         self.askpass_prompt_rx = askpass_prompt_rx;
         self._askpass_task = Some(tokio::spawn(async move {
@@ -611,17 +728,37 @@ impl App {
         self.refresh_reachability();
 
         terminal.draw(|f| ui::draw(f, self))?;
+        let mut last_draw = std::time::Instant::now();
 
         while !self.should_quit {
             let needs_redraw;
+            // Deploy output is the one source that can arrive faster than
+            // we can paint. Its redraws are rate-limited; everything else
+            // (keystrokes above all) still paints immediately.
+            let mut rate_limited = false;
             tokio::select! {
                 biased;
 
-                Some(ev) = events.recv() => {
-                    // Ticks only need a redraw when something is animating
-                    // (spinners). Otherwise skip the expensive draw pass.
-                    needs_redraw = !matches!(ev, AppEvent::Tick) || self.has_inflight_work();
-                    self.handle_event(ev);
+                ev = events.recv() => {
+                    match ev {
+                        Some(ev) => {
+                            // Ticks only need a redraw when something is
+                            // animating (spinners). Otherwise skip the
+                            // expensive draw pass.
+                            needs_redraw =
+                                !matches!(ev, AppEvent::Tick) || self.has_inflight_work();
+                            self.handle_event(ev);
+                        }
+                        // The terminal event stream ended — the terminal
+                        // went away underneath us. There is nobody left to
+                        // draw for, and `status_rx` never closes, so
+                        // without this the loop would wait forever on a
+                        // dead session.
+                        None => {
+                            self.should_quit = true;
+                            needs_redraw = false;
+                        }
+                    }
                 }
 
                 Some(update) = self.status_rx.recv() => {
@@ -630,34 +767,78 @@ impl App {
                 }
 
                 Some(line) = recv_optional(&mut self.deploy_rx) => {
-                    needs_redraw = true;
                     self.handle_deploy_line(line);
+                    // Drain whatever else is already queued before painting.
+                    // `nix` can emit output far faster than a full-screen
+                    // ratatui pass completes; one draw per line makes the
+                    // renderer the bottleneck, the bounded channel fills,
+                    // and back-pressure stalls the child's pipe — which is
+                    // what the log "just stopping" mid-deploy looks like.
+                    let mut drained = 0usize;
+                    while drained < MAX_LOG_DRAIN {
+                        let Some(rx) = self.deploy_rx.as_mut() else {
+                            // An `Exit` line cleared the receiver (and may
+                            // have started the next host in the batch).
+                            break;
+                        };
+                        match rx.try_recv() {
+                            Ok(next) => {
+                                self.handle_deploy_line(next);
+                                drained += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    needs_redraw = true;
+                    // While a deploy is in flight the 120ms tick guarantees
+                    // a follow-up paint, so a skipped frame is never a
+                    // dropped one. Once it finishes there are no more ticks
+                    // to rely on, so that frame has to go out now.
+                    rate_limited = self.deploy_task.is_some();
                 }
 
                 Some(prompt) = self.askpass_prompt_rx.recv() => {
                     if let Some(ref pw) = self.cached_password {
-                        let _ = self.askpass_password_tx.try_send(pw.to_string());
+                        let _ = self
+                            .askpass_password_tx
+                            .try_send(Zeroizing::new(pw.to_string()));
                         needs_redraw = false;
                     } else {
                         needs_redraw = true;
                         self.input = InputMode::PasswordPrompt {
                             prompt,
-                            buf: String::new(),
+                            buf: SecretBuf::new(),
                             source: PromptSource::Askpass,
                         };
                     }
                 }
             }
 
-            if needs_redraw {
+            if needs_redraw && !(rate_limited && last_draw.elapsed() < MIN_FRAME_INTERVAL) {
                 terminal.draw(|f| ui::draw(f, self))?;
+                last_draw = std::time::Instant::now();
             }
         }
 
-        // Cancel any running deploy when we exit. The child will be reaped
-        // by tokio when its handles drop.
+        // Tear down any running deploy before we leave. Same reasoning as
+        // `cancel_deploy`: signal the process group and give the task a
+        // moment to reap it, otherwise quitting the TUI would leave a
+        // detached `nix` build running.
         if let Some(t) = self.deploy_task.take() {
-            t.abort();
+            match self.deploy_cancel.take() {
+                Some(c) => {
+                    c.cancel();
+                    // Teardown takes at least `CANCEL_GRACE`, so say what
+                    // we're waiting on instead of freezing on the last
+                    // frame.
+                    self.busy_label = Some("stopping deploy…".to_string());
+                    let _ = terminal.draw(|f| ui::draw(f, self));
+                    // Bounded so a wedged child can't strand the terminal
+                    // in the alternate screen.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;
+                }
+                None => t.abort(),
+            }
         }
 
         Ok(())
@@ -847,6 +1028,18 @@ impl App {
                     self.refresh_sizes_for_selected();
                     return;
                 }
+                // Shift+C: substituter-drift check — does this deploy add
+                // a binary cache that its own build can't use?
+                KeyCode::Char('C') => {
+                    self.refresh_cache_drift_for_selected();
+                    return;
+                }
+                // Shift+P: build-plan preflight — what will this deploy
+                // compile, and how much will it download?
+                KeyCode::Char('P') => {
+                    self.refresh_build_plan_for_selected();
+                    return;
+                }
                 // Shift+G: vim-style "go to end" — snap the focused
                 // scroll pane back to its tail (auto-follow). Useful
                 // after the user has scrolled up to read history and
@@ -886,10 +1079,15 @@ impl App {
             // still consume Esc to back out themselves. If visual
             // selection is active, Esc clears it first.
             KeyCode::Esc => {
-                if self.log_search.is_some() {
+                // One step back per press, like vim: cancel the selection
+                // first, and only clear the search once nothing is
+                // selected. Doing both at once made a stray Esc during a
+                // selection also lose the query the user was following.
+                if self.visual_sel.is_some() {
+                    self.visual_sel = None;
+                } else if self.log_search.is_some() {
                     self.clear_log_search();
                 }
-                self.visual_sel = None;
                 return;
             }
             // Vim-style "g" → scroll/jump to the top of whatever the
@@ -902,11 +1100,28 @@ impl App {
                 self.jump_to_top();
                 return;
             }
+            // `v` / `V` start a job-log selection from *any* pane.
+            // They used to be reachable only once the job log already
+            // had focus, so the obvious gesture right after a deploy —
+            // focus is still on Hosts — silently did nothing. Focusing
+            // the pane here also means an empty log shows its "no
+            // output for this host" hint instead of just ignoring the
+            // keypress.
+            KeyCode::Char('v') => {
+                self.focus = FocusPane::JobLog;
+                self.enter_visual_mode(VisualMode::Char);
+                return;
+            }
+            KeyCode::Char('V') => {
+                self.focus = FocusPane::JobLog;
+                self.enter_visual_mode(VisualMode::Line);
+                return;
+            }
             // btop-style direct pane jumps. Picked letters that don't
             // collide with anything else: `f` = focus hosts (the
             // obvious `h` is taken by the home-profile shortcut and
             // `n` is taken by search-next), `i` = inspect details,
-            // `v` = view job log, `t` = toggles, `c` = commands.
+            // `p` = pipeline (job) log, `t` = toggles, `c` = commands.
             KeyCode::Char('f') => {
                 self.focus = FocusPane::Hosts;
                 return;
@@ -1504,7 +1719,7 @@ impl App {
                     self.pending_deploy = Some((hosts, mode, profile));
                     self.input = InputMode::PasswordPrompt {
                         prompt: format!("sudo password for {first_host}: "),
-                        buf: String::new(),
+                        buf: SecretBuf::new(),
                         source: PromptSource::SudoPre,
                     };
                 } else {
@@ -1646,22 +1861,23 @@ impl App {
         &mut self,
         key: KeyEvent,
         prompt: String,
-        mut buf: String,
+        mut buf: SecretBuf,
         source: PromptSource,
     ) {
         match key.code {
             KeyCode::Enter => {
                 // Cache the password for replay within this action.
-                self.set_cached_password(buf.clone());
+                self.set_cached_password(buf.as_str());
                 // Route the password to the appropriate destination.
+                let secret = buf.into_inner();
                 match source {
                     PromptSource::Askpass => {
-                        let _ = self.askpass_password_tx.try_send(buf);
+                        let _ = self.askpass_password_tx.try_send(secret);
                         self.input = InputMode::Normal;
                     }
                     PromptSource::Sudo => {
                         if let Some(tx) = &self.deploy_stdin_tx {
-                            let _ = tx.try_send(buf);
+                            let _ = tx.try_send(secret.to_string());
                         } else {
                             self.push_log(
                                 "! no stdin channel available for sudo password",
@@ -1674,8 +1890,8 @@ impl App {
                         // Cached above; now actually start the deploy.
                         // The cached password will be pulled into the
                         // DeployRequest inside `start_next_in_queue`.
-                        // `buf` isn't needed beyond the cache — drop it.
-                        drop(buf);
+                        // The typed buffer isn't needed beyond the cache.
+                        drop(secret);
                         self.input = InputMode::Normal;
                         if let Some((hosts, mode, profile)) = self.pending_deploy.take() {
                             self.run_confirmed(hosts, mode, profile);
@@ -1692,7 +1908,23 @@ impl App {
                         self.pending_deploy = None;
                         self.push_log("• deploy cancelled — sudo password not provided", false);
                     }
-                    _ => {
+                    PromptSource::Askpass => {
+                        // The askpass server is blocked on this reply and
+                        // handles one dialog at a time. Dismissing without
+                        // answering used to wedge it permanently: the ssh
+                        // child waited on the helper, the helper waited on
+                        // the server, and every later prompt in the session
+                        // was dead. An empty password lets ssh fail auth
+                        // and the deploy report a real error.
+                        let _ = self
+                            .askpass_password_tx
+                            .try_send(Zeroizing::new(String::new()));
+                        self.push_log(
+                            "• password prompt dismissed — authentication will fail for this step",
+                            true,
+                        );
+                    }
+                    PromptSource::Sudo => {
                         self.push_log(
                             "• password prompt dismissed — deploy may stall (press x to cancel)",
                             true,
@@ -2084,9 +2316,8 @@ impl App {
         if self.visual_sel.is_some() {
             return;
         }
-        match self.focus {
-            FocusPane::JobLog => self.job_log_scroll = 0,
-            _ => {}
+        if self.focus == FocusPane::JobLog {
+            self.job_log_scroll = 0;
         }
     }
 
@@ -2228,6 +2459,246 @@ impl App {
         );
     }
 
+    /// Run the build-plan preflight (`Shift+P`) for every targeted node,
+    /// covering whichever profiles the current profile selection would
+    /// actually push.
+    fn refresh_build_plan_for_selected(&mut self) {
+        let targets = self.target_nodes();
+        if targets.is_empty() {
+            return;
+        }
+        for node in targets {
+            self.refresh_build_plan_for_node(&node);
+        }
+    }
+
+    /// Preflight one node. Split out from the batch entry point so the
+    /// drift check can chain into it — the same way `Shift+U` chains
+    /// into the package diff.
+    fn refresh_build_plan_for_node(&mut self, node: &Node) {
+        let site = self.build_site();
+        {
+            let profiles: Vec<String> = node
+                .ordered_profiles()
+                .into_iter()
+                .filter(|p| match self.profile_sel {
+                    ProfileSel::All => true,
+                    ProfileSel::System => p == "system",
+                    ProfileSel::Home => p == "home",
+                })
+                .collect();
+            if profiles.is_empty() {
+                self.push_log_tagged(
+                    format!(
+                        "! {} has no {} profile — nothing to plan",
+                        node.name,
+                        describe_profile(self.profile_sel)
+                    )
+                    .as_str(),
+                    true,
+                    Some(node.name.clone()),
+                );
+                return;
+            }
+            let entry = self.status.entry(node.name.clone()).or_default();
+            if entry.checking_plan {
+                return;
+            }
+            entry.checking_plan = true;
+            self.push_log_tagged(
+                format!(
+                    "→ preflighting the {} build for {}",
+                    site.label(),
+                    node.name
+                )
+                .as_str(),
+                false,
+                Some(node.name.clone()),
+            );
+
+            for profile in profiles {
+                let node_cloned = node.clone();
+                let override_ = self.override_for(&node.name).clone();
+                let tx = self.status_tx.clone();
+                let flake = self.flake.clone();
+                let profile_cloned = profile.clone();
+                let handle = tokio::spawn(async move {
+                    let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
+                    let forwarder_tx = tx.clone();
+                    let forwarder_node = node_cloned.name.clone();
+                    let forwarder = tokio::spawn(async move {
+                        while let Some(line) = prog_rx.recv().await {
+                            let _ = forwarder_tx
+                                .send(StatusUpdate::LogLine {
+                                    node: forwarder_node.clone(),
+                                    text: line,
+                                    is_err: false,
+                                })
+                                .await;
+                        }
+                    });
+                    let result = host::check_build_plan(
+                        &flake,
+                        &node_cloned,
+                        &profile_cloned,
+                        site,
+                        &override_,
+                        prog_tx,
+                    )
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                    let _ = forwarder.await;
+                    let _ = tx
+                        .send(StatusUpdate::BuildPlanProbe {
+                            node: node_cloned.name.clone(),
+                            profile: profile_cloned,
+                            result,
+                        })
+                        .await;
+                });
+                self.track_probe(handle);
+            }
+        }
+    }
+
+    /// Build the cache-seeding plan for a node, if one applies.
+    ///
+    /// Seeding needs both halves: the drift check says *which* caches are
+    /// new, and the build plan says *which paths* the deploy would
+    /// otherwise compile. With only one of them there is nothing
+    /// actionable, so we say so rather than seeding blind.
+    fn seed_plan_for(&mut self, node: &str) -> Option<deploy::SeedPlan> {
+        let status = self.status.get(node)?;
+        let drift = status.cache_drift.as_ref()?;
+        if !drift.has_drift() {
+            return None;
+        }
+        // Only a remote build fetches through the target's store; for a
+        // local build the target's cache set is irrelevant to the build.
+        if drift.site != BuildSite::Remote {
+            return None;
+        }
+        let substituters = drift.added_substituters.clone();
+        let keys = drift.added_keys.clone();
+        let paths: Vec<String> = status
+            .build_plans
+            .values()
+            .flat_map(|p| p.seedable_paths())
+            .collect();
+
+        if paths.is_empty() {
+            let msg = if status.build_plans.is_empty() {
+                format!(
+                    "! {node} adds {} cache(s) but no build plan is known — press Shift+P to \
+resolve the paths so they can be seeded",
+                    substituters.len()
+                )
+            } else {
+                format!("• {node}: nothing left to seed — the plan needs no new paths")
+            };
+            let is_err = status.build_plans.is_empty();
+            self.push_log_tagged(&msg, is_err, Some(node.to_string()));
+            return None;
+        }
+
+        self.push_log_tagged(
+            format!(
+                "• {node}: seeding {} path(s) from {} newly-added cache(s) before the build",
+                paths.len(),
+                substituters.len()
+            )
+            .as_str(),
+            false,
+            Some(node.to_string()),
+        );
+        Some(deploy::SeedPlan {
+            substituters,
+            keys,
+            paths,
+        })
+    }
+
+    /// Where a deploy started right now would build. Toggle 4
+    /// (`--remote-build`) is the only thing that moves it.
+    fn build_site(&self) -> BuildSite {
+        if self.toggles.remote_build {
+            BuildSite::Remote
+        } else {
+            BuildSite::Local
+        }
+    }
+
+    /// Run the substituter-drift check (`Shift+C`) for every targeted
+    /// node.
+    fn refresh_cache_drift_for_selected(&mut self) {
+        let targets = self.target_nodes();
+        if targets.is_empty() {
+            return;
+        }
+        // Which store does the building decides whose substituter list we
+        // have to compare against — see `host::BuildSite`.
+        let site = self.build_site();
+        for node in targets {
+            let entry = self.status.entry(node.name.clone()).or_default();
+            if entry.checking_cache {
+                continue;
+            }
+            entry.checking_cache = true;
+            self.push_log_tagged(
+                format!(
+                    "→ checking substituter drift for {} ({} build)",
+                    node.name,
+                    site.label()
+                )
+                .as_str(),
+                false,
+                Some(node.name.clone()),
+            );
+
+            let node_cloned = node.clone();
+            let override_ = self.override_for(&node.name).clone();
+            let askpass = self.askpass_env.clone();
+            let tx = self.status_tx.clone();
+            let flake = self.flake.clone();
+            let handle = tokio::spawn(async move {
+                let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
+                let forwarder_tx = tx.clone();
+                let forwarder_node = node_cloned.name.clone();
+                let forwarder = tokio::spawn(async move {
+                    while let Some(line) = prog_rx.recv().await {
+                        let _ = forwarder_tx
+                            .send(StatusUpdate::LogLine {
+                                node: forwarder_node.clone(),
+                                text: line,
+                                is_err: false,
+                            })
+                            .await;
+                    }
+                });
+                let result = host::check_substituter_drift(
+                    &flake,
+                    &node_cloned,
+                    site,
+                    &override_,
+                    &askpass,
+                    prog_tx,
+                )
+                .await
+                .map_err(|e| format!("{e:#}"));
+                // Drain progress lines before the verdict so they read in
+                // order.
+                let _ = forwarder.await;
+                let _ = tx
+                    .send(StatusUpdate::CacheDriftProbe {
+                        node: node_cloned.name.clone(),
+                        result,
+                    })
+                    .await;
+            });
+            self.track_probe(handle);
+        }
+    }
+
     /// Medium-tier update details: closure size delta for each of the
     /// selected host's profiles. Requires a prior `u` so we have the
     /// local/remote store paths to compare — if they're missing we
@@ -2294,13 +2765,15 @@ impl App {
                     }
                 });
                 let result = host::check_closure_sizes(
-                    &flake_cloned,
-                    &node_cloned,
-                    &profile_cloned,
-                    &local_path,
-                    &remote_path,
-                    &override_,
-                    &askpass,
+                    &host::ProfileProbe {
+                        flake: &flake_cloned,
+                        node: &node_cloned,
+                        profile: &profile_cloned,
+                        local_path: &local_path,
+                        remote_path: &remote_path,
+                        override_: &override_,
+                        askpass: &askpass,
+                    },
                     prog_tx,
                 )
                 .await
@@ -2381,13 +2854,15 @@ impl App {
             });
 
             let result = host::check_package_diff(
-                &flake_cloned,
-                &node_cloned,
-                &profile_cloned,
-                &local_path,
-                &remote_path,
-                &override_,
-                &askpass,
+                &host::ProfileProbe {
+                    flake: &flake_cloned,
+                    node: &node_cloned,
+                    profile: &profile_cloned,
+                    local_path: &local_path,
+                    remote_path: &remote_path,
+                    override_: &override_,
+                    askpass: &askpass,
+                },
                 prog_tx,
             )
             .await
@@ -2593,6 +3068,62 @@ impl App {
                     }
                 }
             }
+            StatusUpdate::BuildPlanProbe {
+                node,
+                profile,
+                result,
+            } => {
+                let entry = self.status.entry(node.clone()).or_default();
+                entry.checking_plan = false;
+                match result {
+                    Ok(plan) => {
+                        for (text, is_err) in describe_plan(&node, &profile, &plan) {
+                            self.push_log_tagged(&text, is_err, Some(node.clone()));
+                        }
+                        let entry = self.status.entry(node).or_default();
+                        entry.build_plans.insert(profile, plan);
+                    }
+                    Err(e) => {
+                        entry.last_error = Some(e.clone());
+                        self.push_log_tagged(
+                            format!("! build plan for {profile} failed: {e}").as_str(),
+                            true,
+                            Some(node),
+                        );
+                    }
+                }
+            }
+            StatusUpdate::CacheDriftProbe { node, result } => {
+                let entry = self.status.entry(node.clone()).or_default();
+                entry.checking_cache = false;
+                match result {
+                    Ok(drift) => {
+                        entry.cache_drift = Some(drift.clone());
+                        for (text, is_err) in describe_drift(&node, &drift) {
+                            self.push_log_tagged(&text, is_err, Some(node.clone()));
+                        }
+                        // Chain into the preflight, same shape as
+                        // `Shift+U` → package diff. Seeding needs the
+                        // path list, and a user who just learned their
+                        // deploy adds an unusable cache wants to know
+                        // what it will cost anyway.
+                        if drift.has_drift() && drift.site == BuildSite::Remote {
+                            if let Some(n) = self.nodes.iter().find(|n| n.name == node).cloned() {
+                                self.refresh_build_plan_for_node(&n);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        entry.cache_drift = None;
+                        entry.last_error = Some(e.clone());
+                        self.push_log_tagged(
+                            format!("! cache check failed: {e}").as_str(),
+                            true,
+                            Some(node),
+                        );
+                    }
+                }
+            }
             StatusUpdate::LogLine { node, text, is_err } => {
                 self.push_log_tagged(&text, is_err, Some(node));
             }
@@ -2722,7 +3253,37 @@ impl App {
                 ssh_override: self.override_for(&node.name).clone(),
                 askpass: self.askpass_env.clone(),
                 profiles,
+                extra_build_args: self.extra_build_args.clone(),
+                seed: self.seed_plan_for(&node.name),
+                node_info: Some(node.clone()),
             };
+            if !self.extra_build_args.is_empty() {
+                self.push_log_tagged(
+                    format!(
+                        "• extra build args: {}",
+                        self.extra_build_args.join(" ")
+                    )
+                    .as_str(),
+                    false,
+                    Some(node.name.clone()),
+                );
+                if self.toggles.remote_build {
+                    let inert = inert_remote_build_args(&self.extra_build_args);
+                    if !inert.is_empty() {
+                        self.push_log_tagged(
+                            format!(
+                                "! {} is inert with --remote-build: it configures the local nix \
+client, but the target's daemon does the fetching. Use Shift+C so deptui seeds the \
+target's store instead.",
+                                inert.join(", ")
+                            )
+                            .as_str(),
+                            true,
+                            Some(node.name.clone()),
+                        );
+                    }
+                }
+            }
             self.push_log_tagged(
                 format!(
                     "→ deploy [{}/{}] {} ({}, {})",
@@ -2748,6 +3309,7 @@ impl App {
             let handle = deploy::run(req, sudo_pw);
             self.deploy_rx = Some(handle.rx);
             self.deploy_task = Some(handle.task);
+            self.deploy_cancel = Some(handle.cancel);
             self.deploy_stdin_tx = handle.stdin_tx;
             self.busy_label = if self.queue_total > 1 {
                 Some(format!(
@@ -2779,7 +3341,20 @@ impl App {
         let probes_aborted = self.cancel_probes();
 
         if let Some(t) = self.deploy_task.take() {
-            t.abort();
+            // Signal first, then *detach* rather than abort. The deploy
+            // task needs to stay alive long enough to SIGTERM its whole
+            // process group, wait out the grace period, and SIGKILL
+            // whatever is left; aborting here would drop the child
+            // mid-sequence and `kill_on_drop` would only reach the group
+            // leader, orphaning the `nix` builders underneath it.
+            if let Some(c) = self.deploy_cancel.take() {
+                c.cancel();
+            } else {
+                // No canceller (shouldn't happen) — fall back to the old
+                // behaviour rather than leaving the task running.
+                t.abort();
+            }
+            drop(t);
             self.deploy_rx = None;
             self.deploy_stdin_tx = None;
             self.clear_cached_password();
@@ -2868,7 +3443,7 @@ impl App {
                 } else {
                     self.input = InputMode::PasswordPrompt {
                         prompt,
-                        buf: String::new(),
+                        buf: SecretBuf::new(),
                         source: PromptSource::Sudo,
                     };
                 }
@@ -2890,6 +3465,7 @@ impl App {
                 self.push_log_tagged(&banner, !ok, exit_host.clone());
                 self.deploy_task = None;
                 self.deploy_rx = None;
+                self.deploy_cancel = None;
                 self.deploy_stdin_tx = None;
     
                 if matches!(self.input, InputMode::PasswordPrompt { .. }) {
@@ -2919,6 +3495,16 @@ impl App {
                             s.home_update = UpdateState::Unknown;
                             s.system_extra = ProfileExtra::default();
                             s.home_extra = ProfileExtra::default();
+                            // The plan described the closure we just
+                            // pushed; keeping it would tell the user a
+                            // deploy still has work to do when it
+                            // doesn't. Same reasoning as the extras.
+                            s.build_plans.clear();
+                            // Drift, on the other hand, is now stale in
+                            // the opposite direction: the new nix.conf
+                            // is live, so whatever it reported has been
+                            // resolved by this very deploy.
+                            s.cache_drift = None;
                         }
                     }
                 }
@@ -2964,6 +3550,7 @@ impl App {
                 );
                 self.deploy_task = None;
                 self.deploy_rx = None;
+                self.deploy_cancel = None;
                 self.deploy_stdin_tx = None;
                 self.clear_cached_password();
 
@@ -3018,6 +3605,190 @@ impl App {
         }
     }
 }
+
+/// `--build-arg` values that configure substitution and therefore do
+/// nothing for a remote build.
+///
+/// `--remote-build` runs a *local* nix client against a remote store
+/// (`--store ssh-ng://…`), so these options configure the local client
+/// while the fetching happens on the target, out of the target's own
+/// nix.conf. nix reports nothing; the build just proceeds as if they
+/// weren't there. Naming them explicitly is the only way the user finds
+/// out.
+const SUBSTITUTION_BUILD_ARGS: &[&str] = &[
+    "substituters",
+    "extra-substituters",
+    "trusted-substituters",
+    "trusted-public-keys",
+    "extra-trusted-public-keys",
+];
+
+/// Which of `args` are substitution options that a remote build ignores.
+pub fn inert_remote_build_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|a| {
+            let key = a.trim_start_matches('-');
+            SUBSTITUTION_BUILD_ARGS.contains(&key)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Render a build plan as job-log lines, as `(text, is_err)` pairs.
+///
+/// The build list is what the user is actually after — "this deploy will
+/// compile ollama" is the fact that has to arrive *before* the deploy,
+/// not forty minutes into it — so it is listed by name and marked as a
+/// warning. Fetching is routine and stays neutral.
+pub fn describe_plan(node: &str, profile: &str, plan: &BuildPlan) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    if plan.nothing_to_do {
+        out.push((
+            format!("[plan] {node}.{profile}: already realised — nothing to build or fetch"),
+            false,
+        ));
+        return out;
+    }
+
+    if plan.builds_anything() {
+        out.push((
+            format!(
+                "[plan] {node}.{profile}: {} derivation(s) will be COMPILED",
+                plan.to_build.len()
+            ),
+            true,
+        ));
+        // Cap the list: a from-scratch system is hundreds of entries and
+        // would bury everything else in the log.
+        const MAX_LISTED: usize = 12;
+        for name in plan.build_labels().iter().take(MAX_LISTED) {
+            out.push((format!("[plan]   ⚒ {name}"), true));
+        }
+        if plan.to_build.len() > MAX_LISTED {
+            out.push((
+                format!("[plan]   … +{} more", plan.to_build.len() - MAX_LISTED),
+                true,
+            ));
+        }
+    } else {
+        out.push((
+            format!("[plan] {node}.{profile}: nothing to compile"),
+            false,
+        ));
+    }
+
+    if !plan.to_fetch.is_empty() {
+        let size = plan
+            .download_bytes
+            .map(|b| format!(" ({} download)", ui::humanise_bytes(b)))
+            .unwrap_or_default();
+        out.push((
+            format!(
+                "[plan] {node}.{profile}: {} path(s) will be fetched{size}",
+                plan.to_fetch.len()
+            ),
+            false,
+        ));
+    }
+    out
+}
+
+/// Turn a drift result into the lines the job log shows, as
+/// `(text, is_err)` pairs.
+///
+/// The wording is deliberately specific about *why* the cache can't be
+/// used, because the symptom (a deploy that compiles for 40 minutes) is
+/// nowhere near the cause (a substituter that only goes live once
+/// `nix-daemon` restarts, which happens after the build).
+pub fn describe_drift(node: &str, drift: &SubstituterDrift) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    if !drift.has_drift() {
+        out.push((
+            format!(
+                "[cache] {node}: no new substituters — the {} store can already fetch \
+everything this closure declares",
+                drift.site.label()
+            ),
+            false,
+        ));
+    } else {
+        let n = drift.added_substituters.len();
+        if n > 0 {
+            let where_ = match drift.site {
+                BuildSite::Remote => "the target's nix-daemon",
+                BuildSite::Local => "this machine's nix",
+            };
+            out.push((
+                format!(
+                    "[cache] {node}: this deploy adds {n} cache(s) that {where_} does not have \
+yet — the build runs before the new nix.conf is active, so it cannot use them"
+                ),
+                true,
+            ));
+            for url in &drift.added_substituters {
+                out.push((format!("[cache]   + {url}"), true));
+            }
+        }
+        if !drift.added_keys.is_empty() {
+            out.push((
+                format!(
+                    "[cache] {node}: {} new trusted-public-key(s) — a cache without its key is \
+still unusable",
+                    drift.added_keys.len()
+                ),
+                true,
+            ));
+            for key in &drift.added_keys {
+                // Keys are long; the name before `:` is the identifying part.
+                let short = key.split_once(':').map(|(n, _)| n).unwrap_or(key);
+                out.push((format!("[cache]   + {short}:…"), true));
+            }
+        }
+        out.push((
+            match drift.site {
+                BuildSite::Remote => format!(
+                    "[cache] {node}: remote builds fetch from the *target's* nix.conf, so \
+`-- --option extra-substituters …` will not help here"
+                ),
+                BuildSite::Local => format!(
+                    "[cache] {node}: local build — pass the cache to this deploy with \
+`-- --option extra-substituters <url> --option extra-trusted-public-keys <key>`"
+                ),
+            },
+            false,
+        ));
+    }
+    if !drift.removed_substituters.is_empty() {
+        out.push((
+            format!(
+                "[cache] {node}: {} cache(s) present now but absent from the new config",
+                drift.removed_substituters.len()
+            ),
+            false,
+        ));
+    }
+    if drift.ssh_user_trusted == Some(false) {
+        let user = drift.ssh_user.as_deref().unwrap_or("the ssh user");
+        out.push((
+            format!(
+                "[cache] {node}: `{user}` is not in the target's `trusted-users` — substituter \
+overrides sent to that host are silently ignored, with no warning from nix"
+            ),
+            true,
+        ));
+    }
+    out
+}
+
+/// Upper bound on how many already-queued deploy lines one loop
+/// iteration absorbs before painting. Matches the channel capacity in
+/// `deploy::run`, so a full backlog clears in a single pass.
+const MAX_LOG_DRAIN: usize = 256;
+
+/// Floor on the interval between deploy-output repaints (~30fps). Only
+/// applies while a deploy is running, where the tick timer guarantees a
+/// follow-up frame.
+const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// Receive from an `Option<Receiver<T>>`. Returns `None` (i.e. the branch
 /// stays pending) when the option is empty, so `select!` can ignore it.
@@ -3089,15 +3860,41 @@ fn describe_profile(p: ProfileSel) -> &'static str {
 /// Try to write `text` to the system clipboard. Attempts `wl-copy` (Wayland),
 /// then `xclip`, then `xsel` (X11), then `pbcopy` (macOS). Returns `true` if
 /// any tool succeeded.
+/// Push `text` to the system clipboard. Returns `false` only when no
+/// clipboard helper could be started at all.
+///
+/// Deliberately never blocks indefinitely on the child. `xclip` (and
+/// `xsel --nodetach`) stay in the foreground *owning* the X selection
+/// until another client claims it — `Child::wait()` on them never
+/// returns, and since this runs on the UI thread that used to wedge the
+/// whole TUI: no keys, no redraws, no way out but SIGKILL. We hand over
+/// the text, give the helper a short grace period to fail fast on a bad
+/// invocation, and otherwise leave it running detached (dropping a
+/// `std::process::Child` does not kill it).
 fn yank_to_clipboard(text: &str) -> bool {
     use std::io::Write as _;
-    let candidates: &[(&str, &[&str])] = &[
-        ("wl-copy", &[]),
-        ("xclip", &["-selection", "clipboard"]),
-        ("xsel", &["--clipboard", "--input"]),
-        ("pbcopy", &[]),
+
+    // Skipping helpers whose display server isn't present avoids
+    // spawning processes that can only fail, and keeps the grace period
+    // below from being spent on them.
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    let x11 = std::env::var_os("DISPLAY").is_some();
+    let candidates: &[(&str, &[&str], bool)] = &[
+        ("wl-copy", &[], wayland),
+        ("xclip", &["-selection", "clipboard"], x11),
+        ("xsel", &["--clipboard", "--input"], x11),
+        ("pbcopy", &[], cfg!(target_os = "macos")),
     ];
-    for &(cmd, args) in candidates {
+
+    /// How long to wait for an immediate failure (helper not usable,
+    /// wrong args) before assuming the helper is alive and holding the
+    /// selection on purpose.
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(120);
+
+    for &(cmd, args, usable) in candidates {
+        if !usable {
+            continue;
+        }
         let Ok(mut child) = std::process::Command::new(cmd)
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -3107,11 +3904,36 @@ fn yank_to_clipboard(text: &str) -> bool {
         else {
             continue;
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+        // Drop stdin so the helper sees EOF and can take ownership.
+        match child.stdin.take() {
+            Some(mut stdin) => {
+                if stdin.write_all(text.as_bytes()).is_err() {
+                    let _ = child.kill();
+                    continue;
+                }
+            }
+            None => {
+                let _ = child.kill();
+                continue;
+            }
         }
-        if child.wait().map(|s| s.success()).unwrap_or(false) {
-            return true;
+
+        let deadline = std::time::Instant::now() + GRACE;
+        loop {
+            match child.try_wait() {
+                // Exited cleanly (wl-copy, pbcopy, xsel forking off).
+                Ok(Some(status)) if status.success() => return true,
+                // Exited non-zero — try the next helper.
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        // Still alive: it owns the selection now. Leave
+                        // it detached rather than waiting on it.
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
         }
     }
     false
@@ -3154,6 +3976,222 @@ mod tests {
                 profiles_order: None,
             },
         ]
+    }
+
+    fn drift(site: BuildSite, added: &[&str], keys: &[&str]) -> SubstituterDrift {
+        SubstituterDrift {
+            site,
+            added_substituters: added.iter().map(|s| s.to_string()).collect(),
+            added_keys: keys.iter().map(|s| s.to_string()).collect(),
+            removed_substituters: Vec::new(),
+            ssh_user: None,
+            ssh_user_trusted: None,
+        }
+    }
+
+    /// `build`/`fetch` are package names; the helper turns them into
+    /// plausible store paths so `build_labels()` round-trips.
+    fn plan(build: &[&str], fetch: &[&str], download: Option<u64>) -> BuildPlan {
+        let path = |n: &str, drv: bool| {
+            format!(
+                "/nix/store/00000000000000000000000000000000-{n}{}",
+                if drv { ".drv" } else { "" }
+            )
+        };
+        BuildPlan {
+            to_build: build.iter().map(|s| path(s, true)).collect(),
+            to_fetch: fetch.iter().map(|s| path(s, false)).collect(),
+            build_outputs: build.iter().map(|s| path(s, false)).collect(),
+            download_bytes: download,
+            unpacked_bytes: None,
+            nothing_to_do: build.is_empty() && fetch.is_empty() && download.is_none(),
+        }
+    }
+
+    #[test]
+    fn flags_substitution_args_as_inert_for_remote_builds() {
+        let args: Vec<String> = [
+            "--option",
+            "extra-substituters",
+            "https://cuda",
+            "--option",
+            "extra-trusted-public-keys",
+            "k:1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let inert = inert_remote_build_args(&args);
+        assert_eq!(inert, vec!["extra-substituters", "extra-trusted-public-keys"]);
+    }
+
+    #[test]
+    fn ordinary_build_args_are_not_flagged() {
+        let args: Vec<String> = ["--option", "max-jobs", "4", "--cores", "8"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(inert_remote_build_args(&args).is_empty());
+    }
+
+    #[test]
+    fn describe_plan_names_what_will_be_compiled() {
+        let p = plan(&["ollama-0.5.4", "cuda-merged-12.4"], &["hello-2.12"], Some(1024 * 1024));
+        let lines = describe_plan("gpu", "system", &p);
+        let joined = lines
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("ollama-0.5.4"), "{joined}");
+        assert!(joined.contains("2 derivation(s) will be COMPILED"), "{joined}");
+        assert!(joined.contains("1.0 MiB download"), "{joined}");
+        // Compiling is the part that has to stand out.
+        assert!(lines.iter().any(|(t, is_err)| *is_err && t.contains("ollama")));
+    }
+
+    #[test]
+    fn describe_plan_is_quiet_when_nothing_compiles() {
+        let p = plan(&[], &["hello-2.12"], Some(2048));
+        let lines = describe_plan("host", "system", &p);
+        assert!(
+            lines.iter().all(|(_, is_err)| !*is_err),
+            "a fetch-only plan should raise no warnings: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn describe_plan_reports_a_no_op_deploy() {
+        let p = plan(&[], &[], None);
+        let lines = describe_plan("host", "system", &p);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].0.contains("nothing to build or fetch"), "{lines:?}");
+    }
+
+    #[test]
+    fn describe_plan_caps_a_huge_build_list() {
+        let names: Vec<String> = (0..40).map(|i| format!("pkg-{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let lines = describe_plan("host", "system", &plan(&refs, &[], None));
+        assert!(
+            lines.len() < 20,
+            "a 40-entry build list must not flood the log: {} lines",
+            lines.len(),
+        );
+        assert!(lines.iter().any(|(t, _)| t.contains("+28 more")), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn shift_p_starts_a_build_plan_check() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+        assert!(app.status_for("alpha").checking_plan);
+        // `p` (unshifted) must still be the job-log pane jump.
+        let mut app2 = App::new(".".into(), sample_nodes());
+        app2.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(app2.focus, FocusPane::JobLog);
+        assert!(!app2.status_for("alpha").checking_plan);
+    }
+
+    #[test]
+    fn describe_drift_names_the_cache_it_cannot_use() {
+        let d = drift(BuildSite::Remote, &["https://cache.nixos-cuda.org"], &[]);
+        let lines = describe_drift("gpu", &d);
+        let joined = lines
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("https://cache.nixos-cuda.org"), "{joined}");
+        assert!(joined.contains("adds 1 cache"), "{joined}");
+        // The remote case must not suggest the local remedy, which is
+        // inert across the ssh-ng store boundary.
+        assert!(
+            !joined.contains("pass the cache to this deploy"),
+            "remote drift should not suggest extra build args: {joined}",
+        );
+        assert!(lines.iter().any(|(_, is_err)| *is_err));
+    }
+
+    #[test]
+    fn describe_drift_suggests_build_args_for_local_builds() {
+        let d = drift(BuildSite::Local, &["https://extra"], &[]);
+        let joined = describe_drift("host", &d)
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("extra-substituters"), "{joined}");
+    }
+
+    #[test]
+    fn describe_drift_is_quiet_when_nothing_was_added() {
+        let d = drift(BuildSite::Remote, &[], &[]);
+        let lines = describe_drift("host", &d);
+        assert!(
+            lines.iter().all(|(_, is_err)| !*is_err),
+            "no drift should produce no error lines: {lines:?}",
+        );
+    }
+
+    #[test]
+    fn describe_drift_flags_an_untrusted_ssh_user() {
+        let mut d = drift(BuildSite::Remote, &[], &[]);
+        d.ssh_user = Some("deploy".into());
+        d.ssh_user_trusted = Some(false);
+        let lines = describe_drift("host", &d);
+        assert!(
+            lines
+                .iter()
+                .any(|(t, is_err)| *is_err && t.contains("trusted-users")),
+            "{lines:?}",
+        );
+    }
+
+    // Spawns the probe task, so it needs a reactor.
+    #[tokio::test]
+    async fn shift_c_starts_a_cache_check_for_the_selected_host() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert!(
+            app.status_for("alpha").checking_cache,
+            "Shift+C should mark the selected host as checking",
+        );
+        // `c` (unshifted) must still be the commands-pane jump.
+        let mut app2 = App::new(".".into(), sample_nodes());
+        app2.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(app2.focus, FocusPane::Commands);
+        assert!(!app2.status_for("alpha").checking_cache);
+    }
+
+    #[test]
+    fn v_enters_visual_mode_from_the_hosts_pane() {
+        // Regression: this used to require the job log to already have
+        // focus, so the gesture right after a deploy did nothing.
+        let mut app = App::new(".".into(), sample_nodes());
+        app.focus = FocusPane::Hosts;
+        app.push_log_tagged("some output", false, Some("alpha".into()));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.focus, FocusPane::JobLog);
+        assert!(app.visual_sel.is_some());
+    }
+
+    #[test]
+    fn esc_unwinds_selection_before_search() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.push_log_tagged("hello", false, Some("alpha".into()));
+        app.log_search = Some("hello".into());
+        app.log_search_target = Some(SearchTarget::JobLog);
+        app.focus = FocusPane::JobLog;
+        app.enter_visual_mode(VisualMode::Line);
+        assert!(app.visual_sel.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.visual_sel.is_none());
+        assert!(app.log_search.is_some(), "search must survive the first Esc");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.log_search.is_none());
     }
 
     #[test]
@@ -3443,6 +4481,82 @@ mod tests {
     // ---- PasswordPrompt input mode ----
 
     #[test]
+    fn secret_buf_redacts_its_debug_output() {
+        // `InputMode` derives Debug; a stray `{:?}` must not put the
+        // plaintext into --log-file.
+        let buf = SecretBuf::from("hunter2");
+        let rendered = format!("{buf:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+
+        let mode = InputMode::PasswordPrompt {
+            prompt: "Password:".into(),
+            buf,
+            source: PromptSource::Askpass,
+        };
+        assert!(!format!("{mode:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn secret_buf_grows_past_its_reserved_capacity() {
+        let mut buf = SecretBuf::new();
+        let long = "x".repeat(SECRET_BUF_CAPACITY * 2 + 7);
+        for c in long.chars() {
+            buf.push(c);
+        }
+        assert_eq!(buf.as_str(), long);
+        assert_eq!(buf.char_count(), long.len());
+    }
+
+    #[test]
+    fn secret_buf_handles_multibyte_input() {
+        let mut buf = SecretBuf::new();
+        for c in "pässwörd±é".chars() {
+            buf.push(c);
+        }
+        assert_eq!(buf.as_str(), "pässwörd±é");
+        assert_eq!(buf.char_count(), 10);
+        buf.pop();
+        assert_eq!(buf.as_str(), "pässwörd±");
+    }
+
+    /// The askpass server handles one dialog at a time and blocks on the
+    /// reply. Dismissing without answering used to leave it blocked
+    /// forever, killing askpass for the rest of the session.
+    #[tokio::test]
+    async fn dismissing_an_askpass_prompt_still_answers_the_server() {
+        let mut app = App::new(".".into(), sample_nodes());
+        let (tx, mut rx) = mpsc::channel::<Zeroizing<String>>(4);
+        app.askpass_password_tx = tx;
+        app.input = InputMode::PasswordPrompt {
+            prompt: "Password:".into(),
+            buf: SecretBuf::from("partial"),
+            source: PromptSource::Askpass,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(app.input, InputMode::Normal));
+        let reply = rx.try_recv().expect("server must receive a reply on dismiss");
+        assert!(reply.is_empty(), "dismissal must not send the typed prefix");
+        // And the half-typed password must not have been cached.
+        assert!(app.cached_password.is_none());
+    }
+
+    #[tokio::test]
+    async fn submitting_an_askpass_prompt_sends_the_password() {
+        let mut app = App::new(".".into(), sample_nodes());
+        let (tx, mut rx) = mpsc::channel::<Zeroizing<String>>(4);
+        app.askpass_password_tx = tx;
+        app.input = InputMode::PasswordPrompt {
+            prompt: "Password:".into(),
+            buf: SecretBuf::from("hunter2"),
+            source: PromptSource::Askpass,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(rx.try_recv().unwrap().as_str(), "hunter2");
+    }
+
+    #[test]
     fn password_prompt_esc_returns_to_normal() {
         let mut app = App::new(".".into(), sample_nodes());
         app.input = InputMode::PasswordPrompt {
@@ -3459,7 +4573,7 @@ mod tests {
         let mut app = App::new(".".into(), sample_nodes());
         app.input = InputMode::PasswordPrompt {
             prompt: "Password:".into(),
-            buf: String::new(),
+            buf: SecretBuf::new(),
             source: PromptSource::Askpass,
         };
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));

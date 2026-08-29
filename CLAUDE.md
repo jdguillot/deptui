@@ -21,6 +21,7 @@ All of these assume you're inside the dev shell (`nix develop`) so that
 | run against a flake   | `cargo run -- /path/to/flake`                 |
 | run against cwd       | `cargo run`                                   |
 | lint                  | `cargo clippy --all-targets -- -D warnings`   |
+| audit                 | `cargo audit` (clean as of the last dep bump) |
 | format                | `cargo fmt`                                   |
 | nix build             | `nix build`                                   |
 
@@ -46,16 +47,23 @@ blocks in the source modules:
   navigation), `push_log` cap, override management, `FocusPane`
   layout rows.
 
-**Integration tests** (`tests/`, ~12 tests) exercise the process-spawning
-code paths via shell-script PATH shims (no real `nix`/`deploy`/`ssh`
-required):
+**Integration tests** (`tests/`) exercise the process-spawning and
+rendering paths:
 
 - `tests/flake_discover.rs` — mock `nix` binary returns canned JSON;
   covers success, empty nodes, eval failure, and malformed JSON.
 - `tests/deploy_run.rs` — mock `deploy` binary; covers stdout/stderr
   streaming, exit code propagation, mode flags (`--boot`,
   `--dry-activate`), toggle flags, SSH override flags, ANSI stripping,
-  and profile suffix in the target string.
+  profile suffix in the target string, extra build args landing after
+  `--`, and that cancelling kills the whole process group.
+- `tests/ui_render.rs` — renders the real widget tree into ratatui's
+  `TestBackend`. Nothing else covers `ui::draw`, where a panic or a
+  layout regression only shows up in front of the user. Covers the
+  default screen, awkward and sub-minimum terminal sizes, every popup,
+  the windowed job log's tail and scroll-back, help scrolling and its
+  in-place clamp, and that the password widget renders only mask
+  characters.
 
 Integration tests use `serial_test` to serialize because they mutate the
 process-global `$PATH`. When adding more, follow the same pattern:
@@ -131,6 +139,29 @@ Key invariants worth knowing before touching the code:
 - **The deploy log is the only mutable buffer that grows.** It's capped
   at 2000 lines in `App::push_log`. If you add other long-lived buffers,
   cap them too.
+- **Log throughput is decoupled from frame rate.** `deploy` can emit
+  output far faster than a full ratatui pass completes. The deploy arm
+  of the `select!` drains up to `MAX_LOG_DRAIN` already-queued lines
+  before painting, and rate-limits its own repaints to
+  `MIN_FRAME_INTERVAL` *while a deploy is running* — the 120ms tick is
+  what guarantees the skipped frame still lands, so the rate limit must
+  stay off once `deploy_task` is `None`. Without this, one draw per line
+  made the renderer the bottleneck, the bounded channel filled, and
+  back-pressure stalled the child's pipe: the log appeared to freeze
+  mid-deploy.
+- **`draw_job_log` only builds the lines that can be on screen.** It
+  windows `tagged` to the last `job_log_scroll + viewport + 2` entries.
+  The two pieces of state that accumulate across the whole pane —
+  `size_locals` and the search `match_counter` — are caught up with a
+  cheap prefix scan over the skipped entries. Anything else that
+  accumulates left-to-right must be added to that pre-scan too.
+- **Child output is read byte-wise, never via `lines()`.**
+  `deploy::forward_lines` decodes lossily and treats both `\n` and `\r`
+  as terminators. `AsyncBufReadExt::lines()` returns `Err` on the first
+  non-UTF-8 byte (nested `nix`/`ssh` output is not guaranteed UTF-8),
+  which silently ended the reader — dropping the rest of the deploy's
+  output *and* the pipe, SIGPIPE-ing the child. It also ignores `\r`,
+  so progress repaints buffered forever.
 - **Modes map directly to deploy-rs flags:**
   `Switch` → no flag, `Boot` → `--boot`, `DryRun` → `--dry-activate`.
   Don't try to emulate `Boot` by SSH-ing manually — deploy-rs already
@@ -157,9 +188,18 @@ Key invariants worth knowing before touching the code:
   The popup warns when a deploy is running. Pressing `y`/Enter confirms,
   `n`/Esc cancels. A second `Ctrl-C` while the popup is showing
   confirms immediately (the short-circuit at the top of `handle_key`).
-- **`kill_on_drop(true)`** is set on the spawned `deploy` Command so
-  cancelling (key `x`) actually reaps the child instead of orphaning
-  it. Don't remove it.
+- **Cancelling signals the process group, not just the child.**
+  `kill_on_drop(true)` is set on the spawned `deploy` Command, but it
+  only reaches the direct child — and since `pre_exec` calls `setsid()`,
+  that child *leads its own process group*, so the `nix` builders and
+  `ssh` it forked survive it and keep burning CPU. `deploy::run` returns
+  a `DeployCanceller`; `App::cancel_deploy` (key `x`) and the quit path
+  call it and then **detach** the task rather than aborting it, because
+  the teardown (`killpg` SIGTERM → 3s grace → `killpg` SIGKILL) runs
+  inside `run_one` while it still owns the child. Owning the child is
+  what makes the escalation safe: the pid stays reserved, so the delayed
+  SIGKILL can't land on a recycled pgid. Aborting the task instead would
+  drop the child mid-sequence and orphan the group again.
 - **`NO_COLOR=1`** is set on the spawned `deploy` so its output stays
   legible when forwarded line-by-line into ratatui. Additionally,
   `deploy.rs::strip_ansi` removes any ANSI escape sequences (CSI, OSC,
@@ -175,6 +215,54 @@ Key invariants worth knowing before touching the code:
   `apply_status` → `UpdateProbe` Ok) and when a deploy succeeds (the
   `LogLine::Exit` handler resets `ProfileExtra` to default). This
   prevents stale numbers from lingering after the closure changes.
+- **Build-plan preflight mirrors deploy-rs's own build command.**
+  `host::check_build_plan` (`Shift+P`) dry-runs the flake attribute for a
+  local build, but for `--remote-build` it resolves `…path.drvPath`,
+  `nix copy --derivation` it to the target, then dry-runs
+  `<drv>^out --eval-store auto --store ssh-ng://<target>`. Using the
+  local form for a remote build reports this machine's store and is
+  simply the wrong answer. `parse_dry_run` reads nix's *human* output —
+  treat it as best-effort and keep it total: unrecognised sections are
+  ignored rather than failing the preflight. Cached plans are cleared on
+  a successful deploy (same place the extras are), because they describe
+  the closure that was just pushed.
+- **Cache seeding is additive on purpose.** `host::seed_substituters`
+  copies store paths into the target *before* the build instead of
+  rewriting its `nix.conf`. That choice is the whole safety story: there
+  is no remote file to restore, so failure, cancellation, and a killed
+  process all leave the target in a valid state. It runs inside
+  `deploy::run_inner` (before the first invocation) rather than in the
+  App, so it is sequenced ahead of the build and shares the deploy's
+  cancellation. Copy one path per `nix copy` — batching fails wholesale
+  when any single path is absent from the cache, which is the normal
+  case. Everything interpolated into the remote script goes through
+  `shell_quote`; the round-trip test against a real `sh` is the guard.
+  Seeding needs *both* the drift result and the build plan, so
+  `CacheDriftProbe` chains into `refresh_build_plan_for_node` — without
+  the plan there are no paths and `seed_plan_for` says so rather than
+  seeding blind.
+- **`--build-arg` is inert for remote builds when it configures
+  substitution.** `inert_remote_build_args` names those options in the
+  log before the deploy starts. deploy-rs forwards `-- <args>` to a
+  *local* nix client even under `--remote-build`, so
+  `extra-substituters` there configures the wrong side of the ssh-ng
+  store boundary and nix reports nothing at all. Extra build args must
+  stay the last thing appended in `run_one` — they follow `--`.
+- **Substituter drift compares against the *building* store.**
+  `host::check_substituter_drift` (`Shift+C`) evaluates
+  `nixosConfigurations.<node>.config.nix.settings` — an eval, never a
+  build — and diffs it against `nix config show`. Which side it reads is
+  the entire point: a `--remote-build` fetches through the *target's*
+  `nix-daemon`, a local build through *this machine's* nix. Getting that
+  backwards makes the check worse than useless, because `--option
+  extra-substituters` passed to a remote build is silently inert (it
+  configures the local client; the ssh-ng store boundary is where the
+  fetching decision actually happens). Read `nix.settings` via the
+  `--apply` in `SETTINGS_APPLY`, which folds in the `extra-*` spellings —
+  reading `substituters` alone misses how most people add a cache.
+  `user_is_trusted` covers the companion trap: a deploy ssh user outside
+  `trusted-users` makes nix ignore substituter overrides with no warning
+  at all.
 - **Content-only change detection.** When `check_package_diff` finds no
   name+version differences but the store-path sets still diverge, it
   emits a `(content-only) N path(s) differ` summary line plus sample
@@ -190,6 +278,10 @@ Key invariants worth knowing before touching the code:
   magenta. `highlight_match` takes a `current_match` (1-based global
   index from `log_search_stats`) and a `&mut match_counter` to
   distinguish the active hit across the entire pane.
+- **`v`/`V` are global too.** Visual selection used to require the job
+  log to already have focus, so the obvious gesture right after a deploy
+  (focus still on Hosts) did nothing at all. Both keys now focus the pane
+  first. `Esc` unwinds one step per press: selection first, then search.
 - **`/`, `n`/`N`, and `Esc` are global search keys.** The early key
   dispatch in `handle_key_normal` catches `/` (open search), `n`/`N`
   (next/prev match), and `Esc` (clear search) before pane-specific arms
@@ -206,6 +298,35 @@ Key invariants worth knowing before touching the code:
   pane holds only the summary + extras; it no longer has a log section.
   Commands/info row is below both columns: commands left (60%), info right
   (40%).
+- **The askpass server must always be answered.** `AskpassServer::serve`
+  handles one dialog at a time and blocks on `password_rx.recv()`.
+  Dismissing a `PromptSource::Askpass` prompt therefore sends an *empty*
+  password rather than nothing: staying silent used to wedge the loop
+  forever, so the ssh child waited on the helper, the helper waited on
+  the server, and every later prompt in the session was dead. Any new
+  exit path out of that prompt has to reply too. The read side is
+  bounded (`MAX_PROMPT_BYTES`) and time-limited (`PROMPT_READ_TIMEOUT`)
+  for the same reason — one stalled or flooding client would otherwise
+  take the whole mechanism down.
+- **Prompts are sanitised before they reach a widget.**
+  `askpass::sanitise_prompt` strips control bytes and caps the length.
+  A prompt embeds host names and key paths, and it is drawn straight
+  into a ratatui popup — escape sequences there corrupt the screen the
+  same way they do in the deploy log.
+- **Passwords never live in a plain `String`.** The typing buffer is
+  `app::SecretBuf`: it reserves capacity up front and grows by hand so
+  `String::push` can't strand un-wiped copies of the prefix on the heap,
+  it wipes on drop via `Zeroizing`, and it redacts its own `Debug` —
+  `InputMode` derives `Debug`, so one stray `tracing::debug!` of the
+  input state would otherwise write the plaintext to `--log-file`. The
+  askpass channel carries `Zeroizing<String>` for the same reason. If
+  you add a new path that touches a password, keep it inside these
+  types.
+- **A panic must restore the terminal.** `ui::init` installs a hook that
+  calls `ui::restore` before chaining to the previous hook. Without it a
+  panic unwinds past `main`'s `restore()` and leaves the user in raw
+  mode inside the alternate screen — no echo, no line editing, and the
+  panic message written to a screen that is about to be discarded.
 - **SSH_ASKPASS is always active during deploys and probes.** The
   deploy child and all SSH-spawning probe tasks run in a new session
   (`setsid`) with `SSH_ASKPASS` pointing at our own binary in
@@ -248,9 +369,26 @@ Key invariants worth knowing before touching the code:
 - The project shells out heavily. Treat `nix`, `deploy`, and `ssh` as
   load-bearing dependencies — every code path that touches them should
   surface stderr to the user, not swallow it.
+- **Every spawned child gets `stdin(Stdio::null())` and
+  `kill_on_drop(true)`.** Null stdin because a child that inherits the
+  terminal steals the TUI's keystrokes; `kill_on_drop` because probe
+  tasks are cancelled by dropping their future, and without it the ssh
+  or nix process behind them keeps running. The deploy child is the one
+  exception on stdin: it pipes when `--interactive-sudo` is on.
+- **Drain stdout and stderr concurrently.** `ssh_capture` uses
+  `tokio::join!` over both pipes. Reading one to EOF first deadlocks as
+  soon as the child fills the other's 64 KiB pipe buffer — it blocks
+  writing, so it never closes the pipe being read. `Command::output()`
+  already does this correctly; hand-rolled spawns do not.
 - Errors that originate from external tools should be wrapped with
   `anyhow::Context` describing *what we were doing*, not *what tool we
   ran* (e.g. `discovering deploy.nodes`, not `running nix eval`).
+- Nothing on the UI thread may block for an unbounded time. The
+  clipboard yank is the cautionary tale: `xclip` stays in the foreground
+  *owning* the X selection until another client claims it, so
+  `Child::wait()` on it never returns and the whole TUI wedged.
+  `yank_to_clipboard` hands over the text, waits only long enough to
+  catch an immediate failure, and otherwise leaves the helper detached.
 - Don't print to stdout/stderr from the main thread once the TUI is up
   — it will corrupt the alternate screen. Use `--log-file` and tracing
   if you need diagnostics.

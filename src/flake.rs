@@ -81,6 +81,56 @@ impl Node {
     }
 }
 
+
+/// Run `nix eval --json` on the flake and parse the resulting attrset.
+pub async fn discover(flake: &str) -> Result<Vec<Node>> {
+    // Apply function strips the heavy `path` derivations and keeps only the
+    // metadata we render. Doing this in Nix avoids forcing evaluation of
+    // the per-host modules.
+    let apply = r#"nodes: builtins.mapAttrs (n: v: {
+      hostname = v.hostname;
+      sshUser = v.sshUser or null;
+      profilesOrder = v.profilesOrder or null;
+      profiles = builtins.mapAttrs (pn: pv: {
+        user = pv.user or null;
+        sshUser = pv.sshUser or null;
+      }) v.profiles;
+    }) nodes"#;
+
+    let target = format!("{flake}#deploy.nodes");
+    let output = Command::new("nix")
+        .args([
+            "eval",
+            "--json",
+            "--no-warn-dirty",
+            &target,
+            "--apply",
+            apply,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("spawning `nix eval`")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`nix eval {target}` failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let raw: BTreeMap<String, Node> =
+        serde_json::from_slice(&output.stdout).context("parsing `nix eval` JSON output")?;
+
+    Ok(raw
+        .into_iter()
+        .map(|(name, mut node)| {
+            node.name = name;
+            node
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,53 +269,4 @@ mod tests {
         assert_eq!(nodes[1].name, "beta");
         assert!(nodes[1].has_system());
     }
-}
-
-/// Run `nix eval --json` on the flake and parse the resulting attrset.
-pub async fn discover(flake: &str) -> Result<Vec<Node>> {
-    // Apply function strips the heavy `path` derivations and keeps only the
-    // metadata we render. Doing this in Nix avoids forcing evaluation of
-    // the per-host modules.
-    let apply = r#"nodes: builtins.mapAttrs (n: v: {
-      hostname = v.hostname;
-      sshUser = v.sshUser or null;
-      profilesOrder = v.profilesOrder or null;
-      profiles = builtins.mapAttrs (pn: pv: {
-        user = pv.user or null;
-        sshUser = pv.sshUser or null;
-      }) v.profiles;
-    }) nodes"#;
-
-    let target = format!("{flake}#deploy.nodes");
-    let output = Command::new("nix")
-        .args([
-            "eval",
-            "--json",
-            "--no-warn-dirty",
-            &target,
-            "--apply",
-            apply,
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .context("spawning `nix eval`")?;
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "`nix eval {target}` failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let raw: BTreeMap<String, Node> =
-        serde_json::from_slice(&output.stdout).context("parsing `nix eval` JSON output")?;
-
-    Ok(raw
-        .into_iter()
-        .map(|(name, mut node)| {
-            node.name = name;
-            node
-        })
-        .collect())
 }

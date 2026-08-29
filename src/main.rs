@@ -24,6 +24,18 @@ struct Cli {
     #[arg(long)]
     log_file: Option<PathBuf>,
 
+    /// Extra argument to forward to `nix build`, via deploy-rs's
+    /// `-- <EXTRA_BUILD_ARGS>` tail. Repeat for each argument, e.g.
+    /// `--build-arg --option --build-arg extra-substituters --build-arg https://…`.
+    ///
+    /// Note this configures whichever nix does the building. With
+    /// `--remote-build` the fetching is done by the *target's* daemon
+    /// out of its own nix.conf, so substituter options passed here do
+    /// not apply — deptui warns when it sees that combination. Use the
+    /// `Shift+C` drift check and its automatic store seeding instead.
+    #[arg(long = "build-arg", value_name = "ARG")]
+    build_args: Vec<String>,
+
     /// Internal: act as an SSH_ASKPASS helper. SSH calls this with the prompt
     /// as $1. Not intended for direct use.
     #[arg(long, hide = true)]
@@ -59,7 +71,9 @@ async fn main() -> Result<()> {
     }
 
     let mut terminal = ui::init()?;
-    let result = App::new(cli.flake.clone(), nodes).run(&mut terminal).await;
+    let mut app = App::new(cli.flake.clone(), nodes);
+    app.extra_build_args = cli.build_args;
+    let result = app.run(&mut terminal).await;
     ui::restore()?;
     result
 }

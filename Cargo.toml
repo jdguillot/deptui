@@ -14,17 +14,31 @@ name = "deptui"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = { version = "0.28", features = ["unstable-rendered-line-info"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-futures = "0.3"
+# `unstable-rendered-line-info` was enabled but never used — scroll
+# maths goes through `Line::width()` (see `compute_tail_scroll_offset`),
+# which needs no unstable API.
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+# Only the runtime pieces this binary actually touches. `full` also pulls
+# in `fs`, `signal`, and the rest, which is build time and API surface we
+# never use.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "net",
+    "sync",
+    "time",
+    "io-util",
+] }
+# `StreamExt::next` for crossterm's EventStream (src/event.rs) — the
+# executor/compat layers in the default feature set are unused.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 libc = "0.2"
 tempfile = "3"
-thiserror = "1"
 zeroize = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -33,6 +47,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+# `test-util` gives tests a pausable clock so timeout behaviour can be
+# asserted without actually sleeping. Dev-only: it is not compiled into
+# the released binary.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"
