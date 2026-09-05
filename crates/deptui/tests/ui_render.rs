@@ -647,3 +647,68 @@ fn title_bar_shows_the_version() {
         "version missing from title: {out}"
     );
 }
+
+/// Drag-to-copy: the renderer captures the copyable panes' cells each
+/// frame and paints the active selection as reverse video.
+#[test]
+fn draw_captures_copy_panes_and_highlights_the_drag() {
+    use deptui::app::{CopyPane, CopySel};
+    use ratatui::style::Modifier;
+
+    let mut app = App::new(".".into(), nodes());
+    log_line(&mut app, "hello from alpha", "alpha");
+    let _ = render(&mut app, 120, 40);
+    let (_, rect, rows) = app
+        .copy_panes
+        .iter()
+        .find(|(p, _, _)| *p == CopyPane::JobLog)
+        .expect("job log captured")
+        .clone();
+    assert_eq!(rows.len(), rect.height as usize);
+    let flat: String = rows
+        .iter()
+        .map(|r| r.concat())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(flat.contains("hello from alpha"), "{flat}");
+
+    // An active drag renders REVERSED cells inside the range.
+    app.copy_sel = Some(CopySel {
+        pane: CopyPane::JobLog,
+        anchor: (rect.x, rect.y),
+        cursor: (rect.x + 4, rect.y),
+        dragged: true,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    terminal.draw(|f| ui::draw(f, &mut app)).expect("draw");
+    let buf = terminal.backend().buffer().clone();
+    assert!(
+        buf[(rect.x + 2, rect.y)]
+            .modifier
+            .contains(Modifier::REVERSED),
+        "selection not highlighted"
+    );
+    assert!(
+        !buf[(rect.x + 20, rect.y)]
+            .modifier
+            .contains(Modifier::REVERSED),
+        "highlight leaked past the cursor"
+    );
+
+    // Agent view captures its panes too (and drops the job log's).
+    app.copy_sel = None;
+    app.agent.open = true;
+    let _ = render(&mut app, 120, 40);
+    assert!(app
+        .copy_panes
+        .iter()
+        .any(|(p, _, _)| *p == CopyPane::AgentWatches));
+    assert!(app
+        .copy_panes
+        .iter()
+        .any(|(p, _, _)| *p == CopyPane::AgentTail));
+    assert!(!app
+        .copy_panes
+        .iter()
+        .any(|(p, _, _)| *p == CopyPane::JobLog));
+}

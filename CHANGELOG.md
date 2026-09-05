@@ -10,6 +10,14 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- Drag-to-copy: dragging across the job log (or the agent view's
+  watches and live-log panes) highlights the rendered cells and puts
+  them on the clipboard on release — exactly what's on screen, so
+  errors can be pasted instead of screenshotted. Plain clicks keep
+  their focus/select meaning.
+
 ## [0.5.1] — 2026-09-05
 
 ### Fixed

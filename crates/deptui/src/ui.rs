@@ -172,6 +172,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Rebuild the hit-test map for exactly this frame; stale rects
     // from a previous layout must never catch a click.
     app.mouse = crate::app::MouseMap::default();
+    app.copy_panes.clear();
     if app.agent.open {
         // The agent view replaces the whole working area — it is a
         // different *mode* of the app, not a pane. Popups below still
@@ -440,6 +441,56 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
     // visible height so we pass &mut App.
     draw_details(frame, left_rows[1], app);
     draw_job_log(frame, cols[1], app);
+    capture_copy_pane(
+        frame,
+        app,
+        crate::app::CopyPane::JobLog,
+        inner_rect(cols[1]),
+    );
+}
+
+/// Snapshot a pane's rendered cells for drag-to-copy, and paint the
+/// active selection as reverse video. Runs *after* the pane's widgets
+/// so the capture is exactly what the user sees.
+fn capture_copy_pane(frame: &mut Frame, app: &mut App, pane: crate::app::CopyPane, rect: Rect) {
+    let buf = frame.buffer_mut();
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(rect.height as usize);
+    for y in rect.y..rect.y + rect.height {
+        let mut row = Vec::with_capacity(rect.width as usize);
+        for x in rect.x..rect.x + rect.width {
+            row.push(buf[(x, y)].symbol().to_string());
+        }
+        rows.push(row);
+    }
+    app.copy_panes.push((pane, rect, rows));
+
+    if let Some(sel) = &app.copy_sel {
+        if sel.pane == pane && sel.dragged {
+            let clamp = |(x, y): (u16, u16)| {
+                (
+                    x.clamp(rect.x, rect.x + rect.width.saturating_sub(1)),
+                    y.clamp(rect.y, rect.y + rect.height.saturating_sub(1)),
+                )
+            };
+            let (a, b) = (clamp(sel.anchor), clamp(sel.cursor));
+            let (start, end) = if (a.1, a.0) <= (b.1, b.0) {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            for y in start.1..=end.1 {
+                let from = if y == start.1 { start.0 } else { rect.x };
+                let to = if y == end.1 {
+                    end.0
+                } else {
+                    rect.x + rect.width - 1
+                };
+                for x in from..=to {
+                    buf[(x, y)].modifier |= Modifier::REVERSED;
+                }
+            }
+        }
+    }
 }
 
 /// The border-less interior of a fully-bordered pane. All the panes
@@ -2506,6 +2557,10 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         key_line("v", "enter visual char mode — select by character with j/k/h/l (from any pane)"),
         key_line("y", "yank selected text to clipboard (wl-copy / xclip / xsel / pbcopy)"),
         key_line("Esc", "cancel visual selection without copying"),
+        key_line(
+            "mouse drag",
+            "select rendered text in the job log / agent panes — copies on release",
+        ),
         Line::raw(""),
 
         section("status"),
@@ -3228,7 +3283,7 @@ fn short_rev(rev: &str) -> &str {
 /// The full-screen agent view: connection header, watch/host listing
 /// with runtime controls, and the live run-log tail. Replaces the main
 /// layout while [`App::agent`] is open; popups still draw on top.
-fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3294,7 +3349,19 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(chunks[1]);
     draw_agent_watches(frame, body[0], app);
+    capture_copy_pane(
+        frame,
+        app,
+        crate::app::CopyPane::AgentWatches,
+        inner_rect(body[0]),
+    );
     draw_agent_tail(frame, body[1], app);
+    capture_copy_pane(
+        frame,
+        app,
+        crate::app::CopyPane::AgentTail,
+        inner_rect(body[1]),
+    );
 
     // --- footer ---
     let mut foot = vec![Span::styled(

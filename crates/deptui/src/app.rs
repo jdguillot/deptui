@@ -422,6 +422,68 @@ pub struct AgentManaged {
     pub offline: bool,
 }
 
+/// Panes whose rendered cells can be drag-selected and copied. The
+/// selection works on the frame's actual cell grid (captured by
+/// `ui::draw`), so what you see highlighted is byte-for-byte what
+/// lands on the clipboard — wrap, badges, and all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyPane {
+    JobLog,
+    AgentWatches,
+    AgentTail,
+}
+
+/// An in-progress mouse drag selection, in absolute screen coords.
+#[derive(Debug, Clone)]
+pub struct CopySel {
+    pub pane: CopyPane,
+    pub anchor: (u16, u16),
+    pub cursor: (u16, u16),
+    /// Becomes true on the first drag movement; a plain click never
+    /// copies (it keeps its focus/select meaning).
+    pub dragged: bool,
+}
+
+/// Terminal-style linear extraction from a captured cell grid:
+/// first row from the anchor column, last row to the cursor column,
+/// full rows between, trailing whitespace trimmed per row.
+pub fn extract_copy_text(rect: Rect, rows: &[Vec<String>], a: (u16, u16), b: (u16, u16)) -> String {
+    let clamp = |(x, y): (u16, u16)| {
+        (
+            x.clamp(rect.x, rect.x + rect.width.saturating_sub(1)),
+            y.clamp(rect.y, rect.y + rect.height.saturating_sub(1)),
+        )
+    };
+    let (a, b) = (clamp(a), clamp(b));
+    let (start, end) = if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut out = Vec::new();
+    for y in start.1..=end.1 {
+        let Some(row) = rows.get((y - rect.y) as usize) else {
+            continue;
+        };
+        let from = if y == start.1 {
+            (start.0 - rect.x) as usize
+        } else {
+            0
+        };
+        let to = if y == end.1 {
+            (end.0 - rect.x) as usize + 1
+        } else {
+            row.len()
+        };
+        let line: String = row
+            .get(from..to.min(row.len()))
+            .unwrap_or_default()
+            .concat();
+        out.push(line.trim_end().to_string());
+    }
+    out.join("\n")
+}
+
 /// Hit-test map for mouse input, rebuilt by `ui::draw` every frame so
 /// clicks resolve against exactly what is on screen. Rects are the
 /// *inner* (border-less) areas. Strip items are linear column ranges
@@ -636,6 +698,13 @@ pub struct App {
     probe_tasks: Vec<JoinHandle<()>>,
     /// Mouse hit-test map, rebuilt each frame by the renderer.
     pub mouse: MouseMap,
+    /// Captured cell grids of the copyable panes, rebuilt each frame.
+    pub copy_panes: Vec<(CopyPane, Rect, Vec<Vec<String>>)>,
+    /// In-progress drag selection, if any.
+    pub copy_sel: Option<CopySel>,
+    /// What the last drag-copy put on the clipboard (also the test
+    /// seam — the clipboard helper itself spawns real processes).
+    pub last_copied: Option<String>,
     /// Agent view state + the ambient managed-host map for badges.
     pub agent: AgentUi,
     /// Node name → what the agent last reported about it. Drives the
@@ -709,6 +778,9 @@ impl App {
             pending_deploy: None,
             probe_tasks: Vec::new(),
             mouse: MouseMap::default(),
+            copy_panes: Vec::new(),
+            copy_sel: None,
+            last_copied: None,
             agent: AgentUi::new(&settings),
             agent_managed: HashMap::new(),
             should_quit: false,
@@ -950,13 +1022,49 @@ impl App {
             }
             return;
         }
-        // Modal inputs (confirm popups, password prompts) and the agent
-        // view are keyboard-only for now; a stray click must not
-        // confirm or cancel anything.
-        if self.agent.open || !matches!(self.input, InputMode::Normal) {
+        // Modal inputs (confirm popups, password prompts): a stray
+        // click must not confirm or cancel anything.
+        if !matches!(self.input, InputMode::Normal) {
             return;
         }
         let (x, y) = (me.column, me.row);
+
+        // Drag-to-copy works in every mode that renders a copyable
+        // pane (job log on the main screen; watches + live log in the
+        // agent view). Down arms it, the first Drag makes it real, Up
+        // copies the highlighted cells.
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(pane) = self.copy_pane_at(x, y) {
+                    self.copy_sel = Some(CopySel {
+                        pane,
+                        anchor: (x, y),
+                        cursor: (x, y),
+                        dragged: false,
+                    });
+                }
+                // Fall through: a plain click keeps its normal meaning.
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(sel) = &mut self.copy_sel {
+                    if (x, y) != sel.anchor {
+                        sel.dragged = true;
+                    }
+                    sel.cursor = (x, y);
+                }
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.finish_copy_drag();
+                return;
+            }
+            _ => {}
+        }
+
+        if self.agent.open {
+            // Everything else in the agent view stays keyboard-driven.
+            return;
+        }
         let map = self.mouse.clone();
         match me.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -1000,6 +1108,44 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn copy_pane_at(&self, x: u16, y: u16) -> Option<CopyPane> {
+        self.copy_panes
+            .iter()
+            .find(|(_, r, _)| rect_contains(*r, x, y))
+            .map(|(p, _, _)| *p)
+    }
+
+    /// Mouse released: copy the highlighted cells (if this was a real
+    /// drag) and clear the selection.
+    fn finish_copy_drag(&mut self) {
+        let Some(sel) = self.copy_sel.take() else {
+            return;
+        };
+        if !sel.dragged {
+            return;
+        }
+        let Some((_, rect, rows)) = self.copy_panes.iter().find(|(p, _, _)| *p == sel.pane) else {
+            return;
+        };
+        let text = extract_copy_text(*rect, rows, sel.anchor, sel.cursor);
+        if text.trim().is_empty() {
+            return;
+        }
+        let lines = text.lines().count();
+        let ok = yank_to_clipboard(&text);
+        self.last_copied = Some(text);
+        let msg = if ok {
+            format!("yanked {lines} line(s) to clipboard")
+        } else {
+            "! no clipboard helper worked (wl-copy/xclip/xsel)".to_string()
+        };
+        if self.agent.open {
+            self.agent.last_op = Some(msg);
+        } else {
+            self.push_log(&msg, !ok);
         }
     }
 
@@ -4850,6 +4996,50 @@ mod tests {
         // Wheel over the hosts pane moves the selection.
         app.handle_mouse(mouse(MouseEventKind::ScrollUp, 3, 6));
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn extract_copy_text_is_terminal_style() {
+        let rect = Rect {
+            x: 2,
+            y: 1,
+            width: 6,
+            height: 3,
+        };
+        let cell = |s: &str| s.chars().map(|c| c.to_string()).collect::<Vec<_>>();
+        let rows = vec![cell("abcde "), cell("fghij "), cell("klmno ")];
+        // Mid-first-row through mid-last-row: tail of row 1, all of
+        // row 2, head of row 3; trailing whitespace trimmed.
+        let text = extract_copy_text(rect, &rows, (4, 1), (3, 3));
+        assert_eq!(text, "cde\nfghij\nkl");
+        // Reversed drag direction gives the same text.
+        assert_eq!(extract_copy_text(rect, &rows, (3, 3), (4, 1)), text);
+        // Single-row slice, cursor clamped into the rect.
+        assert_eq!(extract_copy_text(rect, &rows, (2, 2), (99, 2)), "fghij");
+    }
+
+    #[test]
+    fn copy_drag_yanks_only_after_real_movement() {
+        let mut app = App::new(".".into(), sample_nodes());
+        let rect = Rect {
+            x: 1,
+            y: 1,
+            width: 5,
+            height: 2,
+        };
+        let cell = |s: &str| s.chars().map(|c| c.to_string()).collect::<Vec<_>>();
+        app.copy_panes = vec![(CopyPane::JobLog, rect, vec![cell("hello"), cell("world")])];
+
+        // Click without drag: nothing copied.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 1));
+        assert!(app.last_copied.is_none());
+
+        // Real drag: the highlighted cells land in last_copied.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 3, 2));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3, 2));
+        assert_eq!(app.last_copied.as_deref(), Some("hello\nwor"));
     }
 
     #[test]

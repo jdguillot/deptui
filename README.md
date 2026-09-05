@@ -408,9 +408,15 @@ Optional flags:
 The panes are mouse-aware: the wheel scrolls the job log (and the help
 popup) and moves the host selection; left click focuses panes, selects
 host rows, flips the numbered toggles, and presses command buttons —
-everything routes through the same handlers the keyboard uses. Mouse
-capture makes your terminal's native text selection require holding
-Shift; start with `--no-mouse` to opt out entirely.
+everything routes through the same handlers the keyboard uses.
+
+**Drag to copy**: dragging across the job log — or, in the agent view,
+the watches pane and the live log — highlights the rendered cells and
+copies them to the clipboard on release, exactly as shown (wrap,
+badges and all). Plain clicks keep their focus/select meaning.
+
+Mouse capture makes your terminal's native text selection require
+holding Shift; start with `--no-mouse` to opt out entirely.
 
 ## Key bindings
 
