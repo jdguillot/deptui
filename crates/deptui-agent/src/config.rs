@@ -132,6 +132,11 @@ pub struct WatchConfig {
     /// with a leading `0` for seconds).
     #[serde(default)]
     pub cron: Option<String>,
+    /// How often to re-probe hosts that were offline when an update
+    /// should have reached them (see `HostConfig::catch_up`). Duration
+    /// string; default "2m".
+    #[serde(default)]
+    pub offline_recheck: Option<String>,
     /// Hosts to push to, keyed by the node name in `deploy.nodes`.
     /// Deployed sequentially in the order given by the map (BTreeMap:
     /// alphabetical — predictable, if not configurable yet).
@@ -164,6 +169,13 @@ pub struct HostConfig {
     /// message can explain rather than "unknown field".
     #[serde(default)]
     pub interactive_sudo: Option<bool>,
+    /// When the host is down at deploy time, remember the update and
+    /// push it as soon as the agent sees the host answer again
+    /// (default true). Off: the deploy is attempted anyway and a dead
+    /// host records a normal failure, parking it until the next
+    /// revision.
+    #[serde(default)]
+    pub catch_up: Option<bool>,
     /// Extra arguments forwarded to `nix build` via deploy-rs's `--`
     /// tail.
     #[serde(default)]
@@ -222,6 +234,14 @@ impl HostConfig {
         t
     }
 
+    // Wired up by the offline catch-up runner/daemon work; the knob
+    // ships first so the config surface is stable. Remove the allow
+    // when the runner reads it.
+    #[allow(dead_code)]
+    pub fn catch_up(&self) -> bool {
+        self.catch_up.unwrap_or(true)
+    }
+
     pub fn ssh_override(&self) -> SshOverride {
         let Some(ssh) = &self.ssh else {
             return SshOverride::default();
@@ -258,6 +278,15 @@ impl WatchConfig {
             (Some(b), _) => format!("branch {b}"),
             (_, Some(t)) => format!("tag {t}"),
             _ => unreachable!("validated at load"),
+        }
+    }
+
+    /// Recheck cadence for offline hosts with a pending update.
+    pub fn offline_recheck(&self) -> Result<Duration> {
+        match &self.offline_recheck {
+            Some(s) => parse_duration(s)
+                .with_context(|| format!("watch `{}`: offline_recheck", self.name)),
+            None => Ok(Duration::from_secs(120)),
         }
     }
 
@@ -353,6 +382,7 @@ impl AgentConfig {
                 );
             }
             w.cadence()?;
+            w.offline_recheck()?;
             if w.hosts.is_empty() {
                 bail!("watch `{}` has no hosts configured", w.name);
             }
@@ -469,6 +499,32 @@ interval = "15m"
         assert!(parse_duration("15").is_err());
         assert!(parse_duration("0m").is_err());
         assert!(parse_duration("5x").is_err());
+    }
+
+    #[test]
+    fn catch_up_defaults_on_and_can_be_disabled() {
+        let cfg: AgentConfig = toml::from_str(&minimal("")).unwrap();
+        assert!(cfg.watches[0].hosts["web"].catch_up());
+        assert_eq!(
+            cfg.watches[0].offline_recheck().unwrap(),
+            Duration::from_secs(120)
+        );
+
+        let toml = minimal("offline_recheck = \"30s\"\n").replace(
+            "[watch.hosts.web]\n",
+            "[watch.hosts.web]\ncatch_up = false\n",
+        );
+        let cfg: AgentConfig = toml::from_str(&toml).unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.watches[0].hosts["web"].catch_up());
+        assert_eq!(
+            cfg.watches[0].offline_recheck().unwrap(),
+            Duration::from_secs(30)
+        );
+
+        let bad = minimal("offline_recheck = \"nope\"\n");
+        let cfg: AgentConfig = toml::from_str(&bad).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
