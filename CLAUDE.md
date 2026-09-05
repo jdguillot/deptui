@@ -20,7 +20,10 @@ and to `nix` / `ssh` / `git`. Three crates under `crates/`:
   repos, deploys via the core runner, serves a control API on a Unix
   socket (plus an optional token-gated TCP kick/status listener), and
   is its own CLI client (`ssh host deptui-agent <verb> --json` is the
-  TUI's remote-control transport).
+  TUI's remote-control transport). The TUI finds agents by probing
+  `deploy.nodes` (BatchMode `deptui-agent status --json`); the client
+  settings file only pins agents that aren't deploy nodes. All real
+  agent configuration lives on the agent host.
 
 ## Common commands
 

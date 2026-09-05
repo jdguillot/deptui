@@ -332,6 +332,10 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(theme::ON_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            concat!(" v", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme::MUTED),
+        ),
         Span::raw(" "),
         Span::styled(&app.flake, Style::default().fg(theme::ACCENT)),
     ];
@@ -3318,14 +3322,44 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
-    if app.agent.agents.is_empty() {
+    if app.agent.agents.is_empty() && app.agent.scanning {
+        let sp = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
         lines.push(Line::from(Span::styled(
-            "no agents configured",
+            format!("{sp} scanning your deploy nodes for agents…"),
+            Style::default().fg(theme::BUSY),
+        )));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "hosts running deptui-agent (reachable non-interactively) appear here",
+            Style::default().fg(theme::MUTED),
+        )));
+    } else if app.agent.agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if app.agent.scanned {
+                "no agents found on your deploy nodes"
+            } else {
+                "no agents configured"
+            },
             Style::default()
                 .fg(theme::WARNING)
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::raw(""));
+        if app.agent.scanned {
+            lines.push(Line::from(Span::styled(
+                "discovery needs the host to run deptui-agent, with your ssh key",
+                Style::default().fg(theme::MUTED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "accepted non-interactively and the binary on the ssh PATH.",
+                Style::default().fg(theme::MUTED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "r rescans. For an agent that is not a deploy node, pin it:",
+                Style::default().fg(theme::MUTED),
+            )));
+            lines.push(Line::raw(""));
+        }
         if let Some(err) = &app.agent.settings_error {
             lines.push(Line::from(Span::styled(
                 "the settings file exists but could not be loaded:",

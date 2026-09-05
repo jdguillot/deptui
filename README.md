@@ -257,7 +257,14 @@ deptui-agent tail                   # live run log
 
 ### Connecting the TUI
 
-`~/.config/deptui/config.toml`:
+Zero config: press `a`. The TUI scans your `deploy.nodes` for hosts
+that answer `deptui-agent status` (over ssh, non-interactively) and
+connects to what it finds — the client machine needs no agent setup
+at all; all the real configuration (watches, cadence, hosts, flags)
+lives with the agent itself.
+
+`~/.config/deptui/config.toml` is optional, for pinning an agent that
+is not a deploy node (or ordering several):
 
 ```toml
 default_agent = "homelab"

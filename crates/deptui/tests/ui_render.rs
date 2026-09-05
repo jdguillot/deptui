@@ -616,3 +616,34 @@ fn command_row_shows_probe_buttons_and_never_clips() {
         );
     }
 }
+
+/// Zero-config discovery states: scanning spinner, then an honest
+/// "none found" with requirements — the config file is the fallback,
+/// not the prerequisite.
+#[test]
+fn agent_view_shows_scan_states() {
+    let mut app = App::new(".".into(), nodes());
+    app.agent.open = true;
+    app.agent.scanning = true;
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("scanning your deploy nodes"), "{out}");
+
+    app.agent.scanning = false;
+    app.agent.scanned = true;
+    let out = render(&mut app, 120, 40);
+    assert!(
+        out.contains("no agents found on your deploy nodes"),
+        "{out}"
+    );
+    assert!(out.contains("r rescans"), "{out}");
+}
+
+#[test]
+fn title_bar_shows_the_version() {
+    let mut app = App::new(".".into(), nodes());
+    let out = render(&mut app, 120, 40);
+    assert!(
+        out.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+        "version missing from title: {out}"
+    );
+}

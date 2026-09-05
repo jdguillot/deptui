@@ -91,3 +91,28 @@ pub fn spawn_tail(
         let _ = child.wait().await;
     })
 }
+
+/// Discovery probe: is `target` running an agent? Unlike the normal
+/// verbs this runs with BatchMode — a host that would ask for a
+/// password just isn't discoverable, rather than popping N password
+/// prompts during a scan — and a short timeout, since it fans out
+/// over every deploy node.
+pub async fn probe(target: &str) -> Result<agentwire::AgentStatus> {
+    let mut cmd = Command::new("ssh");
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=4"])
+        .arg(target)
+        .arg("deptui-agent")
+        .args(["status", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(8), cmd.output())
+        .await
+        .map_err(|_| anyhow!("probe timed out"))?
+        .context("spawning ssh")?;
+    if !out.status.success() {
+        return Err(anyhow!("{}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    serde_json::from_slice(&out.stdout).context("parsing agent status JSON")
+}

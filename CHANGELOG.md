@@ -10,6 +10,16 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- Agent auto-discovery: pressing `a` with no client config scans the
+  flake's `deploy.nodes` (parallel, BatchMode, short timeouts) for
+  hosts answering `deptui-agent status` and connects to what it
+  finds. `~/.config/deptui/config.toml` is now optional — a pin for
+  agents that aren't deploy nodes — and `r` rescans from the empty
+  state. All agent configuration stays on the agent host.
+- The TUI title bar shows the app version.
+
 ## [0.3.0] — 2026-09-05
 
 ### Added

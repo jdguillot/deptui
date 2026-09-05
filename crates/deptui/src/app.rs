@@ -364,6 +364,11 @@ pub struct AgentUi {
     pub last_op: Option<String>,
     /// Settings-file load error, surfaced in the view's empty state.
     pub settings_error: Option<String>,
+    /// A deploy-node scan for agents is in flight.
+    pub scanning: bool,
+    /// At least one scan has completed (distinguishes "none found"
+    /// from "haven't looked yet" in the empty state).
+    pub scanned: bool,
 }
 
 impl AgentUi {
@@ -380,6 +385,8 @@ impl AgentUi {
             tail_task: None,
             last_op: None,
             settings_error: settings.load_error.clone(),
+            scanning: false,
+            scanned: false,
         }
     }
 
@@ -460,6 +467,9 @@ enum StatusUpdate {
     AgentOp(Result<String, String>),
     /// One live log line from `deptui-agent tail`.
     AgentTail(String),
+    /// Deploy-node scan finished: `(node name, ssh target)` for every
+    /// node that answered `deptui-agent status`.
+    AgentsDiscovered(Vec<(String, String)>),
 }
 
 impl From<probe::Report> for StatusUpdate {
@@ -2846,6 +2856,35 @@ resolve the paths so they can be seeded",
                     self.agent.last_op = Some(format!("! {e}"));
                 }
             },
+            StatusUpdate::AgentsDiscovered(found) => {
+                self.agent.scanning = false;
+                self.agent.scanned = true;
+                let mut added = false;
+                for (name, target) in found {
+                    // Configured entries win; discovery only fills gaps
+                    // (matching either the agent name or its target).
+                    let dup = self
+                        .agent
+                        .agents
+                        .iter()
+                        .any(|(n, s)| *n == name || *s == target);
+                    if !dup {
+                        self.agent.agents.push((name, target));
+                        added = true;
+                    }
+                }
+                if added && self.agent.open && self.agent.status.is_none() {
+                    self.push_log(
+                        &format!(
+                            "[agent] discovered {} agent(s) on deploy nodes",
+                            self.agent.agents.len()
+                        ),
+                        false,
+                    );
+                    self.fetch_agent_status();
+                    self.start_agent_tail();
+                }
+            }
             StatusUpdate::AgentTail(line) => {
                 self.agent.tail.push_back(line);
                 while self.agent.tail.len() > 2000 {
@@ -3098,7 +3137,50 @@ resolve the paths so they can be seeded",
         if !self.agent.agents.is_empty() {
             self.fetch_agent_status();
             self.start_agent_tail();
+        } else {
+            // Zero-config path: the flake already names every host —
+            // ask them who runs an agent instead of demanding a
+            // client-side settings file.
+            self.scan_for_agents();
         }
+    }
+
+    /// Probe every deploy node for a running agent, in parallel.
+    /// BatchMode + short timeouts: a host that is down or would
+    /// prompt for a password is simply not discoverable this way —
+    /// the settings file remains the override for those (and for
+    /// agent hosts that aren't deploy nodes at all).
+    fn scan_for_agents(&mut self) {
+        if self.agent.scanning {
+            return;
+        }
+        self.agent.scanning = true;
+        let candidates: Vec<(String, String)> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let override_ = self.override_for(&n.name);
+                (
+                    n.name.clone(),
+                    crate::host::build_ssh_target(n, "system", override_),
+                )
+            })
+            .collect();
+        let tx = self.status_tx.clone();
+        tokio::spawn(async move {
+            let probes = candidates.into_iter().map(|(name, target)| async move {
+                match agentclient::probe(&target).await {
+                    Ok(_) => Some((name, target)),
+                    Err(_) => None,
+                }
+            });
+            let found: Vec<(String, String)> = futures::future::join_all(probes)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            let _ = tx.send(StatusUpdate::AgentsDiscovered(found)).await;
+        });
     }
 
     fn close_agent_view(&mut self) {
@@ -3178,7 +3260,13 @@ resolve the paths so they can be seeded",
                     self.agent.sel = (self.agent.sel + rows.len() - 1) % rows.len();
                 }
             }
-            KeyCode::Char('r') => self.fetch_agent_status(),
+            KeyCode::Char('r') => {
+                if self.agent.agents.is_empty() {
+                    self.scan_for_agents();
+                } else {
+                    self.fetch_agent_status();
+                }
+            }
             // `u` — ask the agent to poll now (all watches).
             KeyCode::Char('u') => self.agent_op(vec!["kick".into()]),
             // `p` — pause/resume the selected host.
@@ -4749,6 +4837,30 @@ mod tests {
         };
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 6));
         assert_eq!(app.selected, 0, "clicks must not act under a modal popup");
+    }
+
+    #[test]
+    fn discovered_agents_merge_without_clobbering_config() {
+        let settings: crate::settings::Settings =
+            toml::from_str("[agents.pinned]\nssh = \"me@box\"\n").unwrap();
+        let mut app = App::with_settings(".".into(), sample_nodes(), settings);
+        app.agent.scanning = true;
+        app.apply_status(StatusUpdate::AgentsDiscovered(vec![
+            ("alpha".into(), "root@alpha.lan".into()),
+            // Same target as the pinned entry: not duplicated.
+            ("boxy".into(), "me@box".into()),
+        ]));
+        assert!(!app.agent.scanning);
+        assert!(app.agent.scanned);
+        let names: Vec<&str> = app.agent.agents.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["pinned", "alpha"]);
+
+        // A second scan finding the same node adds nothing.
+        app.apply_status(StatusUpdate::AgentsDiscovered(vec![(
+            "alpha".into(),
+            "root@alpha.lan".into(),
+        )]));
+        assert_eq!(app.agent.agents.len(), 2);
     }
 
     #[test]
