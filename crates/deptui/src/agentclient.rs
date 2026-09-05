@@ -17,8 +17,33 @@ use deptui_core::agentwire;
 
 const VERB_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// One ssh at a time. Every verb, probe, and backfill fetch takes this
+/// gate: firing them in parallel meant one 1Password/ssh-agent
+/// signature prompt per connection, all at once — an unanswerable
+/// prompt storm. Serialized, the first connection authenticates once
+/// and multiplexing (below) makes the rest free. The long-lived tail
+/// is exempt (it is a single connection).
+static SSH_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// SSH connection reuse: the first connection to an agent becomes a
+/// control master and later commands multiplex over it — no new
+/// authentication, so the user's ssh agent is asked exactly once per
+/// host per ControlPersist window.
+fn multiplex_args() -> Vec<String> {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    vec![
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        format!("ControlPath={dir}/deptui-ssh-%C"),
+        "-o".into(),
+        "ControlPersist=60s".into(),
+    ]
+}
+
 fn ssh_command(target: &str, askpass: &AskpassEnv, verb_args: &[&str]) -> Command {
     let mut cmd = Command::new("ssh");
+    cmd.args(multiplex_args());
     cmd.args(["-o", "ConnectTimeout=10"])
         .arg(target)
         .arg("deptui-agent");
@@ -35,6 +60,7 @@ fn ssh_command(target: &str, askpass: &AskpassEnv, verb_args: &[&str]) -> Comman
 }
 
 async fn run_verb(target: &str, askpass: &AskpassEnv, verb_args: &[&str]) -> Result<Vec<u8>> {
+    let _gate = SSH_GATE.acquire().await.expect("gate never closed");
     let out = tokio::time::timeout(
         VERB_TIMEOUT,
         ssh_command(target, askpass, verb_args).output(),
@@ -98,7 +124,12 @@ pub fn spawn_tail(
 /// prompts during a scan — and a short timeout, since it fans out
 /// over every deploy node.
 pub async fn probe(target: &str) -> Result<agentwire::AgentStatus> {
+    // Serialized like the verbs: a parallel scan across N nodes asked
+    // the user's ssh agent N times at once. BatchMode stops password
+    // prompts but not agent-signature authorizations.
+    let _gate = SSH_GATE.acquire().await.expect("gate never closed");
     let mut cmd = Command::new("ssh");
+    cmd.args(multiplex_args());
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=4"])
         .arg(target)
         .arg("deptui-agent")

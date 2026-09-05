@@ -3704,13 +3704,38 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                     );
                 }
                 if let Some(rev) = &h.failed_rev {
-                    seg(
-                        format!("FAILED {}", short_rev(rev)),
-                        Style::default()
-                            .fg(theme::ERROR)
-                            .add_modifier(Modifier::BOLD),
-                        &mut state,
-                    );
+                    // "FAILED" is the wrong volume for a deploy the
+                    // user cancelled themselves — and even a real
+                    // failure reads better with its reason attached.
+                    let msg = h.failed_message.as_deref().unwrap_or("");
+                    if msg.contains("cancelled") {
+                        seg(
+                            format!("cancelled {}", short_rev(rev)),
+                            Style::default().fg(theme::WARNING),
+                            &mut state,
+                        );
+                    } else {
+                        let mut short_msg = msg.lines().next().unwrap_or("").to_string();
+                        if short_msg.len() > 60 {
+                            let cut = (0..=60)
+                                .rfind(|&i| short_msg.is_char_boundary(i))
+                                .unwrap_or(0);
+                            short_msg.truncate(cut);
+                            short_msg.push('…');
+                        }
+                        let text = if short_msg.is_empty() {
+                            format!("failed {}", short_rev(rev))
+                        } else {
+                            format!("failed {} — {short_msg}", short_rev(rev))
+                        };
+                        seg(
+                            text,
+                            Style::default()
+                                .fg(theme::ERROR)
+                                .add_modifier(Modifier::BOLD),
+                            &mut state,
+                        );
+                    }
                 }
                 if let Some(rev) = &h.held_rev {
                     seg(
@@ -3749,13 +3774,26 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                         &mut state,
                     );
                 }
+                let offline = h.offline_rev.is_some();
                 let name_style = if is_sel {
                     Style::default()
                         .fg(theme::ON_ACCENT)
                         .bg(theme::ACCENT)
                         .add_modifier(Modifier::BOLD)
+                } else if offline {
+                    // A sleeping host is context, not a call to action —
+                    // grey the whole row down.
+                    Style::default().fg(theme::MUTED)
                 } else {
                     Style::default()
+                };
+                let state: Vec<Span> = if offline {
+                    state
+                        .into_iter()
+                        .map(|sp| sp.style(Style::default().fg(theme::MUTED)))
+                        .collect()
+                } else {
+                    state
                 };
                 let mut row = vec![
                     Span::raw("  "),

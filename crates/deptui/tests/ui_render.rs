@@ -446,8 +446,11 @@ fn agent_view_renders_status_and_tail() {
     assert!(out.contains("homelab"), "agent name missing: {out}");
     assert!(out.contains("infra"), "watch missing: {out}");
     assert!(out.contains("branch main"), "ref label missing: {out}");
+    // Lowercase with the reason attached — "FAILED" alone was the
+    // wrong volume, especially for user-cancelled runs (which render
+    // as "cancelled …" instead).
     assert!(
-        out.contains("FAILED abcdef1234"),
+        out.contains("failed abcdef1234 — boom"),
         "failed host state missing: {out}"
     );
     assert!(out.contains("run #1"), "tail missing: {out}");

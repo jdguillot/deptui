@@ -716,10 +716,12 @@ impl Daemon {
             }
             hosts.push(crate::runner::PlanHost {
                 name: name.clone(),
-                // First encounter = this agent has never deployed (or
-                // tried to deploy) the host. An approval turns the
-                // probe-and-hold into a real deploy.
-                adopt: !hs.approved && hs.deployed.is_none() && hs.failed.is_none(),
+                // Unadopted = never successfully deployed by this
+                // agent. A past failure or cancel does NOT count as
+                // adoption — losing hold protection over a cancelled
+                // rollback attempt would be exactly backwards. An
+                // approval turns the probe-and-hold into a real deploy.
+                adopt: !hs.approved && hs.deployed.is_none(),
             });
         }
         if hosts.is_empty() {

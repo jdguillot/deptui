@@ -496,7 +496,7 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                 }
                 Some(runner::PlanHost {
                     name: h.clone(),
-                    adopt: !hs.approved && hs.deployed.is_none() && hs.failed.is_none(),
+                    adopt: !hs.approved && hs.deployed.is_none(),
                 })
             })
             .collect();

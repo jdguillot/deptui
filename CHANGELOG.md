@@ -10,6 +10,30 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-09-05
+
+### Fixed
+
+- Opening the agent view could fire an unanswerable storm of
+  ssh-agent (e.g. 1Password) authorization prompts: discovery, status,
+  tail, and backfill all connected in parallel, and the 5s
+  auto-refresh re-fired on every failure. All agent-client ssh now
+  runs through a single gate (one connection authenticates at a
+  time), connections multiplex via ControlMaster/ControlPersist so
+  the agent is asked once per host per minute instead of per command,
+  and the auto-refresh backs off to 20s while the agent is
+  unreachable.
+- Offline hosts render fully greyed in the agent view — a sleeping
+  host is context, not a call to action.
+- Failure wording softened: "cancelled <rev>" (yellow) for
+  user-cancelled runs, "failed <rev> — <reason>" (red) otherwise; no
+  more shouting FAILED at a host that is merely off the watched
+  branch's history.
+- A past failure or cancel no longer strips a host's first-encounter
+  hold protection: unadopted means "never *successfully* deployed",
+  so a cancelled rollback attempt re-probes (and holds) on the next
+  revision instead of blind-deploying.
+
 ## [0.9.0] — 2026-09-05
 
 ### Added

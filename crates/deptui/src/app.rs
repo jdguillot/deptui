@@ -1058,10 +1058,13 @@ impl App {
                 if self.agent.open
                     && !self.agent.loading
                     && !self.agent.agents.is_empty()
-                    && self
-                        .agent
-                        .last_status_fetch
-                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5))
+                    && self.agent.last_status_fetch.is_none_or(|t| {
+                        // Back off hard while the agent is unreachable —
+                        // retrying every 5s re-fires the user's ssh-agent
+                        // prompt into a storm.
+                        let interval = if self.agent.error.is_some() { 20 } else { 5 };
+                        t.elapsed() >= std::time::Duration::from_secs(interval)
+                    })
                 {
                     self.fetch_agent_status();
                 }
