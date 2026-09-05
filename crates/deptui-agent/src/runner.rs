@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -39,6 +39,9 @@ pub enum DeployOutcome {
         target: String,
         message: String,
     },
+    /// The user cancelled the run while this host was deploying; the
+    /// process group has been torn down.
+    Cancelled,
 }
 
 /// BatchMode reachability probe, mirroring what a deploy will need.
@@ -85,6 +88,7 @@ pub async fn execute(
     notify_cfg: &NotifyConfig,
     plan: RunPlan,
     log_tx: &broadcast::Sender<String>,
+    cancel_rx: watch::Receiver<bool>,
 ) -> RunRecord {
     let mut record = RunRecord {
         id: plan.run_id,
@@ -151,7 +155,20 @@ pub async fn execute(
         }
     };
 
+    let mut cancelled = false;
     for host in &plan.hosts {
+        // Cancelled between hosts (or before the first): everything
+        // not yet started is parked at this revision too — "stop this
+        // deploy" must not quietly resume at the next poll.
+        if cancelled || *cancel_rx.borrow() {
+            record.hosts.push(HostRun {
+                host: host.clone(),
+                outcome: "cancelled".into(),
+                message: Some("run cancelled before this host started".into()),
+                target: None,
+            });
+            continue;
+        }
         let outcome = deploy_host(
             watch,
             &flake_ref,
@@ -159,10 +176,26 @@ pub async fn execute(
             host,
             &plan.rev,
             notify_cfg,
+            cancel_rx.clone(),
             |line| log(&mut record, line),
         )
         .await;
         match outcome {
+            Ok(DeployOutcome::Cancelled) => {
+                cancelled = true;
+                log(
+                    &mut record,
+                    format!("[{}] {host}: cancelled by user", watch.name),
+                );
+                // Deliberate user action — parked, but no failure
+                // notification spam.
+                record.hosts.push(HostRun {
+                    host: host.clone(),
+                    outcome: "cancelled".into(),
+                    message: Some("cancelled by user".into()),
+                    target: None,
+                });
+            }
             Ok(DeployOutcome::Offline { target, message }) => {
                 log(
                     &mut record,
@@ -237,6 +270,7 @@ pub async fn execute(
     record
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deploy_host(
     watch: &WatchConfig,
     flake_ref: &str,
@@ -244,6 +278,7 @@ async fn deploy_host(
     host: &str,
     rev: &str,
     notify_cfg: &NotifyConfig,
+    mut cancel_rx: watch::Receiver<bool>,
     mut log: impl FnMut(String),
 ) -> Result<DeployOutcome> {
     let hc = watch
@@ -303,21 +338,43 @@ async fn deploy_host(
     let mut handle = deploy::run(req, None);
     let mut exit: Option<i32> = None;
     let mut spawn_error: Option<String> = None;
-    while let Some(line) = handle.rx.recv().await {
-        match line {
-            LogLine::Stdout(s) | LogLine::Stderr(s) => log(format!("[{host}] {s}")),
-            LogLine::SudoPrompt(_) => {
-                // Headless: there is nobody to answer. Cancel the whole
-                // process group rather than letting the child hang.
-                log(format!(
-                    "[{host}] remote sudo asked for a password — cancelling (agent deploys \
-                     must be non-interactive)"
-                ));
-                handle.cancel.cancel();
+    let mut user_cancelled = *cancel_rx.borrow();
+    if user_cancelled {
+        handle.cancel.cancel();
+    }
+    loop {
+        tokio::select! {
+            line = handle.rx.recv() => {
+                let Some(line) = line else { break };
+                match line {
+                    LogLine::Stdout(s) | LogLine::Stderr(s) => log(format!("[{host}] {s}")),
+                    LogLine::SudoPrompt(_) => {
+                        // Headless: there is nobody to answer. Cancel the whole
+                        // process group rather than letting the child hang.
+                        log(format!(
+                            "[{host}] remote sudo asked for a password — cancelling (agent deploys \
+                             must be non-interactive)"
+                        ));
+                        handle.cancel.cancel();
+                    }
+                    LogLine::Exit(code) => exit = Some(code),
+                    LogLine::Error(e) => spawn_error = Some(e),
+                }
             }
-            LogLine::Exit(code) => exit = Some(code),
-            LogLine::Error(e) => spawn_error = Some(e),
+            // User cancel: tear the process group down, then keep
+            // draining — run_one still owns the child and finishes the
+            // TERM → grace → KILL sequence before the channel closes.
+            changed = cancel_rx.changed(), if !user_cancelled => {
+                if changed.is_ok() && *cancel_rx.borrow() {
+                    user_cancelled = true;
+                    log(format!("[{host}] cancelling — signalling the deploy's process group"));
+                    handle.cancel.cancel();
+                }
+            }
         }
+    }
+    if user_cancelled {
+        return Ok(DeployOutcome::Cancelled);
     }
     if let Some(e) = spawn_error {
         return Err(anyhow!("deploy failed to run: {e}"));

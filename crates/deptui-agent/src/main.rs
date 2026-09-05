@@ -111,6 +111,10 @@ enum Command {
         #[arg(long)]
         watch: Option<String>,
     },
+    /// Stop the deploy run currently in flight (kills the deploy's
+    /// whole process group; the run's hosts stay parked at that
+    /// revision until a new one, a kick after it, or a force-deploy).
+    Cancel,
     /// Stream the daemon's live run log (NDJSON-ish plain lines).
     Tail,
 }
@@ -267,6 +271,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::Cancel => simple_post(&cli, "/cancel", &[]).await,
         Command::Tail => {
             let socket = socket_path(&cli);
             client::tail(&socket, |line| println!("{line}")).await
@@ -463,7 +468,11 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
             trigger: "check".to_string(),
             hosts,
         };
-        let record = runner::execute(&cfg.state_dir, w, &cfg.notify, plan, &log_tx).await;
+        // check is oneshot and foreground: ctrl-c kills it, so no
+        // cancel channel is needed — pass one that never fires.
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let record =
+            runner::execute(&cfg.state_dir, w, &cfg.notify, plan, &log_tx, cancel_rx).await;
         let time = record.finished.unwrap_or_else(state::now_unix);
         for hr in &record.hosts {
             let hs = state
@@ -495,6 +504,14 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                         time,
                         target: hr.target.clone().unwrap_or_default(),
                     });
+                }
+                "cancelled" => {
+                    hs.failed = Some(state::FailStamp {
+                        rev: rev.clone(),
+                        time,
+                        message: hr.message.clone().unwrap_or_else(|| "cancelled".into()),
+                    });
+                    hs.offline = None;
                 }
                 _ => {}
             }

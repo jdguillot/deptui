@@ -484,6 +484,13 @@ Key invariants worth knowing before touching the code:
   return); a real deploy failure parks the host until a new revision.
   Keep the two paths distinct — collapsing them re-introduces either
   retry storms or missed catch-ups.
+- **Pause is not stop.** Pause gates *future* polls; `cancel`
+  (`POST /cancel`, CLI `cancel`, TUI `x` in the agent view) is what
+  stops a run in flight — it signals the deploy's process group via
+  the runner's watch-channel and parks every host the run covered at
+  that revision (outcome `cancelled`, failed-stamp message says so),
+  so the run doesn't quietly resume at the next poll. No failure
+  notification fires for a user cancel.
 - **The TCP listener is kick+status only.** The full control surface
   stays on the Unix socket (group-gated, 0660). Never mount another
   route on the TCP router.

@@ -3080,6 +3080,10 @@ resolve the paths so they can be seeded",
                 let verb = if paused { "resume" } else { "pause" };
                 self.agent_op(vec![verb.into()]);
             }
+            // `x` — stop the run in flight (mirrors the main screen's
+            // cancel key). Pause only gates future polls; this is the
+            // stop button.
+            KeyCode::Char('x') => self.agent_op(vec!["cancel".into()]),
             // `d` — force-deploy the selected host at the last-seen rev.
             KeyCode::Char('d') => {
                 if let Some((watch, host, _)) = self.selected_agent_host(&rows) {

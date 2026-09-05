@@ -191,6 +191,11 @@ async fn post_resume(
     ok_or_400(result)
 }
 
+async fn post_cancel(State(s): State<ApiState>) -> Result<Json<OkReply>, ApiError> {
+    let result = ask(&s.cmd_tx, |reply| Cmd::CancelRun { reply }).await?;
+    ok_or_400(result)
+}
+
 async fn post_deploy(
     State(s): State<ApiState>,
     Query(p): Query<DeployParams>,
@@ -245,6 +250,9 @@ fn full_router(state: ApiState) -> Router {
         .route("/pause", post(post_pause))
         .route("/resume", post(post_resume))
         .route("/deploy", post(post_deploy))
+        // Cancel is a control verb: Unix socket only, never on the TCP
+        // kick router.
+        .route("/cancel", post(post_cancel))
         .with_state(state)
 }
 

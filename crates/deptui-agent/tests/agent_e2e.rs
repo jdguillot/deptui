@@ -421,3 +421,103 @@ fn daemon_recheck_deploys_when_host_returns() {
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();
 }
+
+/// Cancel stops a run in flight: the deploy's process group dies, the
+/// host parks at that revision (message says "cancelled", no failure
+/// spam), and the next poll does NOT resume the run.
+#[test]
+fn cancel_stops_a_running_deploy_and_parks_the_host() {
+    let env = setup(0);
+    // Slow deploy: writes a start marker, then hangs far longer than
+    // the test — only a real process-group kill ends it.
+    let deploy = env._shims.path().join("deploy");
+    let started = env._shims.path().join("deploy-started");
+    fs::write(
+        &deploy,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}\ntouch {}\nsleep 300\n",
+            env.deploy_log.display(),
+            started.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&deploy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let socket = env.state.path().join("agent.sock");
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("--config")
+        .arg(&env.config_path)
+        .arg("run")
+        .env("PATH", &env.shim_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let wait_for = |what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| {
+        let start = Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for("socket", Box::new(|| socket.exists()));
+
+    // No run yet: cancel is a clean error, not a crash.
+    let out = agent(&env, &["cancel"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no run in progress"));
+
+    let out = agent(&env, &["kick"]);
+    assert!(out.status.success());
+    wait_for("deploy to start", Box::new(|| started.exists()));
+
+    let out = agent(&env, &["cancel"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("cancelling run"));
+
+    // The run ends promptly (TERM → 3s grace → KILL is the ceiling,
+    // not the 300s sleep), and the host is parked with a message that
+    // says cancelled, not a fake failure.
+    {
+        let env = &env;
+        wait_for(
+            "run to finish as cancelled",
+            Box::new(move || {
+                let out = agent(env, &["status", "--json"]);
+                let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                let host = &status["watches"][0]["hosts"][0];
+                host["failed_message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("cancelled"))
+            }),
+        );
+    }
+    let out = agent(&env, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        status["watches"][0]["hosts"][0]["deployed_rev"].is_null(),
+        "cancelled deploy must not count as deployed: {status}"
+    );
+
+    // Parked: another kick at the same revision starts nothing.
+    let calls_before = deploy_calls(&env).len();
+    let out = agent(&env, &["kick"]);
+    assert!(out.status.success());
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        deploy_calls(&env).len(),
+        calls_before,
+        "same-revision kick after cancel must not redeploy"
+    );
+
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
+}

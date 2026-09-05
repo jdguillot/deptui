@@ -2430,7 +2430,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         key_line("a", "open/close the agent view (configure agents in ~/.config/deptui/config.toml)"),
         key_line("j/k", "  in the view: select host"),
         key_line("u", "  ask the agent to check for updates now (kick)"),
-        key_line("p / P", "  pause/resume the selected host / the whole agent"),
+        key_line("p / P", "  pause/resume the selected host / the whole agent (future polls only)"),
+        key_line("x", "  cancel the run in flight — kills the deploy, parks its hosts at that rev"),
         key_line("d", "  force-deploy the selected host at the last-seen revision"),
         key_line("[ / ]", "  switch between configured agents"),
         Line::raw(""),
@@ -3157,7 +3158,7 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &App) {
 
     // --- footer ---
     let mut foot = vec![Span::styled(
-        " j/k select  u kick  p pause host  P pause agent  d deploy  r refresh  [/] agent  q close",
+        " j/k select  u kick  x cancel run  p pause host  P pause agent  d deploy  r refresh  [/] agent  q close",
         Style::default().fg(theme::MUTED),
     )];
     if let Some(op) = &app.agent.last_op {

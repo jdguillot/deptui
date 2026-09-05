@@ -249,7 +249,8 @@ deptui-agent status [--json]        # agent + per-host state
 deptui-agent history [--json]       # recent runs
 deptui-agent log WATCH [--run N]    # captured log of a run
 deptui-agent kick [--watch W]      # poll now
-deptui-agent pause|resume [--watch W | --host H]
+deptui-agent pause|resume [--watch W | --host H]   # future polls only
+deptui-agent cancel                 # stop the run in flight (kills the deploy)
 deptui-agent deploy HOST [--watch W]  # force, bypasses pause + parking
 deptui-agent tail                   # live run log
 ```
@@ -265,8 +266,10 @@ default_agent = "homelab"
 ssh = "me@deploy-box"    # any ssh destination; socket access = group membership
 ```
 
-`a` opens the agent view (status, pause/resume, kick, force-deploy,
-live log). Agent-managed hosts show an `[agent]` badge in the host
+`a` opens the agent view (status, pause/resume, kick, cancel,
+force-deploy, live log). Pause gates *future* polls; `x`/`cancel`
+stops a deploy already running — its hosts stay parked at that
+revision until a new commit, a kick after one, or a force-deploy. Agent-managed hosts show an `[agent]` badge in the host
 list — `[agent!]` when the last agent deploy failed, `[agent~]` when
 an update is pending on an offline host.
 

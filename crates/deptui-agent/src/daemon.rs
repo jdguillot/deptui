@@ -49,6 +49,11 @@ pub enum Cmd {
         host: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Stop the run in flight: signals the deploy's process group and
+    /// parks everything the run was going to do at that revision.
+    CancelRun {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     /// Internal: a spawned run finished.
     RunDone {
         watch: String,
@@ -68,6 +73,8 @@ struct RunningRun {
     rev: String,
     trigger: String,
     started: u64,
+    run_id: u64,
+    cancel_tx: tokio::sync::watch::Sender<bool>,
     _task: JoinHandle<()>,
 }
 
@@ -291,6 +298,23 @@ impl Daemon {
             Cmd::ForceDeploy { watch, host, reply } => {
                 let _ = reply.send(self.force_deploy(watch, host));
             }
+            Cmd::CancelRun { reply } => {
+                let result = match &self.running {
+                    Some(r) => {
+                        let _ = r.cancel_tx.send(true);
+                        Ok(format!(
+                            "cancelling run #{} of watch `{}` — hosts it would have \
+                             deployed stay parked at {} until a new revision, a kick \
+                             after one, or a force-deploy",
+                            r.run_id,
+                            r.watch,
+                            &r.rev[..r.rev.len().min(12)]
+                        ))
+                    }
+                    None => Err("no run in progress".to_string()),
+                };
+                let _ = reply.send(result);
+            }
             Cmd::RunDone { watch, record } => self.finish_run(watch, record).await,
         }
     }
@@ -410,17 +434,24 @@ impl Daemon {
 
     fn set_paused(&mut self, scope: Scope, paused: bool) -> Result<String, String> {
         let verb = if paused { "paused" } else { "resumed" };
+        // Pause gates *future* polls only; a run in flight keeps going
+        // by design. Say so, or pause reads as a broken stop button.
+        let running_note = if paused && self.running.is_some() {
+            " (a run is in flight and will finish — use `cancel` to stop it)"
+        } else {
+            ""
+        };
         let msg = match scope {
             Scope::Global => {
                 self.state.paused = paused;
-                format!("agent {verb}")
+                format!("agent {verb}{running_note}")
             }
             Scope::Watch(w) => {
                 if self.watch_cfg(&w).is_none() {
                     return Err(format!("unknown watch `{w}`"));
                 }
                 self.state.watch_mut(&w).paused = paused;
-                format!("watch `{w}` {verb}")
+                format!("watch `{w}` {verb}{running_note}")
             }
             Scope::Host(h) => {
                 let watches: Vec<String> = self
@@ -441,7 +472,7 @@ impl Daemon {
                         .or_default()
                         .paused = paused;
                 }
-                format!("host `{h}` {verb} in {}", watches.join(", "))
+                format!("host `{h}` {verb} in {}{running_note}", watches.join(", "))
             }
         };
         self.save_state();
@@ -683,9 +714,18 @@ impl Daemon {
         let name = watch.to_string();
         let rev = plan.rev.clone();
         let trigger = plan.trigger.clone();
+        let run_id = plan.run_id;
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
-            let record =
-                runner::execute(&state_dir, &watch_owned, &notify_cfg, plan, &log_tx).await;
+            let record = runner::execute(
+                &state_dir,
+                &watch_owned,
+                &notify_cfg,
+                plan,
+                &log_tx,
+                cancel_rx,
+            )
+            .await;
             let _ = cmd_tx
                 .send(Cmd::RunDone {
                     watch: name,
@@ -698,6 +738,8 @@ impl Daemon {
             rev,
             trigger,
             started: now_unix(),
+            run_id,
+            cancel_tx,
             _task: task,
         });
     }
@@ -732,6 +774,17 @@ impl Daemon {
                             time,
                             target: hr.target.clone().unwrap_or_default(),
                         });
+                    }
+                    // A cancel parks the host exactly like a failure —
+                    // the run must not quietly resume at the next poll —
+                    // but the message tells the user it was their call.
+                    "cancelled" => {
+                        hs.failed = Some(FailStamp {
+                            rev: rev.clone(),
+                            time,
+                            message: hr.message.clone().unwrap_or_else(|| "cancelled".into()),
+                        });
+                        hs.offline = None;
                     }
                     _ => {}
                 }
