@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-05
+
 ### Added
 
 - The probe preflights are now command buttons: `U:size`, `P:plan`,
