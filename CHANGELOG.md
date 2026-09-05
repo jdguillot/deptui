@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-05
+
 ### Added
 
 - Drag-to-copy: dragging across the job log (or the agent view's
