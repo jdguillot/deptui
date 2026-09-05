@@ -395,6 +395,7 @@ fn agent_status() -> deptui_core::agentwire::AgentStatus {
                     offline_time: None,
                     held_rev: None,
                     held_time: None,
+                    approved: false,
                 },
                 HostStatus {
                     name: "beta".into(),
@@ -409,6 +410,7 @@ fn agent_status() -> deptui_core::agentwire::AgentStatus {
                     offline_time: None,
                     held_rev: None,
                     held_time: None,
+                    approved: false,
                 },
             ],
         }],

@@ -69,6 +69,9 @@ pub struct HostStatus {
     pub held_rev: Option<String>,
     #[serde(default)]
     pub held_time: Option<u64>,
+    /// The human ok'd taking the next update round (adoption pending).
+    #[serde(default)]
+    pub approved: bool,
 }
 
 /// Per-host outcome inside a run: `"ok"`, `"failed"`, or `"skipped"`.

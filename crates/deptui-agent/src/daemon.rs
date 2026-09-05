@@ -44,9 +44,14 @@ pub enum Cmd {
         paused: bool,
         reply: oneshot::Sender<Result<String, String>>,
     },
-    ForceDeploy {
+    /// Grant (or revoke) the standing ok for a held/unadopted host:
+    /// the next update round may deploy it, moving it off any
+    /// generation made outside the watched repo. The agent never
+    /// deploys immediately on this — immediacy is the TUI's job.
+    Approve {
         watch: Option<String>,
         host: String,
+        revoke: bool,
         reply: oneshot::Sender<Result<String, String>>,
     },
     /// Stop the run in flight: signals the deploy's process group and
@@ -104,10 +109,22 @@ impl Daemon {
         let now = Instant::now();
         for w in &cfg.watches {
             let cadence = w.cadence()?; // validated at load; keep the Result anyway
-                                        // First poll happens shortly after startup rather than a
-                                        // full interval later — an agent restart shouldn't delay an
-                                        // already-due update.
-            next_poll.insert(w.name.clone(), now + Duration::from_secs(5));
+                                        // The first poll follows the configured cadence. Starting
+                                        // (or restarting) the agent is NOT a deploy trigger — only
+                                        // the schedule, a kick, and offline catch-up are; an eager
+                                        // startup poll deployed the instant a fresh agent came up,
+                                        // which is exactly when a human least expects it.
+            let first = match &cadence {
+                Cadence::Every(d) => now + *d,
+                Cadence::Cron(sched) => {
+                    let cnow = chrono::Utc::now();
+                    match sched.after(&cnow).next() {
+                        Some(t) => now + (t - cnow).to_std().unwrap_or(Duration::from_secs(60)),
+                        None => now + Duration::from_secs(86_400 * 365),
+                    }
+                }
+            };
+            next_poll.insert(w.name.clone(), first);
             cadences.insert(w.name.clone(), cadence);
         }
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -295,8 +312,13 @@ impl Daemon {
             } => {
                 let _ = reply.send(self.set_paused(scope, paused));
             }
-            Cmd::ForceDeploy { watch, host, reply } => {
-                let _ = reply.send(self.force_deploy(watch, host));
+            Cmd::Approve {
+                watch,
+                host,
+                revoke,
+                reply,
+            } => {
+                let _ = reply.send(self.approve(watch, host, revoke));
             }
             Cmd::CancelRun { reply } => {
                 let result = match &self.running {
@@ -358,6 +380,7 @@ impl Daemon {
                             offline_time: hs.offline.as_ref().map(|o| o.time),
                             held_rev: hs.held.as_ref().map(|s| s.rev.clone()),
                             held_time: hs.held.as_ref().map(|s| s.time),
+                            approved: hs.approved,
                         }
                     })
                     .collect();
@@ -481,12 +504,15 @@ impl Daemon {
         Ok(msg)
     }
 
-    /// Force-deploy one host at the watch's last-seen revision,
-    /// bypassing pause flags and the failed-at marker.
-    fn force_deploy(&mut self, watch: Option<String>, host: String) -> Result<String, String> {
-        if self.running.is_some() {
-            return Err("a run is already in progress".to_string());
-        }
+    /// Record (or revoke) the adoption ok. No run starts here: the
+    /// approval is consumed by the next scheduled poll, kick, or
+    /// offline catch-up that finds the host eligible.
+    fn approve(
+        &mut self,
+        watch: Option<String>,
+        host: String,
+        revoke: bool,
+    ) -> Result<String, String> {
         let watch_name = match watch {
             Some(w) => w,
             None => {
@@ -507,43 +533,39 @@ impl Daemon {
                 first
             }
         };
-        let Some(wcfg) = self.watch_cfg(&watch_name) else {
-            return Err(format!("unknown watch `{watch_name}`"));
-        };
-        if !wcfg.hosts.contains_key(&host) {
+        if !self
+            .cfg
+            .watches
+            .iter()
+            .any(|w| w.name == watch_name && w.hosts.contains_key(&host))
+        {
             return Err(format!(
                 "host `{host}` is not configured in watch `{watch_name}`"
             ));
         }
-        let Some(rev) = self
+        let hs = self
             .state
-            .watches
-            .get(&watch_name)
-            .and_then(|w| w.last_seen.clone())
-        else {
-            return Err(format!(
-                "watch `{watch_name}` has no known revision yet — kick it first"
-            ));
+            .watch_mut(&watch_name)
+            .hosts
+            .entry(host.clone())
+            .or_default();
+        let msg = if revoke {
+            if !hs.approved {
+                return Err(format!("`{host}` has no pending approval"));
+            }
+            hs.approved = false;
+            format!("approval revoked — `{host}` holds again")
+        } else if hs.approved {
+            format!("`{host}` is already approved for the next update round")
+        } else {
+            hs.approved = true;
+            format!(
+                "approved: `{host}` takes the next update round — this will move it off \
+                 any generation made outside the watched repo (revoke with --revoke)"
+            )
         };
-        let run_id = self.state.take_run_id();
-        self.spawn_run(
-            &watch_name,
-            RunPlan {
-                run_id,
-                rev: rev.clone(),
-                trigger: format!("deploy {host}"),
-                hosts: vec![crate::runner::PlanHost {
-                    name: host.clone(),
-                    // Explicit: the human is adopting by deploying.
-                    adopt: false,
-                }],
-            },
-        );
         self.save_state();
-        Ok(format!(
-            "deploying {host} at {} (run #{run_id})",
-            &rev[..rev.len().min(12)]
-        ))
+        Ok(msg)
     }
 
     async fn poll_due(&mut self) {
@@ -687,15 +709,17 @@ impl Daemon {
             }
             // Held at this revision: the human hasn't blessed the agent
             // for this host yet. A *new* revision re-probes (the host
-            // may have caught up), same one waits.
-            if hs.held.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str()) {
+            // may have caught up), same one waits — unless the human
+            // approved, which is exactly the blessing.
+            if !hs.approved && hs.held.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str()) {
                 continue;
             }
             hosts.push(crate::runner::PlanHost {
                 name: name.clone(),
                 // First encounter = this agent has never deployed (or
-                // tried to deploy) the host.
-                adopt: hs.deployed.is_none() && hs.failed.is_none(),
+                // tried to deploy) the host. An approval turns the
+                // probe-and-hold into a real deploy.
+                adopt: !hs.approved && hs.deployed.is_none() && hs.failed.is_none(),
             });
         }
         if hosts.is_empty() {
@@ -777,6 +801,8 @@ impl Daemon {
                         hs.failed = None;
                         hs.offline = None;
                         hs.held = None;
+                        // The ok was for this update; consumed.
+                        hs.approved = false;
                     }
                     // Adoption: the host already ran this revision.
                     "adopted" => {

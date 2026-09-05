@@ -233,9 +233,13 @@ Rules the agent lives by:
   has never deployed is *probed* on its first eligible run: already
   running the watched revision → adopted silently; anything else →
   **held** and notified — a fresh agent must never roll a host
-  backwards just because the repo is behind reality. Adopt with
-  `deptui-agent deploy HOST` (or `d` in the TUI's agent view), or opt
-  a host into pure GitOps with `bootstrap = "deploy"`.
+  backwards just because the repo is behind reality. Give the ok with
+  `deptui-agent approve HOST` (or `y` in the TUI's agent view): the
+  *next* update round then deploys, accepting that this moves the
+  host off whatever generation was made outside the watched repo.
+  Approval is revocable (`--revoke`) until consumed. The agent never
+  deploys immediately on approval — immediate deploys belong to the
+  TUI's main screen. Pure GitOps per host: `bootstrap = "deploy"`.
 - **Starting the agent is not a deploy trigger.** The first poll
   waits for the configured cadence; only the schedule, a kick, and
   offline catch-up start runs.
@@ -270,7 +274,7 @@ deptui-agent log WATCH [--run N]    # captured log of a run
 deptui-agent kick [--watch W]      # poll now
 deptui-agent pause|resume [--watch W | --host H]   # future polls only
 deptui-agent cancel                 # stop the run in flight (kills the deploy)
-deptui-agent deploy HOST [--watch W]  # force, bypasses pause + parking
+deptui-agent approve HOST [--watch W] [--revoke]  # ok the next round for a held host
 deptui-agent tail                   # live run log
 ```
 

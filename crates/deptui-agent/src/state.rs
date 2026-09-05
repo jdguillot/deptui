@@ -64,6 +64,13 @@ pub struct HostState {
     /// is what ssh said.
     #[serde(default)]
     pub unreachable: Option<String>,
+    /// The human's standing ok for a held/unadopted host: at the next
+    /// update round the agent may deploy — accepting that this moves
+    /// the host off whatever generation was made outside the watched
+    /// repo. Consumed by the first successful deploy; revocable until
+    /// then.
+    #[serde(default)]
+    pub approved: bool,
     /// First-encounter hold: the agent found this host running
     /// something *other* than the watched revision and refused to
     /// deploy over it. Cleared by a successful deploy (force or

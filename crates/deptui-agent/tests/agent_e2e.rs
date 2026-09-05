@@ -617,9 +617,9 @@ fn first_encounter_holds_instead_of_deploying() {
 
 /// The daemon does not poll at startup — only the schedule, a kick,
 /// or offline catch-up trigger runs. A kick on a fresh agent holds;
-/// an explicit force-deploy adopts.
+/// approval makes the *next* round deploy (never immediately).
 #[test]
-fn daemon_waits_for_cadence_and_force_deploy_adopts() {
+fn daemon_waits_for_cadence_and_approval_takes_next_round() {
     let env = setup_with(0, "");
     let socket = env.state.path().join("agent.sock");
 
@@ -666,19 +666,43 @@ fn daemon_waits_for_cadence_and_force_deploy_adopts() {
     );
     assert_eq!(deploy_calls(&env).len(), 0);
 
-    // Explicit adoption-by-deploy.
-    let out = agent(&env, &["deploy", "web", "--watch", "infra"]);
+    // Approval alone deploys nothing — the ok is for the next round.
+    let out = agent(&env, &["approve", "web", "--watch", "infra"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("next update round"));
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        deploy_calls(&env).len(),
+        0,
+        "approve must not deploy immediately"
+    );
+
+    // Revoke + re-approve round-trips.
+    let out = agent(&env, &["approve", "web", "--watch", "infra", "--revoke"]);
+    assert!(out.status.success());
+    let out = agent(&env, &["approve", "web", "--watch", "infra"]);
+    assert!(out.status.success());
+
+    // The next round (a kick here; a scheduled poll in real life)
+    // consumes the approval and deploys — the same revision the hold
+    // parked, which approval unlocks.
+    let out = agent(&env, &["kick"]);
+    assert!(out.status.success());
     wait_for(
-        "adoption deploy",
+        "approved deploy",
         Box::new(|| host_field("deployed_rev").is_string()),
     );
     assert_eq!(deploy_calls(&env).len(), 1);
     assert!(host_field("held_rev").is_null(), "hold cleared by adoption");
+    assert_eq!(
+        host_field("approved"),
+        serde_json::Value::Bool(false),
+        "approval consumed"
+    );
 
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();

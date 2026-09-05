@@ -2630,7 +2630,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         key_line("u", "  ask the agent to check for updates now (kick)"),
         key_line("p / P", "  pause/resume the selected host / the whole agent (future polls only)"),
         key_line("x", "  cancel the run in flight — kills the deploy, parks its hosts at that rev"),
-        key_line("d", "  force-deploy the selected host at the last-seen revision"),
+        key_line("y", "  approve a held host: the NEXT update round deploys it (moves it off its out-of-band generation; y again on an approved host revokes)"),
         key_line("[ / ]", "  switch between configured agents"),
         Line::raw(""),
 
@@ -3367,6 +3367,47 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 
     // --- footer ---
+    if let Some((watch, host)) = &app.agent.pending_approve {
+        // The approval warning owns the footer until confirmed or
+        // dismissed — this is the moment the user accepts moving the
+        // host off its out-of-band generation.
+        let warn = Line::from(vec![
+            Span::styled(
+                " ⚠ approve ",
+                Style::default()
+                    .fg(theme::ON_ACCENT)
+                    .bg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    " next round moves {host} ({watch}) off its current generation — the \
+                     one made outside the watched repo. ",
+                    host = host,
+                    watch = watch
+                ),
+                Style::default().fg(theme::WARNING),
+            ),
+            Span::styled(
+                "y",
+                Style::default().fg(theme::KEY).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" confirms  ", Style::default().fg(theme::MUTED)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(theme::KEY).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" cancels", Style::default().fg(theme::MUTED)),
+        ]);
+        let foot_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::WARNING));
+        let foot_inner = foot_block.inner(chunks[2]);
+        frame.render_widget(foot_block, chunks[2]);
+        frame.render_widget(Paragraph::new(warn).wrap(Wrap { trim: false }), foot_inner);
+        return;
+    }
+
     let mut foot: Vec<Span> = vec![Span::raw(" ")];
     let mut hint = |key: &'static str, label: &'static str| {
         foot.push(Span::styled(key, Style::default().fg(theme::KEY)));
@@ -3380,7 +3421,7 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
     hint("x", "cancel run");
     hint("p", "pause host");
     hint("P", "pause agent");
-    hint("d", "deploy");
+    hint("y", "approve");
     hint("r", "refresh");
     // Cycling agents means nothing with a single one configured —
     // advertising a dead key was its own bug report.
@@ -3602,6 +3643,8 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 // Glyph carries the state (colour reinforces).
                 let (glyph, style) = if h.failed_rev.is_some() {
                     ("!", Style::default().fg(theme::ERROR))
+                } else if h.approved && h.deployed_rev.is_none() {
+                    ("↑", Style::default().fg(theme::ACCENT))
                 } else if h.held_rev.is_some() {
                     ("≠", Style::default().fg(theme::WARNING))
                 } else if h.offline_rev.is_some() {

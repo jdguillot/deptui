@@ -75,9 +75,11 @@ struct PauseParams {
 }
 
 #[derive(Deserialize)]
-struct DeployParams {
+struct ApproveParams {
     host: String,
     watch: Option<String>,
+    #[serde(default)]
+    revoke: bool,
 }
 
 #[derive(Deserialize)]
@@ -196,13 +198,14 @@ async fn post_cancel(State(s): State<ApiState>) -> Result<Json<OkReply>, ApiErro
     ok_or_400(result)
 }
 
-async fn post_deploy(
+async fn post_approve(
     State(s): State<ApiState>,
-    Query(p): Query<DeployParams>,
+    Query(p): Query<ApproveParams>,
 ) -> Result<Json<OkReply>, ApiError> {
-    let result = ask(&s.cmd_tx, |reply| Cmd::ForceDeploy {
+    let result = ask(&s.cmd_tx, |reply| Cmd::Approve {
         watch: p.watch,
         host: p.host,
+        revoke: p.revoke,
         reply,
     })
     .await?;
@@ -249,7 +252,7 @@ fn full_router(state: ApiState) -> Router {
         .route("/kick", post(post_kick))
         .route("/pause", post(post_pause))
         .route("/resume", post(post_resume))
-        .route("/deploy", post(post_deploy))
+        .route("/approve", post(post_approve))
         // Cancel is a control verb: Unix socket only, never on the TCP
         // kick router.
         .route("/cancel", post(post_cancel))

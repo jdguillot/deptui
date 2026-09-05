@@ -10,6 +10,27 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-05
+
+### Changed
+
+- **Breaking:** the agent's force-deploy is gone (`deploy` verb,
+  `POST /deploy`, `d` in the TUI view). The agent schedules; immediate
+  deploys belong to the TUI's main screen. In its place: **approval**
+  — `deptui-agent approve HOST [--revoke]` / `POST /approve` / `y` in
+  the view (with an explicit warning + confirm) marks a held or
+  unadopted host as ok to take the *next* update round, accepting
+  that this moves it off any generation made outside the watched
+  repo. Approval is revocable until consumed by the first successful
+  deploy. Approved hosts show `↑` in the view.
+
+### Fixed
+
+- **Erratum for 0.7.0:** the "no startup poll" change was in that
+  release's notes but not in its binary (a botched patch); the agent
+  still polled ~5s after start. It is actually fixed now, with the
+  e2e test tightened to catch it.
+
 ## [0.7.1] — 2026-09-05
 
 ### Fixed

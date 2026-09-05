@@ -534,8 +534,10 @@ Key invariants worth knowing before touching the code:
   deploy history is probed (`check_profile_up_to_date` per selected
   profile): identical → outcome `adopted` (recorded as deployed);
   different or unprobeable → outcome `held` (notify fires; parked at
-  that rev; a *new* rev re-probes). Only a force-deploy or `bootstrap
-  = "deploy"` deploys a first-encounter host — this is the guard
+  that rev; a *new* rev re-probes). Only an approval (`approve` verb /
+  `y` in the view — consumed by the NEXT round, never an immediate
+  deploy; the agent has no force-deploy) or `bootstrap = "deploy"`
+  deploys a first-encounter host — this is the guard
   against a fresh agent rolling hosts back to a stale repo. The
   daemon's first poll also waits for the cadence: starting the agent
   is not a deploy trigger.

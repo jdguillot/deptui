@@ -104,12 +104,17 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
-    /// Force-deploy one host at the watch's last-seen revision,
-    /// bypassing pause flags and the failed-at marker.
-    Deploy {
+    /// Approve a held (or not-yet-adopted) host: the next update round
+    /// may deploy it — accepting that this moves the host off any
+    /// generation made outside the watched repo. No immediate deploy
+    /// happens; use the TUI for that.
+    Approve {
         host: String,
         #[arg(long)]
         watch: Option<String>,
+        /// Withdraw a pending approval instead.
+        #[arg(long)]
+        revoke: bool,
     },
     /// Stop the deploy run currently in flight (kills the deploy's
     /// whole process group; the run's hosts stay parked at that
@@ -277,16 +282,16 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Deploy {
+        Command::Approve {
             ref host,
             ref watch,
+            revoke,
         } => {
-            simple_post(
-                &cli,
-                "/deploy",
-                &[("host", Some(host.as_str())), ("watch", watch.as_deref())],
-            )
-            .await
+            let mut params = vec![("host", Some(host.as_str())), ("watch", watch.as_deref())];
+            if revoke {
+                params.push(("revoke", Some("true")));
+            }
+            simple_post(&cli, "/approve", &params).await
         }
         Command::Cancel => simple_post(&cli, "/cancel", &[]).await,
         Command::Tail => {
@@ -375,10 +380,14 @@ fn print_status(s: &wire::AgentStatus) {
             }
             if let (Some(rev), Some(t)) = (&h.held_rev, h.held_time) {
                 bits.push(format!(
-                    "HELD since {} — target differs from {}; `deptui-agent deploy` adopts",
+                    "HELD since {} — target differs from {}; `deptui-agent approve` \
+                     takes the next round",
                     fmt_time(t),
                     short(rev)
                 ));
+            }
+            if h.approved {
+                bits.push("approved for the next update round".to_string());
             }
             if let (Some(rev), Some(t)) = (&h.offline_rev, h.offline_time) {
                 bits.push(format!(
@@ -480,14 +489,14 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                 };
                 if hs.paused
                     || same(&hs.deployed)
-                    || same(&hs.held)
+                    || (!hs.approved && same(&hs.held))
                     || hs.failed.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str())
                 {
                     return None;
                 }
                 Some(runner::PlanHost {
                     name: h.clone(),
-                    adopt: hs.deployed.is_none() && hs.failed.is_none(),
+                    adopt: !hs.approved && hs.deployed.is_none() && hs.failed.is_none(),
                 })
             })
             .collect();
@@ -524,6 +533,7 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                     hs.failed = None;
                     hs.offline = None;
                     hs.held = None;
+                    hs.approved = false;
                 }
                 "held" => {
                     hs.held = Some(state::Stamp {

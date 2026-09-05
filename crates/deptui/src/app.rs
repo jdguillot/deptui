@@ -362,6 +362,9 @@ pub struct AgentUi {
     tail_task: Option<JoinHandle<()>>,
     /// Last op ack, shown in the view's footer.
     pub last_op: Option<String>,
+    /// Two-step approval confirm: the (watch, host) awaiting the
+    /// second `y`. The warning lives in the footer while this is set.
+    pub pending_approve: Option<(String, String)>,
     /// Settings-file load error, surfaced in the view's empty state.
     pub settings_error: Option<String>,
     /// When the last status fetch was started — drives the view's
@@ -390,6 +393,7 @@ impl AgentUi {
             tail: VecDeque::new(),
             tail_task: None,
             last_op: None,
+            pending_approve: None,
             settings_error: settings.load_error.clone(),
             last_status_fetch: None,
             scanning: false,
@@ -3454,6 +3458,12 @@ resolve the paths so they can be seeded",
     /// Key handling while the agent view is open (Normal input mode).
     fn handle_key_agent(&mut self, key: KeyEvent) {
         let rows = self.agent.host_rows();
+        // A pending approval confirm unwinds first: Esc cancels it
+        // (rather than closing the view), any other key falls through.
+        if self.agent.pending_approve.is_some() && key.code == KeyCode::Esc {
+            self.agent.pending_approve = None;
+            return;
+        }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('a') => self.close_agent_view(),
             KeyCode::Char('j') | KeyCode::Down => {
@@ -4924,6 +4934,7 @@ mod tests {
                         offline_time: None,
                         held_rev: None,
                         held_time: None,
+                        approved: false,
                     },
                     agentwire::HostStatus {
                         name: "b".into(),
@@ -4938,6 +4949,7 @@ mod tests {
                         offline_time: None,
                         held_rev: None,
                         held_time: None,
+                        approved: false,
                     },
                 ],
             }],
