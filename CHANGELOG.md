@@ -10,6 +10,15 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Fixed
+
+- An agent with `enable = true` but no watches configured yet
+  crash-looped under systemd ("configures no watches — nothing to
+  do") — which also made it undiscoverable, since the socket never
+  existed. The daemon now starts, warns, and serves its control API
+  with zero watches (install first, configure later); the oneshot
+  `check`/`validate` verbs still refuse.
+
 ## [0.6.0] — 2026-09-05
 
 ### Added

@@ -147,10 +147,21 @@ fn load_config(cli: &Cli, state_dir: Option<PathBuf>) -> Result<AgentConfig> {
     if let Some(dir) = state_dir {
         cfg.state_dir = dir;
     }
-    if cfg.watches.is_empty() {
-        bail!("{} configures no watches — nothing to do", path.display());
-    }
     Ok(cfg)
+}
+
+/// The oneshot verbs are pointless without watches; the daemon is not
+/// (an idle agent still serves its API and is discoverable — refusing
+/// to start just made systemd crash-loop the install-first,
+/// configure-watches-later flow).
+fn require_watches(cli: &Cli, cfg: &AgentConfig) -> Result<()> {
+    if cfg.watches.is_empty() {
+        bail!(
+            "{} configures no watches — nothing to do",
+            config_path(cli).display()
+        );
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -161,6 +172,12 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Command::Run { ref state_dir } => {
             let cfg = Arc::new(load_config(&cli, state_dir.clone())?);
+            if cfg.watches.is_empty() {
+                tracing::warn!(
+                    "no watches configured — serving the control API only; add [[watch]] \
+                     tables (or services.deptui-agent.watches) to deploy anything"
+                );
+            }
             let daemon = daemon::Daemon::new(cfg.clone())?;
             let api_state = api::ApiState {
                 cmd_tx: daemon.handle(),
@@ -407,6 +424,7 @@ fn print_history(runs: &[wire::RunSummary]) {
 /// host failed.
 async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>) -> Result<()> {
     let cfg = load_config(cli, state_dir)?;
+    require_watches(cli, &cfg)?;
     if let Some(w) = &only {
         if !cfg.watches.iter().any(|x| &x.name == w) {
             bail!("unknown watch `{w}`");
@@ -532,6 +550,7 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
 /// nodes, and probe every configured host non-interactively.
 async fn validate(cli: &Cli, state_dir: Option<PathBuf>) -> Result<()> {
     let cfg = load_config(cli, state_dir)?;
+    require_watches(cli, &cfg)?;
     let mut failures = 0u32;
     for w in &cfg.watches {
         let rev = match gitwatch::ls_remote(&w.repo, &w.refspec()).await {

@@ -521,3 +521,64 @@ fn cancel_stops_a_running_deploy_and_parks_the_host() {
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();
 }
+
+/// An agent with no watches yet must still start and serve its API —
+/// the install-first, configure-later flow (and TUI discovery) depend
+/// on it. The oneshot verbs still refuse.
+#[test]
+fn daemon_runs_and_answers_with_zero_watches() {
+    let state = TempDir::new().unwrap();
+    let config_path = state.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "state_dir = \"{0}\"\nsocket = \"{0}/agent.sock\"\n",
+            state.path().display()
+        ),
+    )
+    .unwrap();
+    let socket = state.path().join("agent.sock");
+
+    let agent = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+            .arg("--config")
+            .arg(&config_path)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    // check refuses: nothing to do is an error for a oneshot.
+    let out = agent(&["check"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no watches"));
+
+    // The daemon serves.
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("run")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !socket.exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "daemon with zero watches must still bind its socket"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = agent(&["status", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["watches"].as_array().map(Vec::len), Some(0));
+
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
+}

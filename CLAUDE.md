@@ -500,6 +500,10 @@ Key invariants worth knowing before touching the code:
   bump the version, tag. Do not leave finished work sitting on an old
   version number; "the app still says 0.1.0" was the failure mode
   this rule exists to prevent.
+- **Fixes ship immediately as their own patch release** — before, and
+  never bundled with, unrelated features waiting in `[Unreleased]`.
+  A fix the user needs on their machines must not carry feature risk
+  along; features wait for their own minor. (User-confirmed policy.)
 - **CHANGELOG.md discipline:** user-visible changes land in the
   `[Unreleased]` section *in the same commit* that makes them. A
   release = move `[Unreleased]` under a dated version heading, bump
