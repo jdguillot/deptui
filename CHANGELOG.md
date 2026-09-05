@@ -10,6 +10,18 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Self-deploy no longer kills the agent: an agent deploying its own
+  host was stopped by its own activation the moment the update
+  changed deptui-agent.service — run, activation start-phase, and
+  deploy-rs confirmation died with it, and the clean exit meant
+  systemd never restarted it. The module now sets `restartIfChanged =
+  false` (new option `restartOnUpdate` to opt back in); the running
+  agent picks up its new version on the next explicit restart or
+  reboot, and the run log flags deploys that target the agent's own
+  host.
+
 ## [0.6.1] — 2026-09-05
 
 ### Fixed

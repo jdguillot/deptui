@@ -101,6 +101,22 @@ in
       };
     };
 
+    restartOnUpdate = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether NixOS activation may stop/restart the agent when its
+        unit changes. Off by default because of the self-deploy trap:
+        an agent that deploys its *own* host gets killed by its own
+        activation mid-deploy — the run dies, the start-phase and
+        deploy-rs's confirmation die with it, and the service is left
+        stopped. With this off, a changed agent keeps running the old
+        version until `systemctl restart deptui-agent` (or a reboot);
+        turn it on only if this agent never deploys the host it runs
+        on.
+      '';
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -194,6 +210,7 @@ in
 
     systemd.services.deptui-agent = {
       description = "deptui auto-deploy agent";
+      restartIfChanged = cfg.restartOnUpdate;
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];

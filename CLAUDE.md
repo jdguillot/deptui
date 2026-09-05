@@ -537,6 +537,14 @@ Key invariants worth knowing before touching the code:
   that revision (outcome `cancelled`, failed-stamp message says so),
   so the run doesn't quietly resume at the next poll. No failure
   notification fires for a user cancel.
+- **Self-deploy must not kill the agent.** The module sets
+  `restartIfChanged = false` (option `restartOnUpdate`): when the
+  agent deploys its own host and the update changes
+  deptui-agent.service, activation stopping the unit would kill the
+  run mid-flight — driver, start-phase, and deploy-rs confirmation
+  included — and leave the service stopped with a clean exit that
+  `Restart=on-failure` ignores. The runner logs a note when a deploy
+  targets the agent's own host (`is_self_target`).
 - **The TCP listener is kick+status only.** The full control surface
   stays on the Unix socket (group-gated, 0660). Never mount another
   route on the TCP router.

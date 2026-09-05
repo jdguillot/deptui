@@ -235,6 +235,15 @@ Rules the agent lives by:
   `catch_up = false` opts out.
 - Sequential deploys, coalesced to the newest revision; state (and
   the last 50 runs per watch) in `/var/lib/deptui-agent`.
+- **Self-managing agents are safe by default.** An agent may watch
+  and deploy its *own* host; the module sets `restartIfChanged =
+  false` on the service so the activation can't kill the agent
+  mid-deploy (the trap: unit changed → activation stops the agent →
+  the run, the start-phase, and deploy-rs's confirmation all die with
+  it, leaving the service stopped). The running agent keeps its old
+  version until `systemctl restart deptui-agent` or a reboot; set
+  `restartOnUpdate = true` only if the agent never deploys its own
+  host.
 
 ### CLI
 

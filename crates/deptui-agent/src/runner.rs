@@ -70,6 +70,35 @@ pub async fn check_reachable(
     }
 }
 
+/// Does this deploy target the machine the agent itself runs on? A
+/// self-deploy whose update changes deptui-agent.service can stop the
+/// agent mid-run (see the module's restartOnUpdate option); the run
+/// log flags it so the journal explains itself when that happens.
+fn is_self_target(local_hostname: &str, node_hostname: &str) -> bool {
+    if local_hostname.is_empty() {
+        return false;
+    }
+    node_hostname == local_hostname
+        || node_hostname == "localhost"
+        || node_hostname.strip_suffix(".localdomain") == Some(local_hostname)
+        || node_hostname
+            .split('.')
+            .next()
+            .is_some_and(|short| short == local_hostname)
+}
+
+fn local_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: buffer and length are valid; gethostname NUL-terminates
+    // on success (we also cap at the buffer's end defensively).
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) };
+    if rc != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
 /// The agent never answers an ssh prompt: SSH_ASKPASS points at
 /// `/bin/false`, so anything that would ask for a password or
 /// passphrase fails fast instead of hanging a headless daemon.
@@ -303,6 +332,14 @@ async fn deploy_host(
         }
     }
 
+    if is_self_target(&local_hostname(), &node.hostname) {
+        log(format!(
+            "[{host}] note: this deploy targets the agent's own host — if it changes \
+             deptui-agent.service and the module's restartOnUpdate is enabled, the \
+             activation will stop this agent mid-deploy"
+        ));
+    }
+
     notify::dispatch(
         notify_cfg,
         Event::new(
@@ -383,5 +420,24 @@ async fn deploy_host(
         Some(0) => Ok(DeployOutcome::Deployed),
         Some(code) => Err(anyhow!("deploy exited with code {code}")),
         None => Err(anyhow!("deploy ended without an exit status")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_target_detection() {
+        assert!(is_self_target("ryzn-server", "ryzn-server"));
+        assert!(is_self_target("ryzn-server", "ryzn-server.lan"));
+        assert!(is_self_target("ryzn-server", "localhost"));
+        assert!(!is_self_target("ryzn-server", "web.lan"));
+        assert!(!is_self_target("", "web"));
+    }
+
+    #[test]
+    fn local_hostname_is_nonempty_here() {
+        assert!(!local_hostname().is_empty());
     }
 }
