@@ -25,7 +25,7 @@ pub const DEFAULT_SOCKET_PATH: &str = "/run/deptui-agent/agent.sock";
 /// Default state directory (`StateDirectory=deptui-agent`).
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/deptui-agent";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Unix socket the control API listens on.
@@ -52,7 +52,7 @@ fn default_state_dir() -> PathBuf {
     PathBuf::from(DEFAULT_STATE_DIR)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenConfig {
     /// e.g. `"0.0.0.0:7337"`.
@@ -63,7 +63,7 @@ pub struct ListenConfig {
     pub token_file: PathBuf,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotifyConfig {
     /// Hook command run on failure via `sh -c`. `{event}`, `{watch}`,
@@ -112,7 +112,7 @@ pub enum WebhookKind {
     Json,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatchConfig {
     pub name: String,
@@ -139,7 +139,7 @@ pub struct WatchConfig {
     pub hosts: BTreeMap<String, HostConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
     /// `"all"` (default), `"system"`, or `"home"`.
@@ -173,7 +173,7 @@ pub struct HostConfig {
     pub ssh: Option<SshConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshConfig {
     #[serde(default)]
@@ -299,9 +299,7 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
         if ch.is_ascii_digit() {
             num.push(ch);
         } else {
-            let n: u64 = num
-                .parse()
-                .map_err(|_| anyhow!("invalid duration `{s}`"))?;
+            let n: u64 = num.parse().map_err(|_| anyhow!("invalid duration `{s}`"))?;
             num.clear();
             saw_unit = true;
             total += match ch {
@@ -337,7 +335,12 @@ impl AgentConfig {
     pub fn validate(&self) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         for w in &self.watches {
-            if w.name.is_empty() || !w.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            if w.name.is_empty()
+                || !w
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
                 bail!("watch name `{}` must be non-empty [A-Za-z0-9_-]", w.name);
             }
             if !seen.insert(&w.name) {
@@ -443,7 +446,10 @@ interval = "15m"
         let toml = minimal("").replace("interval = \"15m\"", "cron = \"*/15 * * * *\"");
         let cfg: AgentConfig = toml::from_str(&toml).unwrap();
         cfg.validate().unwrap();
-        assert!(matches!(cfg.watches[0].cadence().unwrap(), Cadence::Cron(_)));
+        assert!(matches!(
+            cfg.watches[0].cadence().unwrap(),
+            Cadence::Cron(_)
+        ));
     }
 
     #[test]

@@ -110,13 +110,22 @@ pub async fn execute(
     };
 
     for host in &plan.hosts {
-        let outcome = deploy_host(watch, &flake_ref, &nodes, host, &plan.rev, notify_cfg, |line| {
-            log(&mut record, line)
-        })
+        let outcome = deploy_host(
+            watch,
+            &flake_ref,
+            &nodes,
+            host,
+            &plan.rev,
+            notify_cfg,
+            |line| log(&mut record, line),
+        )
         .await;
         match outcome {
             Ok(()) => {
-                log(&mut record, format!("[{}] {host}: deployed {short}", watch.name));
+                log(
+                    &mut record,
+                    format!("[{}] {host}: deployed {short}", watch.name),
+                );
                 record.hosts.push(HostRun {
                     host: host.clone(),
                     outcome: "ok".into(),
@@ -135,7 +144,10 @@ pub async fn execute(
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                log(&mut record, format!("[{}] {host}: FAILED — {msg}", watch.name));
+                log(
+                    &mut record,
+                    format!("[{}] {host}: FAILED — {msg}", watch.name),
+                );
                 record.hosts.push(HostRun {
                     host: host.clone(),
                     outcome: "failed".into(),
@@ -151,7 +163,11 @@ pub async fn execute(
 
     record.finished = Some(now_unix());
     let ok = record.hosts.iter().filter(|h| h.outcome == "ok").count();
-    let failed = record.hosts.iter().filter(|h| h.outcome == "failed").count();
+    let failed = record
+        .hosts
+        .iter()
+        .filter(|h| h.outcome == "failed")
+        .count();
     log(
         &mut record,
         format!(
@@ -175,12 +191,12 @@ async fn deploy_host(
         .hosts
         .get(host)
         .ok_or_else(|| anyhow!("host `{host}` is not configured in watch `{}`", watch.name))?;
-    let node = nodes
-        .iter()
-        .find(|n| n.name == host)
-        .ok_or_else(|| {
-            anyhow!("node `{host}` not found in deploy.nodes at {}", &rev[..rev.len().min(12)])
-        })?;
+    let node = nodes.iter().find(|n| n.name == host).ok_or_else(|| {
+        anyhow!(
+            "node `{host}` not found in deploy.nodes at {}",
+            &rev[..rev.len().min(12)]
+        )
+    })?;
 
     notify::dispatch(
         notify_cfg,

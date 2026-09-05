@@ -15,9 +15,12 @@ use tokio::process::Command;
 /// ref doesn't exist. For tags, prefers the peeled `^{}` line so an
 /// annotated tag resolves to the commit, not the tag object.
 pub async fn ls_remote(repo: &str, refspec: &str) -> Result<Option<String>> {
-    let out = git(None, &["ls-remote", repo, refspec, &format!("{refspec}^{{}}")])
-        .await
-        .with_context(|| format!("polling {repo} for {refspec}"))?;
+    let out = git(
+        None,
+        &["ls-remote", repo, refspec, &format!("{refspec}^{{}}")],
+    )
+    .await
+    .with_context(|| format!("polling {repo} for {refspec}"))?;
     let mut plain = None;
     let mut peeled = None;
     for line in out.lines() {
@@ -41,25 +44,39 @@ pub fn clone_dir(state_dir: &Path, watch: &str) -> PathBuf {
 
 /// Make `<state_dir>/clones/<watch>` an up-to-date checkout of `rev` and
 /// return its path. Clones on first use; fetches and detaches otherwise.
-pub async fn ensure_checkout(state_dir: &Path, watch: &str, repo: &str, rev: &str) -> Result<PathBuf> {
+pub async fn ensure_checkout(
+    state_dir: &Path,
+    watch: &str,
+    repo: &str,
+    rev: &str,
+) -> Result<PathBuf> {
     let dir = clone_dir(state_dir, watch);
     if !dir.join(".git").exists() {
         std::fs::create_dir_all(dir.parent().unwrap())
             .with_context(|| format!("creating {}", dir.parent().unwrap().display()))?;
-        git(None, &["clone", "--no-checkout", repo, &dir.to_string_lossy()])
-            .await
-            .with_context(|| format!("cloning {repo}"))?;
+        git(
+            None,
+            &["clone", "--no-checkout", repo, &dir.to_string_lossy()],
+        )
+        .await
+        .with_context(|| format!("cloning {repo}"))?;
     }
     // Fetch the specific commit when the server allows it; fall back to a
     // full ref fetch for servers without allow*SHA1InWant.
-    if git(Some(&dir), &["fetch", "--quiet", "origin", rev]).await.is_err() {
+    if git(Some(&dir), &["fetch", "--quiet", "origin", rev])
+        .await
+        .is_err()
+    {
         git(Some(&dir), &["fetch", "--quiet", "--tags", "origin"])
             .await
             .with_context(|| format!("fetching {repo}"))?;
     }
-    git(Some(&dir), &["checkout", "--quiet", "--force", "--detach", rev])
-        .await
-        .with_context(|| format!("checking out {rev} in {}", dir.display()))?;
+    git(
+        Some(&dir),
+        &["checkout", "--quiet", "--force", "--detach", rev],
+    )
+    .await
+    .with_context(|| format!("checking out {rev} in {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -112,13 +129,22 @@ mod tests {
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{cmd}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{cmd}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         sh("git init -q -b main . && echo one > f && git add f && git commit -qm one");
 
         let rev1 = ls_remote(&rp, "refs/heads/main").await.unwrap().unwrap();
-        let dir = ensure_checkout(state.path(), "w", &rp, &rev1).await.unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("f")).unwrap().trim(), "one");
+        let dir = ensure_checkout(state.path(), "w", &rp, &rev1)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f")).unwrap().trim(),
+            "one"
+        );
 
         sh("echo two > f && git add f && git commit -qm two && git tag -a prod -m p");
         let rev2 = ls_remote(&rp, "refs/heads/main").await.unwrap().unwrap();
@@ -127,8 +153,13 @@ mod tests {
         let tagrev = ls_remote(&rp, "refs/tags/prod").await.unwrap().unwrap();
         assert_eq!(tagrev, rev2);
 
-        let dir = ensure_checkout(state.path(), "w", &rp, &rev2).await.unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("f")).unwrap().trim(), "two");
+        let dir = ensure_checkout(state.path(), "w", &rp, &rev2)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f")).unwrap().trim(),
+            "two"
+        );
 
         // Unknown ref is None, not an error.
         assert!(ls_remote(&rp, "refs/heads/nope").await.unwrap().is_none());

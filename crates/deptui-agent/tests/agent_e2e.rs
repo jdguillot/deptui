@@ -1,0 +1,291 @@
+//! End-to-end tests of the deptui-agent binary: a real local git repo,
+//! PATH-shim `nix` and `deploy` binaries, and the actual executable via
+//! `CARGO_BIN_EXE_deptui-agent`. Covers the oneshot `check` pipeline
+//! (deploy on update, park on failure, no same-commit retry) and the
+//! daemon's socket API driven through the client verbs.
+//!
+//! Shims go to the child's PATH only (no process-global mutation), so
+//! no `#[serial]` is needed here.
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use tempfile::TempDir;
+
+const NODES_JSON: &str =
+    r#"{"web":{"hostname":"web.lan","sshUser":"root","profiles":{"system":{"user":null}}}}"#;
+
+struct Env {
+    _shims: TempDir,
+    shim_path: String,
+    repo: TempDir,
+    state: TempDir,
+    config_path: PathBuf,
+    /// Every `deploy` invocation appends its argv here.
+    deploy_log: PathBuf,
+}
+
+fn setup(deploy_exit: i32) -> Env {
+    let shims = TempDir::new().unwrap();
+    let deploy_log = shims.path().join("deploy-calls.log");
+
+    // `nix` shim: flake discovery JSON on stdout.
+    let nix = shims.path().join("nix");
+    fs::write(&nix, format!("#!/bin/sh\nprintf '%s' '{NODES_JSON}'\n")).unwrap();
+    fs::set_permissions(&nix, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // `deploy` shim: record argv, emit a line, controlled exit.
+    let deploy = shims.path().join("deploy");
+    fs::write(
+        &deploy,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}\necho deploying\nexit {deploy_exit}\n",
+            deploy_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&deploy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let shim_path = format!(
+        "{}:{}",
+        shims.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // A real git repo to watch.
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q", "-b", "main", "."]);
+    fs::write(repo.path().join("flake.nix"), "{}").unwrap();
+    git(repo.path(), &["add", "flake.nix"]);
+    git(repo.path(), &["commit", "-qm", "one"]);
+
+    let state = TempDir::new().unwrap();
+    let config_path = state.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+state_dir = "{state}"
+socket = "{state}/agent.sock"
+
+[[watch]]
+name = "infra"
+repo = "{repo}"
+branch = "main"
+interval = "1h"
+
+[watch.hosts.web]
+"#,
+            state = state.path().display(),
+            repo = repo.path().display(),
+        ),
+    )
+    .unwrap();
+
+    Env {
+        _shims: shims,
+        shim_path,
+        repo,
+        state,
+        config_path,
+        deploy_log,
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn agent(env: &Env, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("--config")
+        .arg(&env.config_path)
+        .args(args)
+        .env("PATH", &env.shim_path)
+        .output()
+        .unwrap()
+}
+
+fn deploy_calls(env: &Env) -> Vec<String> {
+    fs::read_to_string(&env.deploy_log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn check_deploys_update_then_is_idempotent() {
+    let env = setup(0);
+
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = deploy_calls(&env);
+    assert_eq!(calls.len(), 1, "one deploy for the initial revision");
+    assert!(
+        calls[0].contains("#web"),
+        "deploy target names the node: {}",
+        calls[0]
+    );
+    // The flake ref is the agent's private clone, not the watched repo.
+    let clone = env.state.path().join("clones/infra");
+    assert!(calls[0].starts_with(&format!("{}#web", clone.display())));
+    assert!(env.repo.path().join(".git").exists());
+
+    // Same revision again: nothing to do.
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("up to date"));
+    assert_eq!(deploy_calls(&env).len(), 1, "no second deploy");
+
+    // A new commit deploys again.
+    fs::write(env.repo.path().join("flake.nix"), "{ two = 1; }").unwrap();
+    git(env.repo.path(), &["add", "flake.nix"]);
+    git(env.repo.path(), &["commit", "-qm", "two"]);
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert_eq!(deploy_calls(&env).len(), 2);
+}
+
+#[test]
+fn failed_deploy_parks_host_until_new_revision() {
+    let env = setup(1);
+
+    let out = agent(&env, &["check"]);
+    assert!(!out.status.success(), "check exits non-zero on failure");
+    assert_eq!(deploy_calls(&env).len(), 1);
+
+    // Same revision: parked, not retried.
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success(), "parked host is not an error");
+    assert_eq!(deploy_calls(&env).len(), 1, "no same-commit retry");
+
+    // New revision: retried (and fails again — still one new call).
+    fs::write(env.repo.path().join("flake.nix"), "{ two = 1; }").unwrap();
+    git(env.repo.path(), &["add", "flake.nix"]);
+    git(env.repo.path(), &["commit", "-qm", "two"]);
+    let out = agent(&env, &["check"]);
+    assert!(!out.status.success());
+    assert_eq!(deploy_calls(&env).len(), 2);
+
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.state.path().join("state.json")).unwrap())
+            .unwrap();
+    let failed = &state["watches"]["infra"]["hosts"]["web"]["failed"];
+    assert!(failed["rev"].is_string(), "failed marker recorded: {state}");
+}
+
+#[test]
+fn daemon_serves_status_pause_kick_over_socket() {
+    let env = setup(0);
+    let socket = env.state.path().join("agent.sock");
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("--config")
+        .arg(&env.config_path)
+        .arg("run")
+        .env("PATH", &env.shim_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let wait_for = |what: &str, mut cond: Box<dyn FnMut() -> bool>| {
+        let start = Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for("socket", Box::new(|| socket.exists()));
+
+    // Status over the socket (client verb → HTTP → daemon → back).
+    let out = agent(&env, &["status", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["watches"][0]["name"], "infra");
+
+    // Pause globally; status reflects it.
+    let out = agent(&env, &["pause"]);
+    assert!(out.status.success());
+    let out = agent(&env, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["paused"], true);
+    let out = agent(&env, &["resume"]);
+    assert!(out.status.success());
+
+    // The startup poll (or our kick) deploys the initial revision.
+    let out = agent(&env, &["kick"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    {
+        let env = &env;
+        wait_for(
+            "deploy to run",
+            Box::new(move || {
+                let out = agent(env, &["status", "--json"]);
+                let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                status["watches"][0]["hosts"][0]["deployed_rev"].is_string()
+            }),
+        );
+    }
+    assert!(!deploy_calls(&env).is_empty());
+
+    // History knows about the run.
+    let out = agent(&env, &["history", "--json"]);
+    let runs: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        runs.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        "{runs}"
+    );
+
+    // Unknown watch is a clean client-side error, not a daemon crash.
+    let out = agent(&env, &["kick", "--watch", "nope"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown watch"));
+
+    // SIGTERM: clean shutdown.
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let start = Instant::now();
+    loop {
+        if let Some(st) = daemon.try_wait().unwrap() {
+            assert!(st.success(), "daemon exited {st:?}");
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "daemon ignored SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

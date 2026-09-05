@@ -207,7 +207,14 @@ mod tests {
         let s2 = AgentState::load(dir.path()).unwrap();
         assert!(s2.paused);
         assert_eq!(s2.watches["infra"].last_seen.as_deref(), Some("abc"));
-        assert_eq!(s2.watches["infra"].hosts["web"].deployed.as_ref().unwrap().rev, "abc");
+        assert_eq!(
+            s2.watches["infra"].hosts["web"]
+                .deployed
+                .as_ref()
+                .unwrap()
+                .rev,
+            "abc"
+        );
     }
 
     #[test]

@@ -127,7 +127,11 @@ fn spawn_webhook(url: String, kind: WebhookKind, token: Option<String>, event: E
         };
         let mut req = match kind {
             WebhookKind::Ntfy => {
-                let priority = if event.kind == "failure" { "high" } else { "default" };
+                let priority = if event.kind == "failure" {
+                    "high"
+                } else {
+                    "default"
+                };
                 client
                     .post(&url)
                     .header("Title", event.title())
