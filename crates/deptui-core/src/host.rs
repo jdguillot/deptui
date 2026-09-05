@@ -1138,7 +1138,7 @@ fn parse_closure_size(text: &str) -> Option<u64> {
 /// used to do inline. Factored out so the size/diff probes go through
 /// the exact same resolution path — including the home-profile user
 /// fallback — and can't drift.
-fn build_ssh_target(node: &Node, profile: &str, override_: &SshOverride) -> String {
+pub fn build_ssh_target(node: &Node, profile: &str, override_: &SshOverride) -> String {
     let host = override_.effective_host(&node.hostname).to_string();
     let fallback_user = match profile {
         "home" => node
