@@ -1953,6 +1953,7 @@ fn info_hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
         FocusPane::Hosts => vec![
             ("j/k", "move"),
             ("Space", "mark"),
+            ("m", "mark all"),
             ("g/G", "top/bottom"),
             ("/", "search log"),
             ("Tab", "focus"),
@@ -2028,7 +2029,7 @@ fn build_commands_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
     let mut spans: Vec<Span> = Vec::with_capacity(COMMANDS.len() * 3 + 1);
     spans.push(Span::raw(" "));
     let mut first = true;
-    for (i, (_cmd, key, label)) in COMMANDS.iter().enumerate() {
+    for (i, (cmd, key, label)) in COMMANDS.iter().enumerate() {
         if !app.command_is_visible(i) {
             continue;
         }
@@ -2036,9 +2037,25 @@ fn build_commands_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
             spans.push(Span::raw(" "));
         }
         first = false;
-        spans.extend(command_button(key, label, sub == Some(i)));
+        spans.extend(command_button(
+            key,
+            command_label(app, *cmd, label),
+            sub == Some(i),
+        ));
     }
     spans
+}
+
+/// The display label for a command button. Most are static; the
+/// mark-all button flips to "unmark" while any host is marked so the
+/// pane always names the action the press will perform. The width
+/// maths below uses the same helper, so the row can't misreport its
+/// own width.
+fn command_label(app: &App, cmd: crate::app::Command, default: &'static str) -> &'static str {
+    match cmd {
+        crate::app::Command::MarkAll if !app.marked.is_empty() => "unmark",
+        _ => default,
+    }
 }
 
 /// Rendered width of the commands-button row, accounting for hidden
@@ -2048,7 +2065,7 @@ fn commands_content_width(app: &App) -> usize {
         .iter()
         .enumerate()
         .filter(|(i, _)| app.command_is_visible(*i))
-        .map(|(_, (_, key, label))| (key, label))
+        .map(|(_, (cmd, key, label))| (key, command_label(app, *cmd, label)))
         .collect();
     let per_button: usize = visible
         .iter()
@@ -2377,6 +2394,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
 
         section("multi-select / batch"),
         key_line("Space", "mark or unmark the highlighted host (the [+] column lights up)"),
+        key_line("m", "mark all hosts / unmark all (batch deploys hit every marked host)"),
         key_line("Shift+A", "mark every host"),
         key_line("Shift+X", "clear all marks"),
         Line::from(Span::styled(

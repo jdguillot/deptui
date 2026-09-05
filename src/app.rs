@@ -74,6 +74,9 @@ pub const TOGGLE_COUNT: usize = deploy::TOGGLES.len();
 pub enum Command {
     Refresh,
     Updates,
+    /// Mark every host / clear all marks — the label flips between
+    /// "mark all" and "unmark" depending on whether anything is marked.
+    MarkAll,
     ProfileAll,
     ProfileSystem,
     ProfileHome,
@@ -90,6 +93,9 @@ pub enum Command {
 pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Refresh, "r", "refresh"),
     (Command::Updates, "u", "updates"),
+    // The label column holds the widest spelling; `ui::command_label`
+    // swaps in "unmark" while any host is marked.
+    (Command::MarkAll, "m", "mark all"),
     (Command::ProfileAll, "a", "all"),
     (Command::ProfileSystem, "s", "sys"),
     (Command::ProfileHome, "h", "home"),
@@ -1194,6 +1200,8 @@ impl App {
         match key.code {
             KeyCode::Char('r') => self.refresh_reachability(),
             KeyCode::Char('u') => self.refresh_updates_for_selected(),
+            // `m` = mark all / unmark all; Space (Hosts pane) marks one.
+            KeyCode::Char('m') => self.toggle_mark_all(),
 
             // Profile selection. `s` = sys (mnemonic: System), `h` = home, `a` = all.
             KeyCode::Char('a') => self.profile_sel = ProfileSel::All,
@@ -1339,6 +1347,7 @@ impl App {
         match cmd {
             Command::Refresh => self.refresh_reachability(),
             Command::Updates => self.refresh_updates_for_selected(),
+            Command::MarkAll => self.toggle_mark_all(),
             Command::ProfileAll => self.profile_sel = ProfileSel::All,
             Command::ProfileSystem => self.profile_sel = ProfileSel::System,
             Command::ProfileHome => self.profile_sel = ProfileSel::Home,
@@ -1918,6 +1927,23 @@ impl App {
     fn log_toggle(&mut self, name: &str, value: bool) {
         let state = if value { "on" } else { "off" };
         self.push_log(format!("• {name} = {state}").as_str(), false);
+    }
+
+    /// Mark every host, or clear all marks when any exist. Backs the
+    /// commands-pane "mark all"/"unmark" button and the global `m` key,
+    /// complementing Space's mark-one-host.
+    fn toggle_mark_all(&mut self) {
+        if self.marked.is_empty() {
+            self.marked = self.nodes.iter().map(|n| n.name.clone()).collect();
+            self.push_log(
+                format!("• marked all {} host(s)", self.marked.len()).as_str(),
+                false,
+            );
+        } else {
+            let n = self.marked.len();
+            self.marked.clear();
+            self.push_log(format!("• unmarked {n} host(s)").as_str(), false);
+        }
     }
 
     fn toggle_mark_selected(&mut self) {
@@ -3976,9 +4002,26 @@ mod tests {
     fn command_pane_entries() {
         // Smoke test: at least verify the pane has the expected commands
         // and that indices match expectations for the nav cursor.
-        assert!(COMMANDS.len() >= 10);
+        assert!(COMMANDS.len() >= 11);
         assert_eq!(COMMANDS[0].0, Command::Refresh);
         assert_eq!(COMMANDS[0].1, "r");
+        assert!(COMMANDS
+            .iter()
+            .any(|(c, k, _)| *c == Command::MarkAll && *k == "m"));
+    }
+
+    #[test]
+    fn m_toggles_between_mark_all_and_unmark_all() {
+        let mut app = App::new(".".into(), sample_nodes());
+        assert!(app.marked.is_empty());
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert_eq!(
+            app.marked.len(),
+            app.nodes.len(),
+            "first press marks every host"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(app.marked.is_empty(), "second press clears all marks");
     }
 
     #[test]

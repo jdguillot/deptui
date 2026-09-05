@@ -222,6 +222,7 @@ Optional flags:
 | `j` / `k`      | move selection / scroll log                                  |
 | `g` / `G`      | jump to top / snap to tail                                   |
 | `Space`        | mark/unmark host for batch operations                        |
+| `m`            | mark all hosts / unmark all                                  |
 | `Tab` / `Shift+Tab` | cycle focus forward / backward                          |
 | `f`/`p`/`t`/`c` | jump to hosts / job log / toggles / commands                |
 | `r`            | refresh online/offline for every host                        |
