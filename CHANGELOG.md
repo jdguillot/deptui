@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-09-05
+
 ### Fixed
 
 - Scan diagnostics kept the boilerplate and cut the cause: remote
