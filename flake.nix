@@ -37,11 +37,19 @@
           {
             pname,
             extraRuntime ? [ ],
+            # "release" (LTO, slow to compile) or "debug" — the -dev
+            # package attrs surface cargo's dev profile to nix so a
+            # wrapped, nix-copyable dev artifact doesn't pay release
+            # compile times. Tests are skipped for the dev variants;
+            # `cargo test` is the edit loop's job.
+            buildType ? "release",
           }:
           pkgs.rustPlatform.buildRustPackage {
-            inherit pname version;
+            inherit pname buildType;
+            version = if buildType == "release" then version else "${version}-dev";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+            doCheck = buildType == "release";
 
             # One workspace, one lockfile, one package per binary.
             cargoBuildFlags = [
@@ -106,6 +114,19 @@
           deptui-agent = mkPackage {
             pname = "deptui-agent";
             extraRuntime = [ pkgs.git ];
+          };
+          # Dev-profile variants: same wrapping, debug compile, no
+          # tests. `nix run .#deptui-dev`, or `nix copy` them to
+          # another machine (closure-complete, unlike a pushed debug
+          # binary).
+          deptui-dev = mkPackage {
+            pname = "deptui";
+            buildType = "debug";
+          };
+          deptui-agent-dev = mkPackage {
+            pname = "deptui-agent";
+            extraRuntime = [ pkgs.git ];
+            buildType = "debug";
           };
           default = self.packages.${system}.deptui;
         };

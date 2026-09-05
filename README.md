@@ -327,26 +327,42 @@ its colour.
 
 ## Development loop
 
-Fast iteration never needs the nix sandbox:
+Three tiers, fastest first:
+
+**Local edit loop — plain cargo, no ssh, no nix build.** The dev
+shell puts the runtime tools (`deploy`, `nix`, `ssh`, `git`) on PATH,
+so cargo's incremental dev profile is all you need:
 
 ```bash
-nix develop                      # toolchain + deploy/nix/ssh on PATH
-cargo run -- /path/to/flake      # the TUI, incremental debug build
+nix develop                      # toolchain + runtime tools on PATH
+cargo run -- /path/to/flake      # the TUI
 cargo run -p deptui-agent -- --config /tmp/agent-test/config.toml check
 cargo test -p deptui-agent       # the agent's e2e suite runs against shims
 ```
 
-To try changes on a real host without a nix rebuild:
+**Dev-profile nix packages — the cargo dev profile, surfaced to nix.**
+`.#deptui-dev` and `.#deptui-agent-dev` build the debug profile (no
+LTO, no tests) but are wrapped like the real packages, so they run
+anywhere nix runs — and `nix copy` ships them to another machine
+closure-complete:
 
 ```bash
-scripts/dev-agent me@deploy-box   # push deptui-agent → /tmp/deptui-agent-dev
-scripts/dev-tui   me@deploy-box   # push deptui       → /tmp/deptui-dev
+nix run .#deptui-dev -- /path/to/flake
+nix build .#deptui-agent-dev && nix copy --to ssh-ng://deploy-box ./result
 ```
 
-Each prints how to run its binary there (the agent: against the real
-config with the service stopped; the TUI: needs `deploy`/`nix`/`ssh`
-on that host's PATH). `nix build` is for release-shaped artifacts,
-not the edit loop.
+**Push scripts — raw speed for remote testing.** Skip nix entirely
+and push the incremental debug binary (caveat: it links this
+machine's glibc, so this is a NixOS-to-similar-NixOS shortcut; the
+-dev packages above are the robust route):
+
+```bash
+scripts/dev-agent me@deploy-box   # → /tmp/deptui-agent-dev
+scripts/dev-tui   me@deploy-box   # → /tmp/deptui-dev
+```
+
+Plain `nix build` stays what it is: the release profile, for
+artifacts you deploy for real.
 
 ## Building
 

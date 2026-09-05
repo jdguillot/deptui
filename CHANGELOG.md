@@ -12,9 +12,13 @@ release is tagged `vX.Y.Z`.
 
 ### Added
 
-- `scripts/dev-agent` / `scripts/dev-tui` (shared `scripts/dev-push`):
-  debug-build either binary and push it to a host for fast iteration
-  without a nix rebuild; README gains a "Development loop" section.
+- Dev builds, tiered: `packages.deptui-dev` / `packages.deptui-agent-dev`
+  surface cargo's dev profile to nix (debug compile, tests skipped,
+  same runtime wrapping — `nix run`-able and `nix copy`-able), and
+  `scripts/dev-agent` / `scripts/dev-tui` (shared `scripts/dev-push`)
+  push the raw incremental debug binary to a host for the fastest
+  remote loop. README gains a "Development loop" section laying out
+  the tiers.
 
 ## [0.4.0] — 2026-09-05
 
