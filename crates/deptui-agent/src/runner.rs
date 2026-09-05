@@ -88,6 +88,33 @@ pub async fn check_reachable(
     }
 }
 
+/// Human summary of a run's per-host outcomes — every category that
+/// occurred, not just ok/failed ("0 ok, 0 failed" for a run that held
+/// one host buried the actual result).
+pub fn summarize_outcomes(hosts: &[HostRun]) -> String {
+    let count = |what: &str| hosts.iter().filter(|h| h.outcome == what).count();
+    let mut parts = Vec::new();
+    for what in [
+        "ok",
+        "adopted",
+        "held",
+        "offline",
+        "failed",
+        "cancelled",
+        "skipped",
+    ] {
+        let n = count(what);
+        if n > 0 {
+            parts.push(format!("{n} {what}"));
+        }
+    }
+    if parts.is_empty() {
+        "nothing to do".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 /// Does this deploy target the machine the agent itself runs on? A
 /// self-deploy whose update changes deptui-agent.service can stop the
 /// agent mid-run (see the module's restartOnUpdate option); the run
@@ -343,18 +370,10 @@ pub async fn execute(
     }
 
     record.finished = Some(now_unix());
-    let ok = record.hosts.iter().filter(|h| h.outcome == "ok").count();
-    let failed = record
-        .hosts
-        .iter()
-        .filter(|h| h.outcome == "failed")
-        .count();
+    let summary = summarize_outcomes(&record.hosts);
     log(
         &mut record,
-        format!(
-            "[{}] run #{} finished: {ok} ok, {failed} failed",
-            watch.name, plan.run_id,
-        ),
+        format!("[{}] run #{} finished: {summary}", watch.name, plan.run_id),
     );
     record
 }
@@ -534,6 +553,22 @@ async fn deploy_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcome_summary_names_every_category() {
+        let hr = |outcome: &str| HostRun {
+            host: "h".into(),
+            outcome: outcome.into(),
+            message: None,
+            target: None,
+        };
+        assert_eq!(summarize_outcomes(&[]), "nothing to do");
+        assert_eq!(summarize_outcomes(&[hr("held")]), "1 held");
+        assert_eq!(
+            summarize_outcomes(&[hr("ok"), hr("ok"), hr("offline"), hr("failed")]),
+            "2 ok, 1 offline, 1 failed"
+        );
+    }
 
     #[test]
     fn self_target_detection() {

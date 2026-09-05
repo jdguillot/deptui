@@ -3292,7 +3292,7 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(5),
-            Constraint::Length(1),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -3367,26 +3367,55 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 
     // --- footer ---
-    let mut foot = vec![Span::styled(
-        " j/k select  u kick  x cancel run  p pause host  P pause agent  d deploy  r refresh  [/] agent  q close",
-        Style::default().fg(theme::MUTED),
-    )];
+    let mut foot: Vec<Span> = vec![Span::raw(" ")];
+    let mut hint = |key: &'static str, label: &'static str| {
+        foot.push(Span::styled(key, Style::default().fg(theme::KEY)));
+        foot.push(Span::styled(
+            format!(":{label}  "),
+            Style::default().fg(theme::MUTED),
+        ));
+    };
+    hint("j/k", "select");
+    hint("u", "kick");
+    hint("x", "cancel run");
+    hint("p", "pause host");
+    hint("P", "pause agent");
+    hint("d", "deploy");
+    hint("r", "refresh");
+    // Cycling agents means nothing with a single one configured —
+    // advertising a dead key was its own bug report.
+    if app.agent.agents.len() > 1 {
+        hint("[/]", "agent");
+    }
+    hint("q", "close");
     if let Some(op) = &app.agent.last_op {
         foot.push(Span::styled(
-            format!("  │ {op}"),
+            format!("│ {op}"),
             Style::default().fg(theme::ACCENT),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(foot)), chunks[2]);
+    let foot_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::MUTED));
+    let foot_inner = foot_block.inner(chunks[2]);
+    frame.render_widget(foot_block, chunks[2]);
+    frame.render_widget(
+        Paragraph::new(Line::from(foot)).wrap(Wrap { trim: false }),
+        foot_inner,
+    );
 }
 
 fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
+    // The watches pane owns the keyboard while the view is open, so it
+    // wears the focus border like any focused pane on the main screen.
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::MUTED))
+        .border_style(Style::default().fg(theme::FOCUS))
         .title(Span::styled(
             " watches ",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::FOCUS)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3550,8 +3579,12 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 ));
             }
             if let Some(r) = &w.running {
+                // "running", not "deploying": a first-encounter run may
+                // only probe and hold — the log says what it did. The
+                // spinner matches the probes on the main screen.
+                let sp = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
                 head.push(Span::styled(
-                    format!("  ⟳ deploying {} ({})", short_rev(&r.rev), r.trigger),
+                    format!("  {sp} running {} ({})", short_rev(&r.rev), r.trigger),
                     Style::default().fg(theme::BUSY),
                 ));
             } else if let Some(t) = w.next_poll {
@@ -3580,38 +3613,78 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     ("·", Style::default().fg(theme::MUTED))
                 };
-                let mut state = Vec::new();
+                // Semantic colour per state segment, matching the main
+                // screen's vocabulary (SUCCESS/ERROR/WARNING/MUTED) —
+                // one muted blob made every state look equally boring.
+                let mut state: Vec<Span> = Vec::new();
+                let seg = |text: String, style: Style, state: &mut Vec<Span<'static>>| {
+                    if !state.is_empty() {
+                        state.push(Span::styled(
+                            "; ".to_string(),
+                            Style::default().fg(theme::MUTED),
+                        ));
+                    }
+                    state.push(Span::styled(text, style));
+                };
                 if h.paused {
-                    state.push("paused".to_string());
+                    seg(
+                        "paused".into(),
+                        Style::default().fg(theme::MUTED),
+                        &mut state,
+                    );
                 }
                 if let (Some(rev), Some(t)) = (&h.deployed_rev, h.deployed_time) {
-                    state.push(format!(
-                        "deployed {} {}",
-                        short_rev(rev),
-                        format_unix_ago(t)
-                    ));
+                    seg(
+                        format!("deployed {} {}", short_rev(rev), format_unix_ago(t)),
+                        Style::default().fg(theme::SUCCESS),
+                        &mut state,
+                    );
                 }
                 if let Some(rev) = &h.failed_rev {
-                    state.push(format!("FAILED {}", short_rev(rev)));
+                    seg(
+                        format!("FAILED {}", short_rev(rev)),
+                        Style::default()
+                            .fg(theme::ERROR)
+                            .add_modifier(Modifier::BOLD),
+                        &mut state,
+                    );
                 }
                 if let Some(rev) = &h.held_rev {
-                    state.push(format!(
-                        "HELD {} — target differs from repo; d adopts",
-                        short_rev(rev)
-                    ));
+                    seg(
+                        format!(
+                            "HELD {} — target differs from repo; d adopts",
+                            short_rev(rev)
+                        ),
+                        Style::default()
+                            .fg(theme::WARNING)
+                            .add_modifier(Modifier::BOLD),
+                        &mut state,
+                    );
                 }
                 if let (Some(rev), Some(t)) = (&h.offline_rev, h.offline_time) {
-                    state.push(format!(
-                        "offline {} — {} pending",
-                        format_unix_ago(t),
-                        short_rev(rev)
-                    ));
+                    seg(
+                        format!(
+                            "offline {} — {} pending",
+                            format_unix_ago(t),
+                            short_rev(rev)
+                        ),
+                        Style::default().fg(theme::WARNING),
+                        &mut state,
+                    );
                 }
                 if let Some(u) = &h.unreachable {
-                    state.push(format!("unreachable: {u}"));
+                    seg(
+                        format!("unreachable: {u}"),
+                        Style::default().fg(theme::ERROR),
+                        &mut state,
+                    );
                 }
                 if state.is_empty() {
-                    state.push("never deployed".to_string());
+                    seg(
+                        "never deployed".into(),
+                        Style::default().fg(theme::MUTED),
+                        &mut state,
+                    );
                 }
                 let name_style = if is_sel {
                     Style::default()
@@ -3621,16 +3694,15 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     Style::default()
                 };
-                lines.push(Line::from(vec![
+                let mut row = vec![
                     Span::raw("  "),
                     Span::styled(glyph.to_string(), style),
                     Span::raw(" "),
                     Span::styled(h.name.clone(), name_style),
-                    Span::styled(
-                        format!("  {}", state.join("; ")),
-                        Style::default().fg(theme::MUTED),
-                    ),
-                ]));
+                    Span::raw("  "),
+                ];
+                row.extend(state);
+                lines.push(Line::from(row));
             }
             lines.push(Line::raw(""));
         }

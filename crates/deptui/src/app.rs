@@ -364,6 +364,10 @@ pub struct AgentUi {
     pub last_op: Option<String>,
     /// Settings-file load error, surfaced in the view's empty state.
     pub settings_error: Option<String>,
+    /// When the last status fetch was started — drives the view's
+    /// 5s auto-refresh so a finished run can't leave a stale
+    /// "running" chip on screen.
+    last_status_fetch: Option<std::time::Instant>,
     /// A deploy-node scan for agents is in flight.
     pub scanning: bool,
     /// At least one scan has completed (distinguishes "none found"
@@ -387,6 +391,7 @@ impl AgentUi {
             tail_task: None,
             last_op: None,
             settings_error: settings.load_error.clone(),
+            last_status_fetch: None,
             scanning: false,
             scanned: false,
             scan_failures: Vec::new(),
@@ -848,6 +853,11 @@ impl App {
         if self.probe_tasks.iter().any(|h| !h.is_finished()) {
             return true;
         }
+        // The agent view animates (running spinner, scan spinner) and
+        // auto-refreshes on ticks.
+        if self.agent.open {
+            return true;
+        }
         false
     }
 
@@ -1001,7 +1011,24 @@ impl App {
 
     fn handle_event(&mut self, ev: AppEvent) {
         match ev {
-            AppEvent::Tick => self.tick_counter = self.tick_counter.wrapping_add(1),
+            AppEvent::Tick => {
+                self.tick_counter = self.tick_counter.wrapping_add(1);
+                // The agent view mirrors remote state the daemon owns;
+                // a run finishing over there doesn't push to us, so the
+                // open view re-fetches on a slow heartbeat. 5s is
+                // imperceptible for a status pane and trivial for one
+                // ssh exec.
+                if self.agent.open
+                    && !self.agent.loading
+                    && !self.agent.agents.is_empty()
+                    && self
+                        .agent
+                        .last_status_fetch
+                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(5))
+                {
+                    self.fetch_agent_status();
+                }
+            }
             AppEvent::Term(CtEvent::Key(key)) => self.handle_key(key),
             AppEvent::Term(CtEvent::Mouse(me)) => self.handle_mouse(me),
             AppEvent::Term(_) => {}
@@ -3373,6 +3400,7 @@ resolve the paths so they can be seeded",
         };
         let (name, ssh) = (name.to_string(), ssh.to_string());
         self.agent.loading = true;
+        self.agent.last_status_fetch = Some(std::time::Instant::now());
         let tx = self.status_tx.clone();
         let env = self.askpass_env.clone();
         tokio::spawn(async move {

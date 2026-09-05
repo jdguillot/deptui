@@ -10,6 +10,21 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-09-05
+
+### Fixed
+
+- The agent view kept saying "deploying" after a run had finished: it
+  now auto-refreshes its status every 5s while open, the running chip
+  says "running" (a first-encounter run may only probe and hold), it
+  animates with the same spinner as the main screen, and run
+  summaries count every outcome ("1 held", not "0 ok, 0 failed").
+- Agent-view styling matches the rest of the app: focus-coloured
+  watches border, key-coloured bordered footer, and semantic colours
+  per host state (deployed green, FAILED red, HELD/offline yellow).
+  The `[/]` agent-cycling hint only shows when more than one agent is
+  configured — with a single agent the keys do nothing.
+
 ## [0.7.0] — 2026-09-05
 
 ### Changed
