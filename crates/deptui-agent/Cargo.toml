@@ -1,0 +1,15 @@
+[package]
+name = "deptui-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Background auto-deploy daemon for deptui"
+
+[[bin]]
+name = "deptui-agent"
+path = "src/main.rs"
+
+[dependencies]
+deptui-core = { path = "../deptui-core" }
+anyhow.workspace = true
+tokio.workspace = true

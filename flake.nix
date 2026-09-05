@@ -54,6 +54,11 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
+          # The workspace also carries deptui-agent; this package is the
+          # TUI alone. Tests still cover the core crate it depends on.
+          cargoBuildFlags = [ "-p" "deptui" ];
+          cargoTestFlags = [ "-p" "deptui" "-p" "deptui-core" ];
+
           nativeBuildInputs = [
             pkgs.pkg-config
             pkgs.makeWrapper

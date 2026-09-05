@@ -363,16 +363,40 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "deptui-core",
  "futures",
  "libc",
  "ratatui",
- "serde",
  "serde_json",
  "serial_test",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "deptui-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deptui-core",
+ "tokio",
+]
+
+[[package]]
+name = "deptui-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "tokio",
+ "tracing",
  "zeroize",
 ]
 

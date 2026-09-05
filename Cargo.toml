@@ -1,27 +1,24 @@
-[package]
-name = "deptui"
+[workspace]
+resolver = "2"
+members = ["crates/deptui-core", "crates/deptui", "crates/deptui-agent"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "A terminal UI wrapper around serokell/deploy-rs"
 license = "MIT"
 
-[lib]
-name = "deptui"
-path = "src/lib.rs"
-
-[[bin]]
-name = "deptui"
-path = "src/main.rs"
-
-[dependencies]
-# `unstable-rendered-line-info` was enabled but never used — scroll
-# maths goes through `Line::width()` (see `compute_tail_scroll_offset`),
-# which needs no unstable API.
-ratatui = "0.30"
-crossterm = { version = "0.29", features = ["event-stream"] }
-# Only the runtime pieces this binary actually touches. `full` also pulls
-# in `fs`, `signal`, and the rest, which is build time and API surface we
-# never use.
+# Shared dependency versions. Members opt in with `dep.workspace = true`
+# so a version bump happens in exactly one place.
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+# Only the runtime pieces the binaries actually touch. `full` also pulls
+# in `signal` and the rest, which is build time and API surface we never
+# use.
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -31,27 +28,13 @@ tokio = { version = "1", features = [
     "time",
     "io-util",
 ] }
-# `StreamExt::next` for crossterm's EventStream (src/event.rs) — the
-# executor/compat layers in the default feature set are unused.
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-libc = "0.2"
-tempfile = "3"
-zeroize = "1"
-clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[dev-dependencies]
-tempfile = "3"
+zeroize = "1"
 serial_test = "3"
-# `test-util` gives tests a pausable clock so timeout behaviour can be
-# asserted without actually sleeping. Dev-only: it is not compiled into
-# the released binary.
-tokio = { version = "1", features = ["test-util"] }
 
+# Profiles only apply at the workspace root; member profile sections are
+# silently ignored.
 [profile.release]
 lto = "thin"
 codegen-units = 1

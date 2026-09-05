@@ -1,0 +1,39 @@
+[package]
+name = "deptui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A terminal UI wrapper around serokell/deploy-rs"
+
+[lib]
+name = "deptui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "deptui"
+path = "src/main.rs"
+
+[dependencies]
+deptui-core = { path = "../deptui-core" }
+anyhow.workspace = true
+clap.workspace = true
+# `event-stream` for the async key/tick source in src/event.rs.
+crossterm = { version = "0.29", features = ["event-stream"] }
+# `StreamExt::next` for crossterm's EventStream (src/event.rs) — the
+# executor/compat layers in the default feature set are unused.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+libc.workspace = true
+# `unstable-rendered-line-info` was enabled but never used — scroll
+# maths goes through `Line::width()` (see `compute_tail_scroll_offset`),
+# which needs no unstable API.
+ratatui = "0.30"
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

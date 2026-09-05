@@ -9,9 +9,9 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use deptui::askpass::AskpassEnv;
-use deptui::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
-use deptui::ssh::SshOverride;
+use deptui_core::askpass::AskpassEnv;
+use deptui_core::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
+use deptui_core::ssh::SshOverride;
 use serial_test::serial;
 use tempfile::TempDir;
 

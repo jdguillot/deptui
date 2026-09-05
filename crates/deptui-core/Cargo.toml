@@ -1,0 +1,28 @@
+[package]
+name = "deptui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless core for deptui: deploy-rs runner, flake discovery, host probes"
+
+[lib]
+name = "deptui_core"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+serial_test.workspace = true
+tempfile.workspace = true
+# `test-util` gives tests a pausable clock so timeout behaviour can be
+# asserted without actually sleeping. Dev-only: it is not compiled into
+# the released binary.
+tokio = { workspace = true, features = ["test-util"] }
