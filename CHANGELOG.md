@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-09-05
+
 ### Fixed
 
 - Self-deploy no longer kills the agent: an agent deploying its own
