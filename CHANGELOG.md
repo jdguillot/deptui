@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-09-05
+
 ### Fixed
 
 - An agent with `enable = true` but no watches configured yet
