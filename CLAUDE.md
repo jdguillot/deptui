@@ -491,6 +491,12 @@ Key invariants worth knowing before touching the code:
 - Pre-1.0 SemVer: **minor** for features (and anything breaking —
   called out in the changelog), **patch** for fixes. Keybinding and
   agent config/API changes count as user-facing surface.
+- **Every completed batch of work ends in a release.** When a feature
+  or fix (or a session's worth of them) is done — tests green, clippy
+  clean, committed — cut the release right then: fold the changelog,
+  bump the version, tag. Do not leave finished work sitting on an old
+  version number; "the app still says 0.1.0" was the failure mode
+  this rule exists to prevent.
 - **CHANGELOG.md discipline:** user-visible changes land in the
   `[Unreleased]` section *in the same commit* that makes them. A
   release = move `[Unreleased]` under a dated version heading, bump
