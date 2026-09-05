@@ -50,6 +50,11 @@ immediate switch or as a new boot entry for next boot.
   deploy that *adds* a binary cache can't use it (see below).
 - **Help popup** (`?`) with a full guide to every key, badge, and toggle.
 
+- **Auto-deploy agent** (`deptui-agent`): a daemon that watches a git
+  repo and pushes updates to your hosts on its own — with catch-up for
+  offline hosts, failure notifications, and full control from the TUI
+  (`a`). See below.
+
 ## Build plan preflight (`Shift+P`)
 
 Runs the same dry-run deploy-rs would, and reports the plan before you
@@ -153,6 +158,139 @@ user's `~/.config/nix/nix.conf`, which `nix daemon --stdio` reads.
 `Shift+C` also checks `trusted-users` on the target. If the deploy's ssh
 user isn't trusted, nix **silently ignores** substituter overrides — no
 warning, it just builds. That check is why the report names the user.
+
+## The agent (`deptui-agent`)
+
+`deptui-agent` is a companion daemon that watches a git repository and
+pushes updates to configured hosts via deploy-rs — GitOps for your
+homelab, using the same deploy machinery as the TUI. It polls a branch
+head (or a moving tag) on an interval or cron schedule, deploys from
+its own private clone (never a working tree), and exposes a control
+API on a Unix socket. The TUI connects to it over ssh: press `a`.
+
+### Quick start (NixOS)
+
+```nix
+{
+  inputs.deptui.url = "github:jdguillot/deptui";
+
+  # in your NixOS configuration:
+  imports = [ deptui.nixosModules.deptui-agent ];
+
+  services.deptui-agent = {
+    enable = true;
+    watches.infra = {
+      repo = "git@github.com:me/infra.git";
+      branch = "main";
+      interval = "15m";
+      hosts.web = { };                         # deploy-rs defaults
+      hosts.db = { remote_build = true; };     # per-host flag overrides
+    };
+    # Optional: token-gated TCP listener for CI kicks (see below).
+    # listen = { enable = true; port = 7337; tokenFile = "/run/secrets/deptui-token"; };
+    # openFirewall = true;
+    sshKeyFile = "/run/secrets/deptui-deploy-key";
+  };
+}
+```
+
+Non-NixOS: build with `nix build .#deptui-agent` (or `cargo build -p
+deptui-agent`), write `/etc/deptui-agent/config.toml`, and install
+`contrib/deptui-agent.service`. The TOML mirrors the module options:
+
+```toml
+[[watch]]
+name = "infra"
+repo = "git@github.com:me/infra.git"
+branch = "main"          # or: tag = "prod" (a moving tag)
+interval = "15m"         # or: cron = "0 */6 * * *"
+offline_recheck = "2m"   # re-probe cadence for offline hosts
+
+[watch.hosts.web]
+# deploy-rs flags, only-emit-if-changed like the TUI:
+# skip_checks / magic_rollback / auto_rollback / remote_build = true|false
+# catch_up = false      # disable deploy-on-return for this host
+# mode = "boot"         # default "switch"
+# profile = "system"    # default "all"
+
+[notify]
+on_failure = "ntfy send homelab 'deploy failed: {host} at {rev}'"
+url = "https://ntfy.sh/my-topic"   # built-in webhook (kind = "ntfy" | "json")
+kind = "ntfy"
+```
+
+Rules the agent lives by:
+
+- **Headless means non-interactive.** Targets must accept
+  passwordless activation (root deploy user or NOPASSWD sudo);
+  `interactive_sudo` is rejected in agent config, and the agent
+  validates reachability at startup (`deptui-agent validate` does it
+  standalone for CI).
+- **No same-commit retry.** A failed host is parked until a new
+  revision, a kick, or a force-deploy. deploy-rs's magic rollback has
+  already made the target safe.
+- **Offline hosts catch up.** A host that is down when an update
+  arrives is *pending*, not failed: the agent re-probes it
+  (`offline_recheck`) and deploys the moment it answers. Per-host
+  `catch_up = false` opts out.
+- Sequential deploys, coalesced to the newest revision; state (and
+  the last 50 runs per watch) in `/var/lib/deptui-agent`.
+
+### CLI
+
+The binary is both daemon and client — `ssh host deptui-agent …` is
+the remote-control interface the TUI itself uses:
+
+```
+deptui-agent run                     # the daemon
+deptui-agent check [--watch W]      # oneshot poll+deploy (cron escape hatch)
+deptui-agent validate               # non-interactive reachability, exit != 0 on failure
+deptui-agent status [--json]        # agent + per-host state
+deptui-agent history [--json]       # recent runs
+deptui-agent log WATCH [--run N]    # captured log of a run
+deptui-agent kick [--watch W]      # poll now
+deptui-agent pause|resume [--watch W | --host H]
+deptui-agent deploy HOST [--watch W]  # force, bypasses pause + parking
+deptui-agent tail                   # live run log
+```
+
+### Connecting the TUI
+
+`~/.config/deptui/config.toml`:
+
+```toml
+default_agent = "homelab"
+
+[agents.homelab]
+ssh = "me@deploy-box"    # any ssh destination; socket access = group membership
+```
+
+`a` opens the agent view (status, pause/resume, kick, force-deploy,
+live log). Agent-managed hosts show an `[agent]` badge in the host
+list — `[agent!]` when the last agent deploy failed, `[agent~]` when
+an update is pending on an offline host.
+
+### Kicking from CI
+
+The kick endpoint means "check now" — it names no refs and deploys
+nothing that polling wouldn't. Two ways to trigger it from a GitHub
+Action after push:
+
+```yaml
+# Over ssh (no exposed port; the runner needs an ssh key):
+- name: Kick deptui-agent
+  run: ssh -o BatchMode=yes agent@deploy-box deptui-agent kick --watch infra
+
+# Or over the token-gated TCP listener (listen.enable + openFirewall):
+- name: Kick deptui-agent
+  run: |
+    curl -fsS -X POST \
+      -H "Authorization: Bearer ${{ secrets.DEPTUI_KICK_TOKEN }}" \
+      "https://deploy.example.com:7337/kick?watch=infra"
+```
+
+The TCP listener serves *only* `POST /kick` and `GET /status`; the
+full control surface never leaves the Unix socket.
 
 ## Requirements
 

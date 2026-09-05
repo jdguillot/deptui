@@ -3,6 +3,13 @@
 Outcome of the design-grilling session on 2026-09-04. Every decision below
 was explicitly confirmed; treat this as the contract for implementation.
 
+**Status: implemented.** The workspace split, the agent (daemon, API,
+CLI, notifications, offline catch-up), the TUI integration (agent view
+on `a`, badges, confirm-popup pause), and the packaging
+(`packages.deptui-agent`, `nixosModules.deptui-agent`,
+`contrib/deptui-agent.service`) all landed. This document remains the
+rationale record; CLAUDE.md carries the working invariants.
+
 ## Shape
 
 - Cargo **workspace**, three crates, lockstep versioning, one Cargo.lock:

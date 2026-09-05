@@ -1,5 +1,5 @@
 {
-  description = "deptui — a terminal UI wrapper for serokell/deploy-rs";
+  description = "deptui — a terminal UI and auto-deploy agent for serokell/deploy-rs";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -14,10 +14,56 @@
       flake-utils,
       deploy-rs,
     }:
-    flake-utils.lib.eachDefaultSystem (
+    (flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+
+        # Both binaries shell out at runtime; the wrapper is what makes
+        # `nix run`/module installs work without polluting the user's
+        # profile with nix/ssh/git pins.
+        runtimeDeps = [
+          deploy-rs.packages.${system}.deploy-rs
+          pkgs.nix
+          pkgs.openssh
+        ];
+
+        mkPackage =
+          {
+            pname,
+            extraRuntime ? [ ],
+          }:
+          pkgs.rustPlatform.buildRustPackage {
+            inherit pname;
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+
+            # One workspace, one lockfile, one package per binary.
+            cargoBuildFlags = [
+              "-p"
+              pname
+            ];
+            cargoTestFlags = [
+              "-p"
+              pname
+              "-p"
+              "deptui-core"
+            ];
+
+            nativeBuildInputs = [
+              pkgs.pkg-config
+              pkgs.makeWrapper
+              # The agent's tests drive real `git` repositories.
+              pkgs.git
+            ];
+            buildInputs = [ pkgs.openssl ];
+
+            postInstall = ''
+              wrapProgram $out/bin/${pname} \
+                --prefix PATH : ${pkgs.lib.makeBinPath (runtimeDeps ++ extraRuntime)}
+            '';
+          };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -34,10 +80,11 @@
             # Build tools
             pkg-config
 
-            # Runtime tools the TUI shells out to
+            # Runtime tools the TUI and the agent shell out to
             deploy-rs.packages.${system}.deploy-rs
             nix
             openssh
+            git
           ];
 
           # OpenSSL is unused at the moment but commonly needed once HTTPS
@@ -48,35 +95,20 @@
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
 
-        packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = "deptui";
-          version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-
-          # The workspace also carries deptui-agent; this package is the
-          # TUI alone. Tests still cover the core crate it depends on.
-          cargoBuildFlags = [ "-p" "deptui" ];
-          cargoTestFlags = [ "-p" "deptui" "-p" "deptui-core" ];
-
-          nativeBuildInputs = [
-            pkgs.pkg-config
-            pkgs.makeWrapper
-          ];
-          buildInputs = [ pkgs.openssl ];
-
-          # The TUI shells out to these at runtime.
-          postInstall = ''
-            wrapProgram $out/bin/deptui \
-              --prefix PATH : ${
-                pkgs.lib.makeBinPath [
-                  deploy-rs.packages.${system}.deploy-rs
-                  pkgs.nix
-                  pkgs.openssh
-                ]
-              }
-          '';
+        packages = {
+          deptui = mkPackage { pname = "deptui"; };
+          # `git` is the agent's own addition: ls-remote polling and the
+          # private clones it deploys from.
+          deptui-agent = mkPackage {
+            pname = "deptui-agent";
+            extraRuntime = [ pkgs.git ];
+          };
+          default = self.packages.${system}.deptui;
         };
       }
-    );
+    ))
+    // {
+      nixosModules.deptui-agent = import ./nix/module.nix { inherit self; };
+      nixosModules.default = self.nixosModules.deptui-agent;
+    };
 }

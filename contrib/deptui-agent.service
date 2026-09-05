@@ -1,0 +1,31 @@
+# deptui-agent systemd unit for non-NixOS systems.
+#
+# Install the binary somewhere on PATH (or set the absolute path in
+# ExecStart), write /etc/deptui-agent/config.toml, create the
+# deptui-agent system user and group (or change User=/Group= to an
+# existing account whose ssh identity should be used), then:
+#
+#   cp contrib/deptui-agent.service /etc/systemd/system/
+#   systemctl enable --now deptui-agent
+#
+# The control socket lands at /run/deptui-agent/agent.sock, mode 0660,
+# owned by User:Group — add operators to the group to let their deptui
+# control the agent.
+
+[Unit]
+Description=deptui auto-deploy agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/deptui-agent --config /etc/deptui-agent/config.toml run
+User=deptui-agent
+Group=deptui-agent
+StateDirectory=deptui-agent
+RuntimeDirectory=deptui-agent
+Environment=HOME=%S/deptui-agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

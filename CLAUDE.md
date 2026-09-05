@@ -4,9 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Rust + ratatui terminal UI that wraps [serokell/deploy-rs](https://github.com/serokell/deploy-rs).
+A Rust workspace wrapping [serokell/deploy-rs](https://github.com/serokell/deploy-rs).
 It does not reimplement deploy-rs — it shells out to the `deploy` binary
-and to `nix` / `ssh`. The repo is small enough to keep flat under `src/`.
+and to `nix` / `ssh` / `git`. Three crates under `crates/`:
+
+- **`deptui-core`** — everything headless: the deploy runner, flake
+  discovery, host probes, probe plumbing, ssh overrides, askpass, and
+  the agent API wire types (`agentwire`). Nothing here may depend on
+  ratatui/crossterm.
+- **`deptui`** — the ratatui frontend. Its `lib.rs` re-exports the core
+  modules under the same names, so `crate::host::…`-style paths work
+  throughout the TUI code.
+- **`deptui-agent`** — the auto-deploy daemon (see
+  `docs/agent-design.md`, the confirmed design contract): watches git
+  repos, deploys via the core runner, serves a control API on a Unix
+  socket (plus an optional token-gated TCP kick/status listener), and
+  is its own CLI client (`ssh host deptui-agent <verb> --json` is the
+  TUI's remote-control transport).
 
 ## Common commands
 
@@ -26,8 +40,9 @@ All of these assume you're inside the dev shell (`nix develop`) so that
 | nix build             | `nix build`                                   |
 
 | test (all)            | `cargo test`                                  |
-| test (unit only)      | `cargo test --lib`                             |
+| test (one crate)      | `cargo test -p deptui-agent`                   |
 | test (integration)    | `cargo test --test '*'`                        |
+| nix build (agent)     | `nix build .#deptui-agent`                     |
 
 ### Test suite
 
@@ -76,6 +91,16 @@ rendering paths:
   the real layout), and that each reachability state renders its own
   glyph in the host row.
 
+- `crates/deptui-agent/tests/agent_e2e.rs` — drives the real
+  `deptui-agent` binary (`CARGO_BIN_EXE_`) against a local git repo
+  with `nix`/`deploy`/`ssh` PATH shims passed via the child's env (no
+  global PATH mutation, so no `#[serial]`): deploy-on-update,
+  idempotence, failure parking (no same-commit retry), offline
+  catch-up (pending, not parked; deploys on return; `catch_up = false`
+  opt-out), and the daemon's socket API (status/pause/kick/history,
+  1s-recheck catch-up, SIGTERM). Test git helpers run with
+  `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` — the host's commit-signing
+  config once leaked in and failed intermittently.
 - `tests/no_color.rs` — deliberately its own binary: `theme::monochrome`
   caches in a `OnceLock`, so the environment has to be set before
   anything in the process asks. Asserts a full frame comes out with every
@@ -442,6 +467,23 @@ Key invariants worth knowing before touching the code:
 
 ## Project conventions
 
+- **The agent is headless: everything it runs must be non-interactive.**
+  `SSH_ASKPASS=/bin/false`, `GIT_TERMINAL_PROMPT=0`, sudo prompts
+  cancel the process group, `interactive_sudo` is rejected at config
+  load. If you add a new child invocation to the agent, give it the
+  same treatment — a hung prompt in a daemon is a silent outage.
+- **Agent state has one writer.** The daemon task owns `AgentState`;
+  API handlers talk to it over the `Cmd` mpsc channel and runs report
+  back the same way (mirroring the TUI's "the channel is the seam").
+  Don't hand `&mut` state to a spawned task.
+- **Offline ≠ failed.** A host down at deploy time gets outcome
+  `offline` (pending, re-probed at `offline_recheck`, deployed on
+  return); a real deploy failure parks the host until a new revision.
+  Keep the two paths distinct — collapsing them re-introduces either
+  retry storms or missed catch-ups.
+- **The TCP listener is kick+status only.** The full control surface
+  stays on the Unix socket (group-gated, 0660). Never mount another
+  route on the TCP router.
 - **Commit messages must not contain Claude session links.** No
   `Claude-Session:` trailers or `claude.ai/code/session_…` URLs —
   they are workstation-local noise in a public history. (A
