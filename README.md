@@ -230,8 +230,9 @@ Optional flags:
 | `Shift+U`      | full update check: closure size delta + package diff         |
 | `Shift+P`      | build plan preflight: what gets compiled + download size     |
 | `Shift+C`      | substituter drift: caches this deploy adds but can't use     |
-| `a` / `y` / `h` | target all profiles / system (sYs) / home (home-manager)   |
-| `s` / `b` / `d` | deploy: switch now / boot entry / dry run                  |
+| `s` / `h`       | toggle system / home profile in the deploy target (both on = all; the last one can't be turned off) |
+| `Shift+S` / `Shift+B` / `Shift+D` | deploy: switch now / boot entry / dry run  |
+| `a`            | open the agent view (auto-deploy daemon status & control)    |
 | `x`            | cancel the running deploy (kills its whole process group)    |
 | `v` / `V`      | select job-log text by char / by line (works from any pane)  |
 | `y`            | yank the visual selection to the clipboard                   |

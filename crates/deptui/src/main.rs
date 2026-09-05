@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use deptui::settings::Settings;
 use deptui::{app::App, askpass, flake, ui};
 
 /// CLI arguments. The TUI runs against a single flake reference.
@@ -71,7 +72,7 @@ async fn main() -> Result<()> {
     }
 
     let mut terminal = ui::init()?;
-    let mut app = App::new(cli.flake.clone(), nodes);
+    let mut app = App::with_settings(cli.flake.clone(), nodes, Settings::load());
     app.extra_build_args = cli.build_args;
     let result = app.run(&mut terminal).await;
     ui::restore()?;

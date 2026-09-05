@@ -363,3 +363,155 @@ fn each_reachability_state_has_its_own_glyph() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// agent view
+// ---------------------------------------------------------------------------
+
+fn agent_status() -> deptui_core::agentwire::AgentStatus {
+    use deptui_core::agentwire::*;
+    AgentStatus {
+        version: "0.1.0".into(),
+        paused: false,
+        watches: vec![WatchStatus {
+            name: "infra".into(),
+            repo: "git@example.com:me/infra.git".into(),
+            ref_label: "branch main".into(),
+            paused: false,
+            last_seen: Some("abcdef1234567890".into()),
+            next_poll: None,
+            running: None,
+            hosts: vec![
+                HostStatus {
+                    name: "alpha".into(),
+                    paused: false,
+                    deployed_rev: Some("abcdef1234567890".into()),
+                    deployed_time: Some(1),
+                    failed_rev: None,
+                    failed_time: None,
+                    failed_message: None,
+                    unreachable: None,
+                    offline_rev: None,
+                    offline_time: None,
+                },
+                HostStatus {
+                    name: "beta".into(),
+                    paused: false,
+                    deployed_rev: None,
+                    deployed_time: None,
+                    failed_rev: Some("abcdef1234567890".into()),
+                    failed_time: Some(2),
+                    failed_message: Some("boom".into()),
+                    unreachable: None,
+                    offline_rev: None,
+                    offline_time: None,
+                },
+            ],
+        }],
+    }
+}
+
+fn app_with_agent() -> App {
+    let settings: deptui::settings::Settings =
+        toml::from_str("default_agent = \"homelab\"\n[agents.homelab]\nssh = \"me@box\"\n")
+            .expect("settings");
+    App::with_settings(".".into(), nodes(), settings)
+}
+
+/// The agent view replaces the main layout wholesale; a panic or an
+/// overflow in its hand-built line assembly only shows up here.
+#[test]
+fn agent_view_renders_status_and_tail() {
+    let mut app = app_with_agent();
+    app.agent.open = true;
+    app.agent.status = Some(agent_status());
+    app.agent
+        .tail
+        .push_back("[infra] run #1 (kick): deploying".into());
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("agent"), "{out}");
+    assert!(out.contains("homelab"), "agent name missing: {out}");
+    assert!(out.contains("infra"), "watch missing: {out}");
+    assert!(out.contains("branch main"), "ref label missing: {out}");
+    assert!(
+        out.contains("FAILED abcdef1234"),
+        "failed host state missing: {out}"
+    );
+    assert!(out.contains("run #1"), "tail missing: {out}");
+    // The main layout is replaced, not underdrawn.
+    assert!(
+        !out.contains("job log"),
+        "main layout leaked through: {out}"
+    );
+}
+
+#[test]
+fn agent_view_survives_empty_status_and_errors() {
+    let mut app = app_with_agent();
+    app.agent.open = true;
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("no status yet"), "{out}");
+
+    app.agent.error = Some("connection refused".into());
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("connection refused"), "{out}");
+
+    // Tiny-but-supported size must not panic.
+    app.agent.error = None;
+    app.agent.status = Some(agent_status());
+    let _ = render(&mut app, 80, 24);
+}
+
+/// The host-list badge is part of the user-facing contract: glyph
+/// carries the state ([agent] managed, [agent!] failed, [agent~]
+/// offline-pending), colour only reinforces.
+#[test]
+fn managed_hosts_get_agent_badges_and_title_notice() {
+    use deptui::app::AgentManaged;
+    let mut app = app_with_agent();
+    app.agent_managed.insert(
+        "alpha".into(),
+        AgentManaged {
+            failed: false,
+            offline: true,
+        },
+    );
+    app.agent_managed.insert(
+        "beta".into(),
+        AgentManaged {
+            failed: true,
+            offline: false,
+        },
+    );
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("[agent~]"), "offline badge missing: {out}");
+    assert!(out.contains("[agent!]"), "failed badge missing: {out}");
+    assert!(
+        out.contains("agent: 1 host deploy(s) failed"),
+        "title notice missing: {out}"
+    );
+}
+
+/// Q28(b): the confirm popup warns when the agent manages a host in
+/// the batch and offers the one-key pause.
+#[test]
+fn confirm_popup_warns_about_agent_managed_hosts() {
+    use deptui::app::AgentManaged;
+    let mut app = app_with_agent();
+    app.agent_managed
+        .insert("alpha".into(), AgentManaged::default());
+    app.input = InputMode::ConfirmDeploy {
+        hosts: vec!["alpha".into()],
+        mode: Mode::Switch,
+        profile: ProfileSel::All,
+    };
+    let out = render(&mut app, 120, 40);
+    assert!(
+        out.contains("the agent auto-deploys some of these hosts"),
+        "warning missing: {out}"
+    );
+    assert!(
+        out.contains("pause the agent first"),
+        "p hint missing: {out}"
+    );
+}

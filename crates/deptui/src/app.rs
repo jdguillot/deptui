@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
+use crate::agentclient;
 use crate::askpass::{AskpassEnv, AskpassServer};
 use crate::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
 use crate::event::{spawn as spawn_events, AppEvent};
@@ -29,8 +30,10 @@ use crate::host::{
 use crate::joblog;
 pub use crate::joblog::{LogEntry, VisualMode, VisualSel};
 use crate::probe;
+use crate::settings::Settings;
 use crate::ssh::SshOverride;
 use crate::ui::{self, Tui};
+use deptui_core::agentwire;
 
 /// Focusable regions of the UI. Each one has its own keyboard
 /// affordance when focused: Hosts moves the selection, Toggles lets
@@ -78,7 +81,8 @@ pub enum Command {
     /// flip between "A mark all" and "X unmark" with the mark state,
     /// mirroring the long-standing Shift+A / Shift+X bindings.
     MarkAll,
-    ProfileAll,
+    /// Open the agent view (key `a`).
+    Agent,
     ProfileSystem,
     ProfileHome,
     Switch,
@@ -98,7 +102,7 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     // swaps in ("X", "unmark") while any host is marked. The real
     // bindings are the Shift+A / Shift+X arms in `handle_key_normal`.
     (Command::MarkAll, "A", "mark all"),
-    (Command::ProfileAll, "a", "all"),
+    (Command::Agent, "a", "agent"),
     (Command::ProfileSystem, "s", "sys"),
     (Command::ProfileHome, "h", "home"),
     (Command::Switch, "S", "switch"),
@@ -323,6 +327,73 @@ pub struct LastDeploy {
     pub ok: bool,
 }
 
+/// Everything the agent view needs, plus the ambient state (badges,
+/// failure notice) the main screen shows even when the view is closed.
+pub struct AgentUi {
+    /// Full-screen agent view open? Not an [`InputMode`]: password
+    /// prompts and quit confirmation must still overlay it.
+    pub open: bool,
+    /// `(name, ssh)` pairs from settings; default agent first.
+    pub agents: Vec<(String, String)>,
+    /// Index into `agents` of the one currently shown.
+    pub current: usize,
+    pub status: Option<agentwire::AgentStatus>,
+    pub error: Option<String>,
+    pub loading: bool,
+    /// Selected row in the flattened watch/host listing.
+    pub sel: usize,
+    /// Live tail from `deptui-agent tail`, capped like the job log.
+    pub tail: VecDeque<String>,
+    tail_task: Option<JoinHandle<()>>,
+    /// Last op ack, shown in the view's footer.
+    pub last_op: Option<String>,
+}
+
+impl AgentUi {
+    fn new(settings: &Settings) -> Self {
+        Self {
+            open: false,
+            agents: settings.agent_list(),
+            current: 0,
+            status: None,
+            error: None,
+            loading: false,
+            sel: 0,
+            tail: VecDeque::new(),
+            tail_task: None,
+            last_op: None,
+        }
+    }
+
+    pub fn current_agent(&self) -> Option<(&str, &str)> {
+        self.agents
+            .get(self.current)
+            .map(|(n, s)| (n.as_str(), s.as_str()))
+    }
+
+    /// Flattened `(watch index, host index)` rows of the status listing,
+    /// the order the view renders and `sel` indexes.
+    pub fn host_rows(&self) -> Vec<(usize, usize)> {
+        let Some(status) = &self.status else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for (wi, w) in status.watches.iter().enumerate() {
+            for hi in 0..w.hosts.len() {
+                rows.push((wi, hi));
+            }
+        }
+        rows
+    }
+}
+
+/// What the host list needs to know about a host the agent manages.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AgentManaged {
+    pub failed: bool,
+    pub offline: bool,
+}
+
 /// Background work updates we receive over the status channel.
 #[derive(Debug)]
 enum StatusUpdate {
@@ -331,6 +402,12 @@ enum StatusUpdate {
     /// Re-discovered flake nodes from the last `r` refresh. Merges new
     /// nodes into the running list without disturbing existing state.
     FlakeDiscover(Vec<Node>),
+    /// Agent status fetched over ssh (agent name, result).
+    AgentStatus(String, Result<agentwire::AgentStatus, String>),
+    /// Ack (or error) from a mutating agent verb.
+    AgentOp(Result<String, String>),
+    /// One live log line from `deptui-agent tail`.
+    AgentTail(String),
 }
 
 impl From<probe::Report> for StatusUpdate {
@@ -487,12 +564,24 @@ pub struct App {
     /// inside `host.rs` so the underlying nix/ssh children are
     /// reaped, not orphaned.
     probe_tasks: Vec<JoinHandle<()>>,
+    /// Agent view state + the ambient managed-host map for badges.
+    pub agent: AgentUi,
+    /// Node name → what the agent last reported about it. Drives the
+    /// host-list badge and the info-row failure notice.
+    pub agent_managed: HashMap<String, AgentManaged>,
     /// True once we receive a quit request.
     should_quit: bool,
 }
 
 impl App {
+    /// Construct with default (empty) settings — no disk reads, so
+    /// tests stay hermetic. The binary calls [`Self::with_settings`]
+    /// with [`Settings::load`].
     pub fn new(flake: String, nodes: Vec<Node>) -> Self {
+        Self::with_settings(flake, nodes, Settings::default())
+    }
+
+    pub fn with_settings(flake: String, nodes: Vec<Node>, settings: Settings) -> Self {
         let (status_tx, status_rx) = mpsc::channel(64);
         let mut status = HashMap::new();
         for n in &nodes {
@@ -547,6 +636,8 @@ impl App {
             cached_password: None,
             pending_deploy: None,
             probe_tasks: Vec::new(),
+            agent: AgentUi::new(&settings),
+            agent_managed: HashMap::new(),
             should_quit: false,
         }
     }
@@ -630,6 +721,12 @@ impl App {
         }));
 
         let mut events = spawn_events();
+
+        // Ambient agent badges: one status fetch at startup when any
+        // agent is configured (the view itself fetches again on open).
+        if !self.agent.agents.is_empty() {
+            self.fetch_agent_status();
+        }
 
         // Kick off an initial reachability sweep so the first frame isn't
         // all "unknown".
@@ -831,6 +928,15 @@ impl App {
         }
 
         // Route by current input mode.
+        // The agent view owns Normal-mode keys while open. Modal
+        // popups (password prompt, quit confirm) still take priority
+        // because their InputMode is not Normal and falls through to
+        // the dispatch below.
+        if self.agent.open && matches!(self.input, InputMode::Normal) {
+            self.handle_key_agent(key);
+            return;
+        }
+
         match std::mem::replace(&mut self.input, InputMode::Normal) {
             InputMode::Normal => {
                 self.input = InputMode::Normal;
@@ -1203,10 +1309,14 @@ impl App {
             KeyCode::Char('r') => self.refresh_reachability(),
             KeyCode::Char('u') => self.refresh_updates_for_selected(),
 
-            // Profile selection. `s` = sys (mnemonic: System), `h` = home, `a` = all.
-            KeyCode::Char('a') => self.profile_sel = ProfileSel::All,
-            KeyCode::Char('s') => self.profile_sel = ProfileSel::System,
-            KeyCode::Char('h') => self.profile_sel = ProfileSel::Home,
+            // Profile selection: `s` and `h` are independent toggles
+            // (system on/off, home on/off). Both on = deploy-rs's
+            // "all profiles"; toggling the last one off is refused so
+            // a deploy always targets something. This freed `a`, which
+            // now opens the agent view.
+            KeyCode::Char('a') => self.open_agent_view(),
+            KeyCode::Char('s') => self.toggle_profile_system(),
+            KeyCode::Char('h') => self.toggle_profile_home(),
 
             // Deploy modes — Shift versions so the lowercase letters are free
             // for profile selection above. Boot (Shift+B) is blocked when only
@@ -1354,9 +1464,9 @@ impl App {
                     self.clear_marks();
                 }
             }
-            Command::ProfileAll => self.profile_sel = ProfileSel::All,
-            Command::ProfileSystem => self.profile_sel = ProfileSel::System,
-            Command::ProfileHome => self.profile_sel = ProfileSel::Home,
+            Command::Agent => self.open_agent_view(),
+            Command::ProfileSystem => self.toggle_profile_system(),
+            Command::ProfileHome => self.toggle_profile_home(),
             Command::Switch => self.request_deploy(Mode::Switch),
             Command::Boot => self.request_deploy(Mode::Boot),
             Command::DryRun => self.request_deploy(Mode::DryRun),
@@ -1604,6 +1714,19 @@ impl App {
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.input = InputMode::Normal;
                 self.push_log("• deploy cancelled at confirmation", false);
+            }
+            // Q28(b): deploying over the agent's shoulder is the one
+            // genuinely confusing race — offer a one-key pause right
+            // in the confirmation. The popup stays open; y/n still
+            // decide the deploy itself.
+            KeyCode::Char('p') if self.agent_manages_any(&hosts) => {
+                self.agent_op(vec!["pause".into()]);
+                self.push_log("[agent] pause requested before manual deploy", false);
+                self.input = InputMode::ConfirmDeploy {
+                    hosts,
+                    mode,
+                    profile,
+                };
             }
             _ => {
                 // Re-arm the modal so unrelated keystrokes don't dismiss
@@ -2177,6 +2300,10 @@ impl App {
     /// makes the online badge honour `~/.ssh/config` (ProxyJump aside —
     /// we're still doing a direct TCP dial).
     fn refresh_reachability(&mut self) {
+        // Piggy-back the agent badge refresh on the same gesture.
+        if !self.agent.agents.is_empty() {
+            self.fetch_agent_status();
+        }
         // Flip every host into the "checking" state before spawning so
         // the UI shows the spinner on the very next frame instead of
         // waiting for the first TCP probe to return.
@@ -2548,6 +2675,55 @@ resolve the paths so they can be seeded",
     fn apply_status(&mut self, update: StatusUpdate) {
         match update {
             StatusUpdate::Probe(report) => self.apply_probe(report),
+            StatusUpdate::AgentStatus(name, result) => {
+                // Ignore replies from an agent the view has cycled away
+                // from — only the current one may write the state.
+                if self.agent.current_agent().map(|(n, _)| n == name) != Some(true) {
+                    return;
+                }
+                self.agent.loading = false;
+                match result {
+                    Ok(status) => {
+                        // Ambient managed-host map for badges + notice.
+                        self.agent_managed.clear();
+                        for w in &status.watches {
+                            for h in &w.hosts {
+                                let entry = self.agent_managed.entry(h.name.clone()).or_default();
+                                entry.failed |= h.failed_rev.is_some();
+                                entry.offline |= h.offline_rev.is_some();
+                            }
+                        }
+                        self.agent.status = Some(status);
+                        self.agent.error = None;
+                        let rows = self.agent.host_rows().len();
+                        if rows > 0 && self.agent.sel >= rows {
+                            self.agent.sel = rows - 1;
+                        }
+                    }
+                    Err(e) => {
+                        self.agent.error = Some(e);
+                    }
+                }
+            }
+            StatusUpdate::AgentOp(result) => match result {
+                Ok(msg) => {
+                    self.push_log(&format!("[agent] {msg}"), false);
+                    self.agent.last_op = Some(msg);
+                    // The op changed daemon state; re-fetch so the view
+                    // and badges catch up.
+                    self.fetch_agent_status();
+                }
+                Err(e) => {
+                    self.push_log(&format!("[agent] ! {e}"), true);
+                    self.agent.last_op = Some(format!("! {e}"));
+                }
+            },
+            StatusUpdate::AgentTail(line) => {
+                self.agent.tail.push_back(line);
+                while self.agent.tail.len() > 2000 {
+                    self.agent.tail.pop_front();
+                }
+            }
             StatusUpdate::FlakeDiscover(new_nodes) => {
                 // Merge newly discovered nodes into the running list.
                 // Nodes already present keep all their accumulated
@@ -2775,6 +2951,199 @@ resolve the paths so they can be seeded",
                 self.push_log_line(line.text, false, Some(node), line.kind);
             }
         }
+    }
+
+    // ---- agent view ----
+
+    /// Does the agent auto-deploy any of these nodes? Drives the
+    /// confirm-popup warning and its `p` shortcut.
+    pub fn agent_manages_any(&self, hosts: &[String]) -> bool {
+        hosts.iter().any(|h| self.agent_managed.contains_key(h))
+    }
+
+    /// `a` — open the full-screen agent view.
+    fn open_agent_view(&mut self) {
+        if self.agent.agents.is_empty() {
+            self.push_log(
+                &format!(
+                    "! no agents configured — add [agents.NAME] ssh = \"user@host\" to {}",
+                    Settings::config_path().display()
+                ),
+                true,
+            );
+            return;
+        }
+        self.agent.open = true;
+        self.agent.sel = 0;
+        self.fetch_agent_status();
+        self.start_agent_tail();
+    }
+
+    fn close_agent_view(&mut self) {
+        self.agent.open = false;
+        self.stop_agent_tail();
+    }
+
+    /// Kick off a background status fetch of the current agent.
+    fn fetch_agent_status(&mut self) {
+        let Some((name, ssh)) = self.agent.current_agent() else {
+            return;
+        };
+        let (name, ssh) = (name.to_string(), ssh.to_string());
+        self.agent.loading = true;
+        let tx = self.status_tx.clone();
+        let env = self.askpass_env.clone();
+        tokio::spawn(async move {
+            let result = agentclient::fetch_status(&ssh, &env)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(StatusUpdate::AgentStatus(name, result)).await;
+        });
+    }
+
+    /// Run a mutating agent verb in the background; the ack (or error)
+    /// comes back as [`StatusUpdate::AgentOp`].
+    fn agent_op(&mut self, args: Vec<String>) {
+        let Some((_, ssh)) = self.agent.current_agent() else {
+            return;
+        };
+        let ssh = ssh.to_string();
+        let tx = self.status_tx.clone();
+        let env = self.askpass_env.clone();
+        tokio::spawn(async move {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let result = agentclient::op(&ssh, &env, &refs)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(StatusUpdate::AgentOp(result)).await;
+        });
+    }
+
+    fn start_agent_tail(&mut self) {
+        self.stop_agent_tail();
+        let Some((_, ssh)) = self.agent.current_agent() else {
+            return;
+        };
+        let tx = self.status_tx.clone();
+        let handle =
+            agentclient::spawn_tail(ssh.to_string(), self.askpass_env.clone(), move |line| {
+                // Best-effort: a full channel drops tail lines rather than
+                // blocking the reader (the history endpoint has the truth).
+                let _ = tx.try_send(StatusUpdate::AgentTail(line));
+            });
+        self.agent.tail_task = Some(handle);
+    }
+
+    fn stop_agent_tail(&mut self) {
+        if let Some(task) = self.agent.tail_task.take() {
+            // kill_on_drop on the ssh child reaps it with the task.
+            task.abort();
+        }
+    }
+
+    /// Key handling while the agent view is open (Normal input mode).
+    fn handle_key_agent(&mut self, key: KeyEvent) {
+        let rows = self.agent.host_rows();
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('a') => self.close_agent_view(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !rows.is_empty() {
+                    self.agent.sel = (self.agent.sel + 1) % rows.len();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if !rows.is_empty() {
+                    self.agent.sel = (self.agent.sel + rows.len() - 1) % rows.len();
+                }
+            }
+            KeyCode::Char('r') => self.fetch_agent_status(),
+            // `u` — ask the agent to poll now (all watches).
+            KeyCode::Char('u') => self.agent_op(vec!["kick".into()]),
+            // `p` — pause/resume the selected host.
+            KeyCode::Char('p') => {
+                if let Some((watch, host, paused)) = self.selected_agent_host(&rows) {
+                    let verb = if paused { "resume" } else { "pause" };
+                    self.agent_op(vec![
+                        verb.into(),
+                        "--host".into(),
+                        host,
+                        "--watch".into(),
+                        watch,
+                    ]);
+                }
+            }
+            // `P` — pause/resume the whole agent.
+            KeyCode::Char('P') => {
+                let paused = self
+                    .agent
+                    .status
+                    .as_ref()
+                    .map(|s| s.paused)
+                    .unwrap_or(false);
+                let verb = if paused { "resume" } else { "pause" };
+                self.agent_op(vec![verb.into()]);
+            }
+            // `d` — force-deploy the selected host at the last-seen rev.
+            KeyCode::Char('d') => {
+                if let Some((watch, host, _)) = self.selected_agent_host(&rows) {
+                    self.agent_op(vec!["deploy".into(), host, "--watch".into(), watch]);
+                }
+            }
+            // `[` / `]` — cycle between configured agents.
+            KeyCode::Char('[') | KeyCode::Char(']') => {
+                let n = self.agent.agents.len();
+                if n > 1 {
+                    self.agent.current = if key.code == KeyCode::Char(']') {
+                        (self.agent.current + 1) % n
+                    } else {
+                        (self.agent.current + n - 1) % n
+                    };
+                    self.agent.status = None;
+                    self.agent.error = None;
+                    self.agent.sel = 0;
+                    self.agent.tail.clear();
+                    self.fetch_agent_status();
+                    self.start_agent_tail();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `(watch name, host name, paused)` of the selected view row.
+    fn selected_agent_host(&self, rows: &[(usize, usize)]) -> Option<(String, String, bool)> {
+        let (wi, hi) = *rows.get(self.agent.sel)?;
+        let status = self.agent.status.as_ref()?;
+        let w = status.watches.get(wi)?;
+        let h = w.hosts.get(hi)?;
+        Some((w.name.clone(), h.name.clone(), h.paused))
+    }
+
+    /// `s` — toggle the system profile in/out of the deploy target.
+    /// `profile_sel` stays the tri-state deploy-rs concept; the two
+    /// keys just walk it: both on = All. Turning the last profile off
+    /// is refused (a deploy must target something).
+    fn toggle_profile_system(&mut self) {
+        self.profile_sel = match self.profile_sel {
+            ProfileSel::All => ProfileSel::Home,
+            ProfileSel::Home => ProfileSel::All,
+            ProfileSel::System => {
+                self.push_log("! at least one profile must stay selected", true);
+                return;
+            }
+        };
+    }
+
+    /// `h` — toggle the home profile. See [`Self::toggle_profile_system`].
+    fn toggle_profile_home(&mut self) {
+        self.profile_sel = match self.profile_sel {
+            ProfileSel::All => ProfileSel::System,
+            ProfileSel::System => ProfileSel::All,
+            ProfileSel::Home => {
+                self.push_log("! at least one profile must stay selected", true);
+                return;
+            }
+        };
     }
 
     /// Build the candidate target list for `mode` and open the
@@ -4078,18 +4447,110 @@ mod tests {
         assert_eq!(app.selected, 2);
     }
 
-    #[test]
-    fn handle_key_mode_selection() {
+    // Needs a runtime: opening the view spawns the status fetch task
+    // (which fails fast against the fake ssh target and is dropped).
+    #[tokio::test]
+    async fn agent_view_opens_only_when_configured() {
+        // No agents configured: `a` logs a hint instead of opening.
         let mut app = App::new(".".into(), sample_nodes());
-        // Profile selection keys.
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert_eq!(app.profile_sel, ProfileSel::All);
+        assert!(!app.agent.open);
+        assert!(app
+            .log
+            .iter()
+            .any(|l| l.text.contains("no agents configured")));
 
+        // Configured: the view opens, q closes it, `a` toggles too.
+        let settings: crate::settings::Settings =
+            toml::from_str("[agents.box]\nssh = \"me@box\"\n").unwrap();
+        let mut app = App::with_settings(".".into(), sample_nodes(), settings);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.agent.open);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.agent.open, "q closes the agent view, not the app");
+        assert!(
+            !matches!(app.input, InputMode::ConfirmQuit { .. }),
+            "q inside the view must not raise the quit popup"
+        );
+    }
+
+    #[test]
+    fn agent_view_selection_moves_over_host_rows() {
+        let settings: crate::settings::Settings =
+            toml::from_str("[agents.box]\nssh = \"me@box\"\n").unwrap();
+        let mut app = App::with_settings(".".into(), sample_nodes(), settings);
+        app.agent.open = true;
+        app.agent.status = Some(agentwire::AgentStatus {
+            version: "0".into(),
+            paused: false,
+            watches: vec![agentwire::WatchStatus {
+                name: "w".into(),
+                repo: "r".into(),
+                ref_label: "branch main".into(),
+                paused: false,
+                last_seen: None,
+                next_poll: None,
+                running: None,
+                hosts: vec![
+                    agentwire::HostStatus {
+                        name: "a".into(),
+                        paused: false,
+                        deployed_rev: None,
+                        deployed_time: None,
+                        failed_rev: None,
+                        failed_time: None,
+                        failed_message: None,
+                        unreachable: None,
+                        offline_rev: None,
+                        offline_time: None,
+                    },
+                    agentwire::HostStatus {
+                        name: "b".into(),
+                        paused: true,
+                        deployed_rev: None,
+                        deployed_time: None,
+                        failed_rev: None,
+                        failed_time: None,
+                        failed_message: None,
+                        unreachable: None,
+                        offline_rev: None,
+                        offline_time: None,
+                    },
+                ],
+            }],
+        });
+        assert_eq!(app.agent.host_rows().len(), 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.agent.sel, 1);
+        // Wraps.
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.agent.sel, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.agent.sel, 1);
+        // The selected row resolves to (watch, host, paused).
+        let rows = app.agent.host_rows();
+        let (w, h, paused) = app.selected_agent_host(&rows).unwrap();
+        assert_eq!((w.as_str(), h.as_str(), paused), ("w", "b", true));
+    }
+
+    #[test]
+    fn handle_key_profile_toggles() {
+        let mut app = App::new(".".into(), sample_nodes());
+        // Both profiles start selected (All). `h` off → system only.
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.profile_sel, ProfileSel::System);
+
+        // Toggling the last selected profile off is refused.
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.profile_sel, ProfileSel::System);
 
+        // `h` back on → All again; `s` off → home only.
         app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.profile_sel, ProfileSel::All);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.profile_sel, ProfileSel::Home);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.profile_sel, ProfileSel::Home, "refused: last profile");
     }
 
     #[test]

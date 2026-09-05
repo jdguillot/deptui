@@ -27,7 +27,9 @@ libc.workspace = true
 # maths goes through `Line::width()` (see `compute_tail_scroll_offset`),
 # which needs no unstable API.
 ratatui = "0.30"
+serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

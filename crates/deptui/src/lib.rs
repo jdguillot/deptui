@@ -6,8 +6,10 @@
 
 pub use deptui_core::{askpass, deploy, flake, host, probe, ssh};
 
+pub mod agentclient;
 pub mod app;
 pub mod event;
 pub mod joblog;
+pub mod settings;
 pub mod theme;
 pub mod ui;

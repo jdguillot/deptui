@@ -162,12 +162,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    draw_title(frame, chunks[0], app);
-    draw_toggles_strip(frame, chunks[1], app);
-    draw_body(frame, chunks[2], app);
-    draw_commands_row(frame, chunks[3], app);
-    if needs_input_strip {
-        draw_input_strip(frame, chunks[4], app);
+    if app.agent.open {
+        // The agent view replaces the whole working area — it is a
+        // different *mode* of the app, not a pane. Popups below still
+        // overlay it (password prompts can arrive mid-view).
+        draw_agent_screen(frame, area, app);
+    } else {
+        draw_title(frame, chunks[0], app);
+        draw_toggles_strip(frame, chunks[1], app);
+        draw_body(frame, chunks[2], app);
+        draw_commands_row(frame, chunks[3], app);
+        if needs_input_strip {
+            draw_input_strip(frame, chunks[4], app);
+        }
     }
     // Note: draw_help_popup borrows `app.help_scroll` mutably, so it
     // runs after the body which already returned its &mut borrow.
@@ -330,6 +337,15 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
             "[x to cancel]",
             Style::default().fg(theme::MUTED),
         ));
+    } else if app.agent_managed.values().any(|m| m.failed) {
+        let n = app.agent_managed.values().filter(|m| m.failed).count();
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("agent: {n} host deploy(s) failed — press a"),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+        ));
     } else if let Some(last) = &app.last_deploy {
         // Only show the last-deploy chip when nothing is currently
         // running, otherwise it's noise. Bright colours so the user
@@ -475,6 +491,22 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default()
                         .fg(theme::BRAND)
                         .add_modifier(Modifier::BOLD),
+                ));
+            }
+            // Agent badge. Glyph-first (house rule): the suffix inside
+            // the bracket carries the state, colour only reinforces —
+            // `!` failed, `~` offline-pending, bare = managed and fine.
+            if let Some(m) = app.agent_managed.get(&node.name) {
+                let (label, color) = if m.failed {
+                    (" [agent!]", theme::ERROR)
+                } else if m.offline {
+                    (" [agent~]", theme::WARNING)
+                } else {
+                    (" [agent]", theme::ACCENT)
+                };
+                row.push(Span::styled(
+                    label,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ));
             }
             row.push(Span::raw("  "));
@@ -2382,8 +2414,8 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
 
         section("deploy"),
         key_line(
-            "a / s / h",
-            "target all profiles / system (NixOS) / home (home-manager)",
+            "s / h",
+            "toggle the system (NixOS) / home (home-manager) profile in the deploy target — both on = all; the last one can't be turned off",
         ),
         key_line("Shift+S", "switch — apply now (asks for confirmation)"),
         key_line(
@@ -2392,6 +2424,15 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         ),
         key_line("Shift+D", "dry-run — `deploy --dry-activate`, build + diff only"),
         key_line("x", "cancel running deploy AND drop any queued hosts (SIGKILL the child)"),
+        Line::raw(""),
+
+        section("agent"),
+        key_line("a", "open/close the agent view (configure agents in ~/.config/deptui/config.toml)"),
+        key_line("j/k", "  in the view: select host"),
+        key_line("u", "  ask the agent to check for updates now (kick)"),
+        key_line("p / P", "  pause/resume the selected host / the whole agent"),
+        key_line("d", "  force-deploy the selected host at the last-seen revision"),
+        key_line("[ / ]", "  switch between configured agents"),
         Line::raw(""),
 
         section("multi-select / batch"),
@@ -2609,6 +2650,27 @@ fn draw_confirm_popup(
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    // Q28(b): warn when the agent also auto-deploys any of these hosts
+    // — no lock exists, so offer the one-key pause right here.
+    if app.agent_manages_any(hosts) {
+        lines.push(Line::from(vec![Span::styled(
+            "⚠ the agent auto-deploys some of these hosts",
+            Style::default()
+                .fg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.push(Line::from(vec![
+            Span::styled("  press ", Style::default().fg(theme::MUTED)),
+            Span::styled(
+                "p",
+                Style::default().fg(theme::KEY).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " to pause the agent first",
+                Style::default().fg(theme::MUTED),
+            ),
+        ]));
+    }
     lines.push(Line::from(vec![
         Span::styled("hosts   ", Style::default().fg(theme::MUTED)),
         Span::styled(
@@ -3007,6 +3069,299 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+// ---------------------------------------------------------------------------
+// agent view
+// ---------------------------------------------------------------------------
+
+/// Unix-seconds variant of [`format_time_ago`] for agent wire times.
+fn format_unix_ago(t: u64) -> String {
+    format_time_ago(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
+}
+
+fn short_rev(rev: &str) -> &str {
+    &rev[..rev.len().min(10)]
+}
+
+/// The full-screen agent view: connection header, watch/host listing
+/// with runtime controls, and the live run-log tail. Replaces the main
+/// layout while [`App::agent`] is open; popups still draw on top.
+fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // --- header ---
+    let mut spans = vec![Span::styled(
+        " agent ",
+        Style::default()
+            .bg(theme::BRAND)
+            .fg(theme::ON_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some((name, ssh)) = app.agent.current_agent() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            name.to_string(),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" ({ssh})"),
+            Style::default().fg(theme::MUTED),
+        ));
+    }
+    if app.agent.agents.len() > 1 {
+        spans.push(Span::styled(
+            format!("  [{}/{}]", app.agent.current + 1, app.agent.agents.len()),
+            Style::default().fg(theme::MUTED),
+        ));
+    }
+    if let Some(status) = &app.agent.status {
+        spans.push(Span::styled(
+            format!("  v{}", status.version),
+            Style::default().fg(theme::MUTED),
+        ));
+        if status.paused {
+            spans.push(Span::styled(
+                "  [PAUSED]",
+                Style::default()
+                    .fg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    if app.agent.loading {
+        let sp = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
+        spans.push(Span::styled(
+            format!("  {sp} fetching…"),
+            Style::default().fg(theme::BUSY),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+
+    // --- body: watches (left) | live log (right) ---
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(chunks[1]);
+    draw_agent_watches(frame, body[0], app);
+    draw_agent_tail(frame, body[1], app);
+
+    // --- footer ---
+    let mut foot = vec![Span::styled(
+        " j/k select  u kick  p pause host  P pause agent  d deploy  r refresh  [/] agent  q close",
+        Style::default().fg(theme::MUTED),
+    )];
+    if let Some(op) = &app.agent.last_op {
+        foot.push(Span::styled(
+            format!("  │ {op}"),
+            Style::default().fg(theme::ACCENT),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(foot)), chunks[2]);
+}
+
+fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::MUTED))
+        .title(Span::styled(
+            " watches ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(err) = &app.agent.error {
+        lines.push(Line::from(Span::styled(
+            format!("! {err}"),
+            Style::default().fg(theme::ERROR),
+        )));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "r retries — is the agent running and reachable over ssh?",
+            Style::default().fg(theme::MUTED),
+        )));
+    } else if let Some(status) = &app.agent.status {
+        let mut row_idx = 0usize;
+        for w in &status.watches {
+            let mut head = vec![
+                Span::styled(
+                    w.name.clone(),
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", w.ref_label),
+                    Style::default().fg(theme::MUTED),
+                ),
+            ];
+            if let Some(rev) = &w.last_seen {
+                head.push(Span::styled(
+                    format!("  @{}", short_rev(rev)),
+                    Style::default().fg(theme::MUTED),
+                ));
+            }
+            if w.paused {
+                head.push(Span::styled(
+                    "  [paused]",
+                    Style::default().fg(theme::WARNING),
+                ));
+            }
+            if let Some(r) = &w.running {
+                head.push(Span::styled(
+                    format!("  ⟳ deploying {} ({})", short_rev(&r.rev), r.trigger),
+                    Style::default().fg(theme::BUSY),
+                ));
+            } else if let Some(t) = w.next_poll {
+                head.push(Span::styled(
+                    format!("  next poll {}", format_unix_ago_or_in(t)),
+                    Style::default().fg(theme::MUTED),
+                ));
+            }
+            lines.push(Line::from(head));
+
+            for h in &w.hosts {
+                let is_sel = app.agent.sel == row_idx;
+                row_idx += 1;
+
+                // Glyph carries the state (colour reinforces).
+                let (glyph, style) = if h.failed_rev.is_some() {
+                    ("!", Style::default().fg(theme::ERROR))
+                } else if h.offline_rev.is_some() {
+                    ("~", Style::default().fg(theme::WARNING))
+                } else if h.paused {
+                    ("‖", Style::default().fg(theme::MUTED))
+                } else if h.deployed_rev.is_some() {
+                    ("✓", Style::default().fg(theme::SUCCESS))
+                } else {
+                    ("·", Style::default().fg(theme::MUTED))
+                };
+                let mut state = Vec::new();
+                if h.paused {
+                    state.push("paused".to_string());
+                }
+                if let (Some(rev), Some(t)) = (&h.deployed_rev, h.deployed_time) {
+                    state.push(format!(
+                        "deployed {} {}",
+                        short_rev(rev),
+                        format_unix_ago(t)
+                    ));
+                }
+                if let Some(rev) = &h.failed_rev {
+                    state.push(format!("FAILED {}", short_rev(rev)));
+                }
+                if let (Some(rev), Some(t)) = (&h.offline_rev, h.offline_time) {
+                    state.push(format!(
+                        "offline {} — {} pending",
+                        format_unix_ago(t),
+                        short_rev(rev)
+                    ));
+                }
+                if let Some(u) = &h.unreachable {
+                    state.push(format!("unreachable: {u}"));
+                }
+                if state.is_empty() {
+                    state.push("never deployed".to_string());
+                }
+                let name_style = if is_sel {
+                    Style::default()
+                        .fg(theme::ON_ACCENT)
+                        .bg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(glyph.to_string(), style),
+                    Span::raw(" "),
+                    Span::styled(h.name.clone(), name_style),
+                    Span::styled(
+                        format!("  {}", state.join("; ")),
+                        Style::default().fg(theme::MUTED),
+                    ),
+                ]));
+            }
+            lines.push(Line::raw(""));
+        }
+    } else if app.agent.loading {
+        lines.push(Line::from(Span::styled(
+            "fetching agent status…",
+            Style::default().fg(theme::BUSY),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "no status yet — r to fetch",
+            Style::default().fg(theme::MUTED),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// "in 3m" / "12s ago" for next-poll stamps that can sit either side
+/// of now.
+fn format_unix_ago_or_in(t: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if t > now {
+        let secs = t - now;
+        if secs < 60 {
+            format!("in {secs}s")
+        } else if secs < 3600 {
+            format!("in {}m", secs / 60)
+        } else {
+            format!("in {}h", secs / 3600)
+        }
+    } else {
+        format_unix_ago(t)
+    }
+}
+
+fn draw_agent_tail(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::MUTED))
+        .title(Span::styled(
+            " agent log (live) ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Tail-window: the last lines that fit, like the job log's tail.
+    let viewport = inner.height as usize;
+    let start = app.agent.tail.len().saturating_sub(viewport);
+    let lines: Vec<Line> = app
+        .agent
+        .tail
+        .iter()
+        .skip(start)
+        .map(|l| Line::raw(l.clone()))
+        .collect();
+    if lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "waiting for agent output…",
+                Style::default().fg(theme::MUTED),
+            ))),
+            inner,
+        );
+    } else {
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
 }
 
 #[cfg(test)]
