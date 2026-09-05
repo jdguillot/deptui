@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Shared fast-iteration push: debug-build one of the workspace binaries
+# and copy it to a host, skipping the nix sandbox entirely (cargo's
+# incremental build, a few seconds after the first). Use the wrappers:
+#
+#   scripts/dev-agent me@deploy-box    # deptui-agent
+#   scripts/dev-tui   me@deploy-box    # deptui
+#
+# Caveat: a debug binary built on this machine links this machine's
+# nix-store glibc. Between two NixOS boxes on similar channels that
+# resolves fine; if the exec fails with "No such file or directory",
+# fall back to `nix build .#<pkg> && nix copy --to ssh-ng://HOST ./result`
+# or build from the repo clone on the target.
+set -euo pipefail
+
+pkg="${1:?internal: package name}"
+target="${2:?usage: scripts/dev-${1#deptui-} <ssh-target>}"
+here="$(cd "$(dirname "$0")/.." && pwd)"
+
+echo ">> cargo build -p $pkg (debug)"
+cargo build --manifest-path "$here/Cargo.toml" -p "$pkg"
+
+bin="$here/target/debug/$pkg"
+dest="/tmp/$pkg-dev"
+echo ">> pushing to $target:$dest"
+rsync -z --info=progress2 "$bin" "$target:$dest" 2>/dev/null \
+  || scp -q "$bin" "$target:$dest"
+ssh "$target" chmod +x "$dest"
+
+version="$(ssh "$target" "$dest" --version 2>/dev/null || true)"
+if [ -n "$version" ]; then
+  echo ">> on $target: $version"
+else
+  echo "!! pushed, but the binary did not run on $target — likely a glibc"
+  echo "   mismatch; see the caveat at the top of scripts/dev-push."
+  exit 1
+fi
+
+case "$pkg" in
+  deptui-agent)
+    echo ">> run it there:"
+    echo "   sudo systemctl stop deptui-agent   # if the service is running"
+    echo "   $dest --config /etc/deptui-agent/config.toml run"
+    ;;
+  deptui)
+    echo ">> run it there (needs deploy, nix, and ssh on that host's PATH —"
+    echo "   the wrapped nix package normally provides them; for the debug"
+    echo "   binary, install deploy-rs or: nix shell github:serokell/deploy-rs):"
+    echo "   $dest /path/to/flake"
+    ;;
+esac

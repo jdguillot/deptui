@@ -336,15 +336,17 @@ cargo run -p deptui-agent -- --config /tmp/agent-test/config.toml check
 cargo test -p deptui-agent       # the agent's e2e suite runs against shims
 ```
 
-To try agent changes on a real host without a nix rebuild:
+To try changes on a real host without a nix rebuild:
 
 ```bash
-scripts/dev-agent me@deploy-box   # debug build + push to /tmp/deptui-agent-dev
+scripts/dev-agent me@deploy-box   # push deptui-agent → /tmp/deptui-agent-dev
+scripts/dev-tui   me@deploy-box   # push deptui       → /tmp/deptui-dev
 ```
 
-then run it there against the real config (stop the service first so
-they don't fight over the socket). `nix build` is for release-shaped
-artifacts, not the edit loop.
+Each prints how to run its binary there (the agent: against the real
+config with the service stopped; the TUI: needs `deploy`/`nix`/`ssh`
+on that host's PATH). `nix build` is for release-shaped artifacts,
+not the edit loop.
 
 ## Building
 

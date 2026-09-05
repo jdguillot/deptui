@@ -12,9 +12,9 @@ release is tagged `vX.Y.Z`.
 
 ### Added
 
-- `scripts/dev-agent <ssh-target>`: debug-build deptui-agent and push
-  it to a host for fast iteration without a nix rebuild; README gains
-  a "Development loop" section.
+- `scripts/dev-agent` / `scripts/dev-tui` (shared `scripts/dev-push`):
+  debug-build either binary and push it to a host for fast iteration
+  without a nix rebuild; README gains a "Development loop" section.
 
 ## [0.4.0] — 2026-09-05
 

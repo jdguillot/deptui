@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Debug-build deptui (the TUI) and push it to a host — for testing the
+# TUI on the agent box or any other machine. See scripts/dev-push.
+exec "$(dirname "$0")/dev-push" deptui "$@"
