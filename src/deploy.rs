@@ -1007,6 +1007,17 @@ fn strip_ansi(input: &str) -> String {
         }
         i += 1;
     }
+    // Emoji variation selectors (VS15/VS16) flip a character between
+    // text and emoji presentation — and with it the *rendered* width
+    // between 1 and 2 columns, while width models disagree on which to
+    // count. deploy-rs prefixes lines with `ℹ️`-style sequences
+    // (U+2139 U+FE0F), and one mis-counted column shifts the rest of
+    // the row: the line's last character lands in a cell ratatui
+    // believes is empty and never repaints, leaving ghost letters
+    // pinned to the right edge of the pane. Dropping the selector
+    // renders the base character in its narrow text presentation,
+    // which every width model agrees is one column.
+    out.retain(|c| !matches!(c, '\u{FE0E}' | '\u{FE0F}'));
     out
 }
 /// Read from the child's stderr byte-by-byte so we can detect partial-line
@@ -1473,6 +1484,19 @@ mod tests {
         // \x7f (DEL) → stripped.
         let input = "warn\x05ing \x1b ok\x7f";
         assert_eq!(strip_ansi(input), "warning ok");
+    }
+
+    #[test]
+    fn strip_ansi_drops_emoji_variation_selectors() {
+        // deploy-rs prefixes lines with emoji-presentation sequences
+        // (`ℹ️` = U+2139 U+FE0F); the selector makes terminals render
+        // two columns where width models may count one, ghosting the
+        // row's last character past the pane edge. The base char stays.
+        let input = "\u{1F680} \u{2139}\u{FE0F} [deploy] [INFO] checks";
+        assert_eq!(
+            strip_ansi(input),
+            "\u{1F680} \u{2139} [deploy] [INFO] checks"
+        );
     }
 
     // ---- is_sudo_prompt ----

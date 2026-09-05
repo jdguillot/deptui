@@ -260,7 +260,11 @@ Key invariants worth knowing before touching the code:
   `deploy.rs::strip_ansi` removes any ANSI escape sequences (CSI, OSC,
   bare ESC, control bytes) that leak through from nested `nix`/`ssh`
   children — without this, ratatui's width accounting drifts and
-  characters get dropped from the visible text.
+  characters get dropped from the visible text. It also drops emoji
+  variation selectors (VS15/VS16): deploy-rs's `ℹ️`-style prefixes
+  render 2 columns where width models may count 1, which shifted the
+  rest of the row and left the line's last character ghosted in a cell
+  ratatui never repaints.
 - **`Shift+U` chains size + package diff.** There is no separate `p`
   keybind. When a `SizeProbe` Ok arrives in `apply_status`, it
   auto-triggers `spawn_pkg_diff_for_profile` for the same
