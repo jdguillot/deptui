@@ -74,8 +74,9 @@ pub const TOGGLE_COUNT: usize = deploy::TOGGLES.len();
 pub enum Command {
     Refresh,
     Updates,
-    /// Mark every host / clear all marks — the label flips between
-    /// "mark all" and "unmark" depending on whether anything is marked.
+    /// Mark every host / clear all marks. The button's key + label
+    /// flip between "A mark all" and "X unmark" with the mark state,
+    /// mirroring the long-standing Shift+A / Shift+X bindings.
     MarkAll,
     ProfileAll,
     ProfileSystem,
@@ -93,9 +94,10 @@ pub enum Command {
 pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Refresh, "r", "refresh"),
     (Command::Updates, "u", "updates"),
-    // The label column holds the widest spelling; `ui::command_label`
-    // swaps in "unmark" while any host is marked.
-    (Command::MarkAll, "m", "mark all"),
+    // The stored key/label are the unmarked spelling; `ui::command_hint`
+    // swaps in ("X", "unmark") while any host is marked. The real
+    // bindings are the Shift+A / Shift+X arms in `handle_key_normal`.
+    (Command::MarkAll, "A", "mark all"),
     (Command::ProfileAll, "a", "all"),
     (Command::ProfileSystem, "s", "sys"),
     (Command::ProfileHome, "h", "home"),
@@ -1200,8 +1202,6 @@ impl App {
         match key.code {
             KeyCode::Char('r') => self.refresh_reachability(),
             KeyCode::Char('u') => self.refresh_updates_for_selected(),
-            // `m` = mark all / unmark all; Space (Hosts pane) marks one.
-            KeyCode::Char('m') => self.toggle_mark_all(),
 
             // Profile selection. `s` = sys (mnemonic: System), `h` = home, `a` = all.
             KeyCode::Char('a') => self.profile_sel = ProfileSel::All,
@@ -1347,7 +1347,13 @@ impl App {
         match cmd {
             Command::Refresh => self.refresh_reachability(),
             Command::Updates => self.refresh_updates_for_selected(),
-            Command::MarkAll => self.toggle_mark_all(),
+            Command::MarkAll => {
+                if self.marked.is_empty() {
+                    self.mark_all();
+                } else {
+                    self.clear_marks();
+                }
+            }
             Command::ProfileAll => self.profile_sel = ProfileSel::All,
             Command::ProfileSystem => self.profile_sel = ProfileSel::System,
             Command::ProfileHome => self.profile_sel = ProfileSel::Home,
@@ -1927,23 +1933,6 @@ impl App {
     fn log_toggle(&mut self, name: &str, value: bool) {
         let state = if value { "on" } else { "off" };
         self.push_log(format!("• {name} = {state}").as_str(), false);
-    }
-
-    /// Mark every host, or clear all marks when any exist. Backs the
-    /// commands-pane "mark all"/"unmark" button and the global `m` key,
-    /// complementing Space's mark-one-host.
-    fn toggle_mark_all(&mut self) {
-        if self.marked.is_empty() {
-            self.marked = self.nodes.iter().map(|n| n.name.clone()).collect();
-            self.push_log(
-                format!("• marked all {} host(s)", self.marked.len()).as_str(),
-                false,
-            );
-        } else {
-            let n = self.marked.len();
-            self.marked.clear();
-            self.push_log(format!("• unmarked {n} host(s)").as_str(), false);
-        }
     }
 
     fn toggle_mark_selected(&mut self) {
@@ -4007,21 +3996,34 @@ mod tests {
         assert_eq!(COMMANDS[0].1, "r");
         assert!(COMMANDS
             .iter()
-            .any(|(c, k, _)| *c == Command::MarkAll && *k == "m"));
+            .any(|(c, k, _)| *c == Command::MarkAll && *k == "A"));
     }
 
     #[test]
-    fn m_toggles_between_mark_all_and_unmark_all() {
+    fn shift_a_marks_all_and_shift_x_clears_marks() {
         let mut app = App::new(".".into(), sample_nodes());
         assert!(app.marked.is_empty());
-        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
         assert_eq!(
             app.marked.len(),
             app.nodes.len(),
-            "first press marks every host"
+            "Shift+A marks every host"
         );
-        app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
-        assert!(app.marked.is_empty(), "second press clears all marks");
+        app.handle_key(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert!(app.marked.is_empty(), "Shift+X clears all marks");
+    }
+
+    #[test]
+    fn mark_all_command_button_follows_the_mark_state() {
+        let mut app = App::new(".".into(), sample_nodes());
+        let idx = COMMANDS
+            .iter()
+            .position(|(c, _, _)| *c == Command::MarkAll)
+            .expect("mark-all button present");
+        app.activate_command(idx);
+        assert_eq!(app.marked.len(), app.nodes.len(), "button marks all");
+        app.activate_command(idx);
+        assert!(app.marked.is_empty(), "button clears marks when any exist");
     }
 
     #[test]
