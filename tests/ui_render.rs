@@ -87,10 +87,14 @@ fn renders_the_default_screen() {
 }
 
 /// The adaptive-height logic in `draw` measures content against column
-/// widths; narrow terminals are where it decides to grow the strips.
+/// widths; the narrow end of the *supported* range is where it decides
+/// to grow the strips. Anything below `MIN_WIDTH` x `MIN_HEIGHT` never
+/// reaches that code — it gets the resize message instead, which
+/// `too_small_terminals_get_a_resize_message_instead_of_a_broken_layout`
+/// covers.
 #[test]
 fn renders_at_awkward_terminal_sizes() {
-    for (w, h) in [(40, 12), (60, 20), (200, 60), (240, 80)] {
+    for (w, h) in [(80, 24), (86, 30), (200, 60), (240, 80)] {
         let mut app = App::new(".".into(), nodes());
         for i in 0..50 {
             log_line(&mut app, &format!("line {i}"), "alpha");
@@ -102,7 +106,8 @@ fn renders_at_awkward_terminal_sizes() {
 
 /// A terminal smaller than the layout's own minimums must not panic —
 /// the user can drag a window to any size at any moment, including while
-/// a popup is open.
+/// a popup is open. These sizes take the resize-message path, which is
+/// itself rendered into an area of one cell in the worst case.
 #[test]
 fn survives_a_terminal_too_small_for_the_layout() {
     for (w, h) in [(1, 1), (2, 3), (10, 3), (20, 5), (5, 40)] {
@@ -186,10 +191,19 @@ fn renders_every_popup_without_panicking() {
         ),
     ];
     for (label, mode) in modes {
-        let mut app = App::new(".".into(), nodes());
-        app.input = mode;
-        let out = render(&mut app, 120, 40);
-        assert!(!out.trim().is_empty(), "{label} rendered nothing");
+        // Both a roomy terminal and the smallest one that still draws the
+        // real layout: `centered_rect` divides the area down, so the
+        // minimum size is where a popup's own maths is most likely to
+        // collapse to zero rows.
+        for (w, h) in [(120, 40), (80, 24)] {
+            let mut app = App::new(".".into(), nodes());
+            app.input = mode.clone();
+            let out = render(&mut app, w, h);
+            assert!(
+                !out.trim().is_empty(),
+                "{label} rendered nothing at {w}x{h}"
+            );
+        }
     }
 }
 
@@ -267,4 +281,84 @@ fn visual_selection_renders() {
     });
     let out = render(&mut app, 120, 40);
     assert!(out.contains("VISUAL"), "visual mode chip missing: {out}");
+}
+
+/// Below the layout's honest minimum the UI must say so rather than draw
+/// five panes whose contents no longer fit inside them. The message has
+/// to carry the numbers — "too small" alone leaves the user guessing how
+/// much bigger.
+#[test]
+fn too_small_terminals_get_a_resize_message_instead_of_a_broken_layout() {
+    for (w, h) in [(79, 40), (120, 23), (40, 12), (20, 6)] {
+        let mut app = App::new(".".into(), nodes());
+        log_line(&mut app, "some output", "alpha");
+        let out = render(&mut app, w, h);
+        assert!(
+            out.contains("terminal too small"),
+            "no resize message at {w}x{h}: {out}",
+        );
+        assert!(
+            !out.contains("job log"),
+            "real layout still drawn at {w}x{h}: {out}",
+        );
+        // Only the wider cases have room for the second line; the point
+        // is that the ones that do actually report both sizes.
+        if w >= 40 && h >= 3 {
+            assert!(out.contains("80x24"), "required size missing: {out}");
+        }
+    }
+}
+
+/// The exact boundary renders the real thing — an off-by-one here would
+/// hide the app from anyone running a stock 80x24 terminal.
+#[test]
+fn the_minimum_size_renders_the_real_layout() {
+    let mut app = App::new(".".into(), nodes());
+    let out = render(&mut app, 80, 24);
+    assert!(!out.contains("terminal too small"), "gated at 80x24: {out}");
+    assert!(out.contains("job log"), "job log pane missing: {out}");
+}
+
+/// Reachability is the one host-list column where colour used to be the
+/// only signal. Each state needs its own glyph so the list survives
+/// `NO_COLOR`, a monochrome terminal, and red/green colour blindness.
+#[test]
+fn each_reachability_state_has_its_own_glyph() {
+    use deptui::host::{HostStatus, Reachability};
+
+    // Assert against the host row itself: the toggles strip draws the
+    // very same filled/hollow circles for its on/off dots, so a
+    // whole-screen substring search would pass no matter what this
+    // column rendered.
+    fn host_row(out: &str, host: &str) -> String {
+        out.lines()
+            .find(|l| l.contains(host) && l.contains("sys:"))
+            .unwrap_or_else(|| panic!("no host row for `{host}`: {out}"))
+            .to_string()
+    }
+
+    for (reach, glyph, others) in [
+        (Reachability::Online, "\u{25cf}", ["\u{25cb}", "\u{b7}"]),
+        (Reachability::Offline, "\u{25cb}", ["\u{25cf}", "\u{b7}"]),
+        (Reachability::Unknown, "\u{b7}", ["\u{25cf}", "\u{25cb}"]),
+    ] {
+        let mut app = App::new(".".into(), nodes());
+        app.status.insert(
+            "alpha".to_string(),
+            HostStatus {
+                reachability: reach,
+                ..Default::default()
+            },
+        );
+
+        let out = render(&mut app, 120, 40);
+        let row = host_row(&out, "alpha");
+        assert!(row.contains(glyph), "{reach:?} lost its glyph: {row}");
+        for other in others {
+            assert!(
+                !row.contains(other),
+                "{reach:?} rendered as `{other}`, which belongs to another state: {row}",
+            );
+        }
+    }
 }

@@ -10,7 +10,10 @@ use std::io::{stdout, Stdout};
 use anyhow::{Context, Result};
 use crossterm::{
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -27,6 +30,7 @@ use crate::app::{
 };
 use crate::deploy::{Mode, ProfileSel};
 use crate::host::{Reachability, UpdateState};
+use crate::theme;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -71,8 +75,31 @@ pub fn restore() -> Result<()> {
     Ok(())
 }
 
+/// Smallest terminal this layout is honest at.
+///
+/// The body needs 16 rows before the details pane (11 summary rows + 2
+/// borders) crowds the host list out entirely, and the two-column split
+/// gives the host pane only 35% of the width — under 80 columns a row
+/// like `+ ● hostname [ssh]  sys:✓ home:✓` no longer fits. Rather than
+/// render a layout whose panes silently lie about their contents, we say
+/// so and wait for the resize. 80x24 is also the conventional floor, so
+/// nobody is surprised by the number.
+const MIN_WIDTH: u16 = 80;
+const MIN_HEIGHT: u16 = 24;
+
+/// Paint one frame of the app.
+///
+/// Prefer [`render`], which wraps this in a synchronized update. This is
+/// public for the render tests, which drive a `TestBackend` directly and
+/// have no terminal to synchronize against.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        draw_too_small(frame, area);
+        finish_frame(frame, area);
+        return;
+    }
 
     // Vertical layout, top → bottom:
     //   1. title bar
@@ -179,6 +206,103 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     {
         draw_password_popup(frame, area, prompt, buf, source);
     }
+
+    finish_frame(frame, area);
+}
+
+/// Last pass over a finished frame: drop every colour when the user has
+/// asked for monochrome. Runs after the popups so nothing painted later
+/// can sneak a colour back in.
+fn finish_frame(frame: &mut Frame, area: Rect) {
+    if theme::monochrome() {
+        frame.render_widget(theme::Monochrome, area);
+    }
+}
+
+/// The whole screen when the terminal is below [`MIN_WIDTH`] x
+/// [`MIN_HEIGHT`].
+///
+/// Deliberately plain: no borders, no centring maths that could underflow,
+/// and every line optional. This is the one screen guaranteed to be drawn
+/// into an area we already know is too small for the real layout, and a
+/// panic here would take the TUI down mid-resize. It names the actual
+/// numbers because "too small" without them just prompts the user to
+/// guess how much bigger.
+fn draw_too_small(frame: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(Span::styled(
+            " terminal too small",
+            Style::default()
+                .fg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(" need ", Style::default().fg(theme::MUTED)),
+            Span::raw(format!("{MIN_WIDTH}x{MIN_HEIGHT}")),
+            Span::styled("  have ", Style::default().fg(theme::MUTED)),
+            Span::styled(
+                format!("{}x{}", area.width, area.height),
+                Style::default().fg(theme::ERROR),
+            ),
+        ]),
+        Line::from(Span::styled(
+            " resize, or q / Ctrl-C to quit",
+            Style::default().fg(theme::MUTED),
+        )),
+    ];
+
+    // Centre vertically, but only once the area is provably wide enough
+    // that no line wraps (the longest is 30 columns) and tall enough to
+    // spare the rows. Below that, top-left is the one placement that
+    // cannot push the message off the bottom of the screen.
+    const LONGEST_LINE: u16 = 30;
+    let area = if area.width >= LONGEST_LINE && area.height >= lines.len() as u16 * 2 {
+        let top = (area.height - lines.len() as u16) / 2;
+        Rect {
+            y: area.y + top,
+            height: area.height - top,
+            ..area
+        }
+    } else {
+        area
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
+/// Draw one frame inside a terminal *synchronized update*.
+///
+/// A ratatui pass writes its diff as a stream of cursor moves and cell
+/// writes; a terminal that repaints partway through shows the frame
+/// half-applied, which reads as tearing while the job log scrolls.
+/// `CSI ? 2026 h` / `l` asks the terminal to hold its repaint until the
+/// whole frame has arrived. Terminals that don't implement it ignore the
+/// private mode, so this costs nothing where it isn't supported.
+///
+/// The guard ends the update on drop, so a failed `draw` cannot leave the
+/// terminal holding its output forever.
+pub fn render(terminal: &mut Tui, app: &mut App) -> Result<()> {
+    let _sync = SyncUpdate::begin();
+    terminal
+        .draw(|f| draw(f, app))
+        .context("rendering a frame")?;
+    Ok(())
+}
+
+struct SyncUpdate;
+
+impl SyncUpdate {
+    fn begin() -> Self {
+        // Best-effort: a terminal that rejects the sequence still gets a
+        // correct (just un-synchronized) frame.
+        let _ = execute!(stdout(), BeginSynchronizedUpdate);
+        Self
+    }
+}
+
+impl Drop for SyncUpdate {
+    fn drop(&mut self) {
+        let _ = execute!(stdout(), EndSynchronizedUpdate);
+    }
 }
 
 fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
@@ -186,18 +310,18 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             " deptui ",
             Style::default()
-                .bg(Color::Magenta)
-                .fg(Color::Black)
+                .bg(theme::BRAND)
+                .fg(theme::ON_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(&app.flake, Style::default().fg(Color::Cyan)),
+        Span::styled(&app.flake, Style::default().fg(theme::ACCENT)),
     ];
     if let Some(busy) = &app.busy_label {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("⟳ {busy}"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::BUSY),
         ));
         // Hint that the running job can be cancelled with `x`. Always
         // visible during a deploy so the user doesn't have to dig
@@ -205,7 +329,7 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             "[x to cancel]",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         ));
     } else if let Some(last) = &app.last_deploy {
         // Only show the last-deploy chip when nothing is currently
@@ -221,9 +345,9 @@ fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
 /// bar and the details summary so the same status is consistent.
 fn deploy_outcome_chip(last: &LastDeploy) -> Span<'static> {
     let (icon, label, bg) = if last.ok {
-        ("✓", "DONE", Color::Green)
+        ("✓", "DONE", theme::SUCCESS)
     } else {
-        ("✗", "FAILED", Color::Red)
+        ("✗", "FAILED", theme::ERROR)
     };
     Span::styled(
         format!(
@@ -235,7 +359,7 @@ fn deploy_outcome_chip(last: &LastDeploy) -> Span<'static> {
         ),
         Style::default()
             .bg(bg)
-            .fg(Color::Black)
+            .fg(theme::ON_ACCENT)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -299,15 +423,9 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
             // `u` refresh (the user asked for parity).
             let reach = if status.checking_reachability {
                 let frame = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
-                Span::styled(frame.to_string(), Style::default().fg(Color::Cyan))
+                Span::styled(frame.to_string(), Style::default().fg(theme::ACCENT))
             } else {
-                match status.reachability {
-                    Reachability::Online => Span::styled("●", Style::default().fg(Color::Green)),
-                    Reachability::Offline => Span::styled("●", Style::default().fg(Color::Red)),
-                    Reachability::Unknown => {
-                        Span::styled("●", Style::default().fg(Color::DarkGray))
-                    }
-                }
+                reachability_dot(status.reachability)
             };
             let sys = badge(
                 "sys",
@@ -326,8 +444,8 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
             let selected = i == app.selected;
             let name_style = if selected {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(theme::ON_ACCENT)
+                    .bg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -339,7 +457,7 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(
                     "+",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme::ACCENT)
                         .add_modifier(Modifier::BOLD),
                 )
             } else {
@@ -358,7 +476,7 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
                 row.push(Span::styled(
                     " [ssh]",
                     Style::default()
-                        .fg(Color::Magenta)
+                        .fg(theme::BRAND)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -388,7 +506,7 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
         title_spans.push(Span::styled(
             count_label,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -401,15 +519,35 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(list, area);
 }
 
-/// Border colour for a pane that can hold focus: magenta when the
-/// pane owns the keyboard, default otherwise. Shares the colour
-/// with the override chips/input strip so "this thing is active /
-/// interactive" is one consistent visual cue across the UI.
+/// The one-glyph reachability indicator in the host list.
+///
+/// The glyph carries the state on its own — filled, hollow, absent —
+/// because colour cannot. A red/green pair is the textbook failure for
+/// deuteranopia, and under `NO_COLOR` all three dots would collapse into
+/// the same character. The `sys:`/`home:` badges next to it already work
+/// this way; this column was the last colour-only signal in the UI.
+fn reachability_dot(reach: Reachability) -> Span<'static> {
+    let (glyph, color) = match reach {
+        Reachability::Online => ("●", theme::SUCCESS),
+        Reachability::Offline => ("○", theme::ERROR),
+        Reachability::Unknown => ("·", theme::MUTED),
+    };
+    Span::styled(glyph, Style::default().fg(color))
+}
+
+/// Border colour for a pane that can hold focus: [`theme::FOCUS`] when
+/// the pane owns the keyboard, [`theme::MUTED`] otherwise. The same hue
+/// marks the pane's title and its jump letter, so "this pane has the
+/// keyboard" is one consistent cue across the UI.
 fn focus_border_style(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme::FOCUS)
     } else {
-        Style::default()
+        // Muted rather than default-coloured. With five bordered panes on
+        // screen, a focus ring that only differs in *hue* from four
+        // equally-bright neighbours is easy to lose; dimming the other
+        // four makes the focused one the brightest thing in the frame.
+        Style::default().fg(theme::MUTED)
     }
 }
 
@@ -419,7 +557,7 @@ fn focus_border_style(focused: bool) -> Style {
 fn focus_title_style(focused: bool) -> Style {
     if focused {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme::FOCUS)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -435,7 +573,7 @@ fn focus_title_style(focused: bool) -> Style {
 /// prefixed as `[l] label`.
 fn pane_title_spans(label: &str, jump: char, focused: bool) -> Vec<Span<'static>> {
     let base = focus_title_style(focused);
-    let hot = Style::default().fg(Color::Yellow).add_modifier(
+    let hot = Style::default().fg(theme::FOCUS).add_modifier(
         Modifier::BOLD
             | if focused {
                 Modifier::REVERSED
@@ -485,7 +623,7 @@ fn badge(
     tick: u64,
 ) -> Span<'static> {
     if !present {
-        return Span::styled(format!("{label}:-"), Style::default().fg(Color::DarkGray));
+        return Span::styled(format!("{label}:-"), Style::default().fg(theme::MUTED));
     }
     if checking {
         // Render the previous icon (dimmed) followed by the spinner so the
@@ -504,14 +642,14 @@ fn badge(
             Some(p) => format!("{label}:{p}{frame}"),
             None => format!("{label}:{frame}"),
         };
-        return Span::styled(text, Style::default().fg(Color::Cyan));
+        return Span::styled(text, Style::default().fg(theme::ACCENT));
     }
     let (icon, color) = match state {
-        UpdateState::UpToDate => ("✓", Color::Green),
-        UpdateState::NeedsUpdate => ("↑", Color::Yellow),
-        UpdateState::NotDeployed => ("—", Color::Blue),
-        UpdateState::Error => ("!", Color::Red),
-        UpdateState::Unknown => ("?", Color::DarkGray),
+        UpdateState::UpToDate => ("✓", theme::SUCCESS),
+        UpdateState::NeedsUpdate => ("↑", theme::WARNING),
+        UpdateState::NotDeployed => ("—", theme::INFO),
+        UpdateState::Error => ("!", theme::ERROR),
+        UpdateState::Unknown => ("?", theme::MUTED),
     };
     Span::styled(format!("{label}:{icon}"), Style::default().fg(color))
 }
@@ -565,7 +703,7 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(Line::from(Span::styled(
         "update details",
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD),
     )));
     for (label, has, extra) in [
@@ -579,7 +717,7 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
             Span::styled(
                 format!("{label:<6} "),
                 Style::default()
-                    .fg(Color::Magenta)
+                    .fg(theme::BRAND)
                     .add_modifier(Modifier::BOLD),
             ),
             short_hash_span("local ", extra.local_path.as_deref()),
@@ -596,11 +734,11 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
             // exact closure became the running one.
             meta.push(Span::styled(
                 "activated ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::MUTED),
             ));
             meta.push(Span::styled(
                 format_time_ago(t),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme::SUCCESS),
             ));
             meta.push(Span::raw("  "));
         }
@@ -608,15 +746,15 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
             let frame_ch = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
             meta.push(Span::styled(
                 format!("size {frame_ch}"),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme::ACCENT),
             ));
         } else if let (Some(local), Some(remote)) = (extra.local_size, extra.remote_size) {
-            meta.push(Span::styled("size ", Style::default().fg(Color::DarkGray)));
+            meta.push(Span::styled("size ", Style::default().fg(theme::MUTED)));
             meta.push(size_delta_span(local, remote));
         } else {
             meta.push(Span::styled(
                 "size ?  (Shift+U)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::MUTED),
             ));
         }
         if meta.len() > 1 {
@@ -634,14 +772,14 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
                 Span::raw("       "),
                 Span::styled(
                     format!("packages {frame_ch}"),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(theme::ACCENT),
                 ),
             ]));
         } else if let Some(diff) = extra.pkg_diff.as_deref() {
             if diff.is_empty() {
                 lines.push(Line::from(vec![
                     Span::raw("       "),
-                    Span::styled("packages identical", Style::default().fg(Color::Green)),
+                    Span::styled("packages identical", Style::default().fg(theme::SUCCESS)),
                 ]));
             } else if diff.trim_start().starts_with("(content-only)") {
                 // Content-only case: every package name+version
@@ -658,13 +796,10 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
                     Span::styled(
                         "packages identical, content differs",
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(theme::WARNING)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        "  see job log for paths",
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled("  see job log for paths", Style::default().fg(theme::MUTED)),
                 ]));
             } else {
                 let total = diff.trim().lines().count();
@@ -676,22 +811,19 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
                             if total == 1 { "" } else { "s" }
                         ),
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(theme::WARNING)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         "  see job log for per-package details",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme::MUTED),
                     ),
                 ]));
             }
         } else {
             lines.push(Line::from(vec![
                 Span::raw("       "),
-                Span::styled(
-                    "packages ?  (Shift+U)",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("packages ?  (Shift+U)", Style::default().fg(theme::MUTED)),
             ]));
         }
     }
@@ -719,7 +851,7 @@ fn short_hash_span(label: &'static str, path: Option<&str>) -> Span<'static> {
         }
         None => format!("{label}?"),
     };
-    Span::styled(text, Style::default().fg(Color::Cyan))
+    Span::styled(text, Style::default().fg(theme::ACCENT))
 }
 
 /// Humanised closure size delta: `+42.3 MiB` / `-7.0 MiB` / `±0 B`.
@@ -733,9 +865,9 @@ fn size_delta_span(local: u64, remote: u64) -> Span<'static> {
         (remote - local, '-')
     };
     let color = if delta_abs == 0 {
-        Color::Green
+        theme::SUCCESS
     } else {
-        Color::Yellow
+        theme::WARNING
     };
     let text = if delta_abs == 0 {
         format!("{} (unchanged)", humanise_bytes(local))
@@ -804,31 +936,31 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
     let override_ = app.override_for(&node.name);
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("name     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("name     ", Style::default().fg(theme::MUTED)),
             Span::raw(node.name.clone()),
         ]),
         Line::from(vec![
-            Span::styled("hostname ", Style::default().fg(Color::DarkGray)),
+            Span::styled("hostname ", Style::default().fg(theme::MUTED)),
             Span::raw(node.hostname.clone()),
         ]),
         Line::from(vec![
-            Span::styled("profiles ", Style::default().fg(Color::DarkGray)),
+            Span::styled("profiles ", Style::default().fg(theme::MUTED)),
             Span::raw(node.profiles.keys().cloned().collect::<Vec<_>>().join(", ")),
         ]),
         Line::from(vec![
-            Span::styled("status   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("status   ", Style::default().fg(theme::MUTED)),
             if status.checking_reachability {
-                Span::styled("checking…", Style::default().fg(Color::Cyan))
+                Span::styled("checking…", Style::default().fg(theme::ACCENT))
             } else {
                 match status.reachability {
                     Reachability::Online => {
-                        Span::styled("online", Style::default().fg(Color::Green))
+                        Span::styled("online", Style::default().fg(theme::SUCCESS))
                     }
                     Reachability::Offline => {
-                        Span::styled("offline", Style::default().fg(Color::Red))
+                        Span::styled("offline", Style::default().fg(theme::ERROR))
                     }
                     Reachability::Unknown => {
-                        Span::styled("unknown", Style::default().fg(Color::DarkGray))
+                        Span::styled("unknown", Style::default().fg(theme::MUTED))
                     }
                 }
             },
@@ -839,14 +971,14 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
         // this session (otherwise it would claim "never" for hosts we
         // just haven't probed yet).
         Line::from(vec![
-            Span::styled("last up  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("last up  ", Style::default().fg(theme::MUTED)),
             match status.last_online {
-                Some(t) => Span::styled(format_time_ago(t), Style::default().fg(Color::Green)),
-                None => Span::styled("(never seen)", Style::default().fg(Color::DarkGray)),
+                Some(t) => Span::styled(format_time_ago(t), Style::default().fg(theme::SUCCESS)),
+                None => Span::styled("(never seen)", Style::default().fg(theme::MUTED)),
             },
         ]),
         Line::from(vec![
-            Span::styled("mode     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("mode     ", Style::default().fg(theme::MUTED)),
             Span::raw(format!(
                 "{} / {}",
                 describe_mode(app.mode),
@@ -854,11 +986,11 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
             )),
         ]),
         Line::from(vec![
-            Span::styled("override ", Style::default().fg(Color::DarkGray)),
+            Span::styled("override ", Style::default().fg(theme::MUTED)),
             if override_.is_active() {
-                Span::styled(override_.summary(), Style::default().fg(Color::Magenta))
+                Span::styled(override_.summary(), Style::default().fg(theme::BRAND))
             } else {
-                Span::styled("(none)", Style::default().fg(Color::DarkGray))
+                Span::styled("(none)", Style::default().fg(theme::MUTED))
             },
         ]),
         // "last     " row: persistent finished/failed indicator scoped
@@ -870,18 +1002,18 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
         // single-source.
         match (&app.busy_label, app.last_deploys.get(&node.name)) {
             (Some(busy), _) => Line::from(vec![
-                Span::styled("last     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("⟳ {busy}"), Style::default().fg(Color::Yellow)),
+                Span::styled("last     ", Style::default().fg(theme::MUTED)),
+                Span::styled(format!("⟳ {busy}"), Style::default().fg(theme::BUSY)),
             ]),
             (None, Some(last)) => Line::from(vec![
-                Span::styled("last     ", Style::default().fg(Color::DarkGray)),
+                Span::styled("last     ", Style::default().fg(theme::MUTED)),
                 deploy_outcome_chip(last),
             ]),
             (None, None) => Line::from(vec![
-                Span::styled("last     ", Style::default().fg(Color::DarkGray)),
+                Span::styled("last     ", Style::default().fg(theme::MUTED)),
                 Span::styled(
                     "(no deploy this session)",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::MUTED),
                 ),
             ]),
         },
@@ -890,7 +1022,7 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(cache_drift_summary_line(&status, app.tick_counter));
     if let Some(err) = &status.last_error {
         lines.push(Line::from(vec![
-            Span::styled("error    ", Style::default().fg(Color::Red)),
+            Span::styled("error    ", Style::default().fg(theme::ERROR)),
             Span::raw(err.clone()),
         ]));
     }
@@ -904,7 +1036,7 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
 /// user wants at a glance is "does this deploy compile anything", not a
 /// per-profile breakdown — the job log has the detail.
 fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<'static> {
-    let label = Span::styled("plan     ", Style::default().fg(Color::DarkGray));
+    let label = Span::styled("plan     ", Style::default().fg(theme::MUTED));
     if status.checking_plan {
         return Line::from(vec![
             label,
@@ -913,17 +1045,14 @@ fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<
                     "{} preflighting build…",
                     SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
                 ),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::BUSY),
             ),
         ]);
     }
     if status.build_plans.is_empty() {
         return Line::from(vec![
             label,
-            Span::styled(
-                "not checked (Shift+P)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("not checked (Shift+P)", Style::default().fg(theme::MUTED)),
         ]);
     }
     let builds: usize = status.build_plans.values().map(|p| p.to_build.len()).sum();
@@ -938,7 +1067,7 @@ fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<
             label,
             Span::styled(
                 "nothing to build or fetch",
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme::SUCCESS),
             ),
         ]);
     }
@@ -946,12 +1075,14 @@ fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<
     if builds > 0 {
         spans.push(Span::styled(
             format!("{builds} to compile"),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
         spans.push(Span::styled(
             "nothing to compile".to_string(),
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme::SUCCESS),
         ));
     }
     if fetches > 0 {
@@ -962,7 +1093,7 @@ fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<
         };
         spans.push(Span::styled(
             format!(", {fetches} to fetch{size}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         ));
     }
     Line::from(spans)
@@ -974,7 +1105,7 @@ fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<
 /// green "ok" state — the whole point of the check is that a deploy
 /// looks fine right up until it spends 40 minutes compiling.
 fn cache_drift_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<'static> {
-    let label = Span::styled("cache    ", Style::default().fg(Color::DarkGray));
+    let label = Span::styled("cache    ", Style::default().fg(theme::MUTED));
     if status.checking_cache {
         return Line::from(vec![
             label,
@@ -983,17 +1114,14 @@ fn cache_drift_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line
                     "{} checking substituters…",
                     SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
                 ),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::BUSY),
             ),
         ]);
     }
     match &status.cache_drift {
         None => Line::from(vec![
             label,
-            Span::styled(
-                "not checked (Shift+C)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("not checked (Shift+C)", Style::default().fg(theme::MUTED)),
         ]),
         Some(d) if d.has_drift() => Line::from(vec![
             label,
@@ -1003,38 +1131,27 @@ fn cache_drift_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line
                     d.added_substituters.len().max(d.added_keys.len()),
                     d.site.label()
                 ),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::ERROR)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Some(d) if d.ssh_user_trusted == Some(false) => Line::from(vec![
             label,
             Span::styled(
                 "no new caches, but the ssh user is not trusted",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::WARNING),
             ),
         ]),
         Some(d) => Line::from(vec![
             label,
             Span::styled(
                 format!("no new caches for the {} build", d.site.label()),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme::SUCCESS),
             ),
         ]),
     }
 }
-
-/// Palette used to colour host prefixes in the job-log pane. Chosen
-/// to be distinct on a dark terminal background and to avoid the
-/// colours already reserved by the rest of the UI (cyan = focus,
-/// magenta = title chip, red/yellow = errors/busy).
-const JOB_LOG_COLORS: &[Color] = &[
-    Color::LightBlue,
-    Color::LightGreen,
-    Color::LightYellow,
-    Color::LightMagenta,
-    Color::LightCyan,
-    Color::LightRed,
-];
 
 /// Stable host→colour mapping. Uses a tiny FNV-1a hash on the host
 /// name so the same host always gets the same colour across frames
@@ -1046,7 +1163,7 @@ fn job_log_color(host: &str) -> Color {
         hash ^= *b as u32;
         hash = hash.wrapping_mul(16777619);
     }
-    JOB_LOG_COLORS[(hash as usize) % JOB_LOG_COLORS.len()]
+    theme::JOB_LOG[(hash as usize) % theme::JOB_LOG.len()]
 }
 
 /// Longest host name among tagged log entries, used to align the
@@ -1078,7 +1195,7 @@ fn styled_segment(text: impl Into<String>, style: Style) -> StyledSegment {
 fn dim_style(base: Style) -> Style {
     base.patch(
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(theme::MUTED)
             .add_modifier(Modifier::DIM),
     )
 }
@@ -1109,9 +1226,9 @@ fn style_pkg_probe_line(text: &str, base: Style) -> Vec<StyledSegment> {
         if let Some(count) = rest.strip_suffix(" change(s))") {
             let changes = count.parse::<usize>().ok().unwrap_or(0);
             let emphasis = if changes == 0 {
-                accent_style(base, Color::Green)
+                accent_style(base, theme::SUCCESS)
             } else {
-                accent_style(base, Color::Yellow)
+                accent_style(base, theme::WARNING)
             };
             return vec![
                 styled_segment("[pkg] ", tag),
@@ -1124,7 +1241,7 @@ fn style_pkg_probe_line(text: &str, base: Style) -> Vec<StyledSegment> {
     if let Some(summary) = body.strip_prefix("(content-only)") {
         return vec![
             styled_segment("[pkg] ", tag),
-            styled_segment("(content-only)", accent_style(base, Color::Yellow)),
+            styled_segment("(content-only)", accent_style(base, theme::WARNING)),
             styled_segment(summary, dim_style(base)),
         ];
     }
@@ -1133,29 +1250,29 @@ fn style_pkg_probe_line(text: &str, base: Style) -> Vec<StyledSegment> {
         if let Some((old, new)) = delta.split_once(" → ") {
             return vec![
                 styled_segment("[pkg] ", tag),
-                styled_segment(name, accent_style(base, Color::Yellow)),
+                styled_segment(name, accent_style(base, theme::WARNING)),
                 styled_segment(": ", tag),
                 styled_segment(old, dim_style(base)),
                 styled_segment(" → ", tag),
-                styled_segment(new, accent_style(base, Color::Green)),
+                styled_segment(new, accent_style(base, theme::SUCCESS)),
             ];
         }
         if let Some(added) = delta.strip_prefix("+ ") {
             return vec![
                 styled_segment("[pkg] ", tag),
-                styled_segment(name, accent_style(base, Color::Yellow)),
+                styled_segment(name, accent_style(base, theme::WARNING)),
                 styled_segment(": ", tag),
-                styled_segment("+ ", accent_style(base, Color::Green)),
-                styled_segment(added, accent_style(base, Color::Green)),
+                styled_segment("+ ", accent_style(base, theme::SUCCESS)),
+                styled_segment(added, accent_style(base, theme::SUCCESS)),
             ];
         }
         if let Some(removed) = delta.strip_prefix("- ") {
             return vec![
                 styled_segment("[pkg] ", tag),
-                styled_segment(name, accent_style(base, Color::Yellow)),
+                styled_segment(name, accent_style(base, theme::WARNING)),
                 styled_segment(": ", tag),
-                styled_segment("- ", accent_style(base, Color::Red)),
-                styled_segment(removed, accent_style(base, Color::Red)),
+                styled_segment("- ", accent_style(base, theme::ERROR)),
+                styled_segment(removed, accent_style(base, theme::ERROR)),
             ];
         }
     }
@@ -1187,9 +1304,9 @@ fn style_size_probe_line(text: &str, base: Style, local_size: Option<u64>) -> Ve
         ];
         if let Some(local) = local_size {
             let (delta_abs, sign, color) = if local >= remote {
-                (local - remote, '+', Color::Yellow)
+                (local - remote, '+', theme::WARNING)
             } else {
-                (remote - local, '-', Color::Yellow)
+                (remote - local, '-', theme::WARNING)
             };
             spans.push(styled_segment("  delta ", tag));
             spans.push(styled_segment(
@@ -1230,12 +1347,12 @@ fn highlight_segments(
     };
 
     let hi_patch = Style::default()
-        .bg(Color::Magenta)
-        .fg(Color::Black)
+        .bg(theme::SEARCH_MATCH)
+        .fg(theme::ON_ACCENT)
         .add_modifier(Modifier::BOLD);
     let hi_current_patch = Style::default()
-        .bg(Color::Cyan)
-        .fg(Color::Black)
+        .bg(theme::SEARCH_ACTIVE)
+        .fg(theme::ON_ACCENT)
         .add_modifier(Modifier::BOLD);
 
     let full_text = segments
@@ -1427,7 +1544,7 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
             let color = job_log_color(host);
             let prefix = format!("{host}{} │ ", " ".repeat(pad));
             let body_style = if entry.is_err {
-                Style::default().fg(Color::Red)
+                Style::default().fg(theme::ERROR)
             } else {
                 Style::default()
             };
@@ -1441,7 +1558,7 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
             if let Some((vmode, start_line, start_col, end_line, end_col)) = visual_range {
                 let in_sel = line_idx >= start_line && line_idx <= end_line;
                 if in_sel {
-                    let sel_bg = Style::default().bg(Color::DarkGray);
+                    let sel_bg = Style::default().bg(theme::SURFACE_SEL);
                     match vmode {
                         VisualMode::Line => {
                             // Whole line highlighted — prefix + body both get bg.
@@ -1449,7 +1566,7 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
                                 Style::default()
                                     .fg(color)
                                     .add_modifier(Modifier::BOLD)
-                                    .bg(Color::DarkGray),
+                                    .bg(theme::SURFACE_SEL),
                             )];
                             spans.extend(highlight_segments(
                                 style_job_log_segments(
@@ -1544,8 +1661,8 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(
                 mode_label,
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(theme::ON_ACCENT)
+                    .bg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
@@ -1572,7 +1689,7 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     if tagged.is_empty() {
         let empty = Line::styled(
             " (no deploy output for this host — press s / b / d to start, or mark hosts with Space)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         );
         frame.render_widget(Paragraph::new(empty), inner);
         return;
@@ -1671,8 +1788,8 @@ fn scroll_chip(scroll: usize) -> Span<'static> {
     Span::styled(
         format!("[↑{scroll}] "),
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
+            .fg(theme::ON_ACCENT)
+            .bg(theme::FOCUS)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -1692,8 +1809,8 @@ fn search_chip(query: &str, current: usize, total: usize) -> Span<'static> {
     Span::styled(
         label,
         Style::default()
-            .fg(Color::Black)
-            .bg(Color::Magenta)
+            .fg(theme::ON_ACCENT)
+            .bg(theme::SEARCH_MATCH)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -1780,11 +1897,11 @@ fn toggle_span(key: &str, label: &str, on: bool, focused: bool) -> Span<'static>
     let icon = if on { "●" } else { "○" };
     let style = if focused {
         Style::default()
-            .fg(Color::White)
-            .bg(Color::DarkGray)
+            .fg(theme::EMPHASIS)
+            .bg(theme::SURFACE_SEL)
             .add_modifier(Modifier::BOLD)
     } else if on {
-        Style::default().fg(Color::Green)
+        Style::default().fg(theme::SUCCESS)
     } else {
         Style::default()
     };
@@ -1824,7 +1941,10 @@ fn draw_commands_row(frame: &mut Frame, area: Rect, app: &App) {
     );
 
     // Right: informational hints. Never takes focus.
-    let info_block = Block::default().borders(Borders::ALL).title(" info ");
+    let info_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::MUTED))
+        .title(Span::styled(" info ", Style::default().fg(theme::MUTED)));
     let info_inner = info_block.inner(cols[1]);
     frame.render_widget(info_block, cols[1]);
     let info_spans = build_info_spans(app);
@@ -1845,7 +1965,7 @@ fn draw_commands_row(frame: &mut Frame, area: Rect, app: &App) {
 /// actual rendered width.
 fn build_info_spans(app: &App) -> Vec<Span<'static>> {
     let hints: Vec<(&'static str, &'static str)> = info_hints_for(app);
-    let yellow = Style::default().fg(Color::Yellow);
+    let yellow = Style::default().fg(theme::KEY);
     let mut spans = Vec::with_capacity(hints.len() * 3 + 1);
     spans.push(Span::raw(" "));
     for (i, (key, desc)) in hints.iter().enumerate() {
@@ -1996,19 +2116,19 @@ fn command_button(key: &'static str, label: &'static str, focused: bool) -> [Spa
     let sep_style;
     let label_style;
     if focused {
-        let bg = Color::DarkGray;
+        let bg = theme::SURFACE_SEL;
         key_style = Style::default()
-            .fg(Color::Yellow)
+            .fg(theme::KEY)
             .bg(bg)
             .add_modifier(Modifier::BOLD);
-        sep_style = Style::default().fg(Color::Gray).bg(bg);
+        sep_style = Style::default().fg(theme::MUTED).bg(bg);
         label_style = Style::default()
-            .fg(Color::White)
+            .fg(theme::EMPHASIS)
             .bg(bg)
             .add_modifier(Modifier::BOLD);
     } else {
-        key_style = Style::default().fg(Color::Yellow);
-        sep_style = Style::default().fg(Color::DarkGray);
+        key_style = Style::default().fg(theme::KEY);
+        sep_style = Style::default().fg(theme::MUTED);
         label_style = Style::default();
     }
     [
@@ -2028,36 +2148,36 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 " confirm ▸ ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
+                    .fg(theme::ON_ACCENT)
+                    .bg(theme::WARNING)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("y", Style::default().fg(Color::Yellow)),
+            Span::styled("y", Style::default().fg(theme::KEY)),
             Span::raw(" / "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", Style::default().fg(theme::KEY)),
             Span::raw(" confirm  "),
-            Span::styled("n", Style::default().fg(Color::Yellow)),
+            Span::styled("n", Style::default().fg(theme::KEY)),
             Span::raw(" / "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme::KEY)),
             Span::raw(" cancel"),
         ]),
         InputMode::EditIdentityPicker { .. } => Line::from(vec![
             Span::styled(
                 " identity ▸ ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
+                    .fg(theme::ON_ACCENT)
+                    .bg(theme::BRAND)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("Ctrl+J/K", Style::default().fg(Color::Yellow)),
+            Span::styled("Ctrl+J/K", Style::default().fg(theme::KEY)),
             Span::raw(" pick  "),
-            Span::styled("type", Style::default().fg(Color::Yellow)),
+            Span::styled("type", Style::default().fg(theme::KEY)),
             Span::raw(" custom path  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", Style::default().fg(theme::KEY)),
             Span::raw(" save  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme::KEY)),
             Span::raw(" cancel"),
         ]),
         InputMode::EditOverride { field, buf } => {
@@ -2071,17 +2191,17 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(
                     format!(" {label} ▸ "),
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Magenta)
+                        .fg(theme::ON_ACCENT)
+                        .bg(theme::BRAND)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
                 Span::raw(buf.clone()),
-                Span::styled("▎", Style::default().fg(Color::Magenta)),
+                Span::styled("▎", Style::default().fg(theme::BRAND)),
                 Span::raw("   "),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter", Style::default().fg(theme::KEY)),
                 Span::raw(" save  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled("Esc", Style::default().fg(theme::KEY)),
                 Span::raw(" cancel"),
             ])
         }
@@ -2089,22 +2209,22 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 " override ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
+                    .fg(theme::ON_ACCENT)
+                    .bg(theme::BRAND)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("h", Style::default().fg(Color::Yellow)),
+            Span::styled("h", Style::default().fg(theme::KEY)),
             Span::raw(" host  "),
-            Span::styled("u", Style::default().fg(Color::Yellow)),
+            Span::styled("u", Style::default().fg(theme::KEY)),
             Span::raw(" user  "),
-            Span::styled("k", Style::default().fg(Color::Yellow)),
+            Span::styled("k", Style::default().fg(theme::KEY)),
             Span::raw(" key  "),
-            Span::styled("o", Style::default().fg(Color::Yellow)),
+            Span::styled("o", Style::default().fg(theme::KEY)),
             Span::raw(" opts  "),
-            Span::styled("c", Style::default().fg(Color::Yellow)),
+            Span::styled("c", Style::default().fg(theme::KEY)),
             Span::raw(" clear  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme::KEY)),
             Span::raw(" back"),
         ]),
         InputMode::SearchLog { target, buf } => {
@@ -2115,17 +2235,17 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled(
                     label,
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Magenta)
+                        .fg(theme::ON_ACCENT)
+                        .bg(theme::BRAND)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
                 Span::raw(buf.clone()),
-                Span::styled("▎", Style::default().fg(Color::Magenta)),
+                Span::styled("▎", Style::default().fg(theme::BRAND)),
                 Span::raw("   "),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter", Style::default().fg(theme::KEY)),
                 Span::raw(" commit  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled("Esc", Style::default().fg(theme::KEY)),
                 Span::raw(" cancel"),
             ])
         }
@@ -2133,35 +2253,35 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(
                 " /filter help ▸ ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
+                    .fg(theme::ON_ACCENT)
+                    .bg(theme::BRAND)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
             Span::raw(buf.clone()),
-            Span::styled("▎", Style::default().fg(Color::Magenta)),
+            Span::styled("▎", Style::default().fg(theme::BRAND)),
             Span::raw("   "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", Style::default().fg(theme::KEY)),
             Span::raw(" commit  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme::KEY)),
             Span::raw(" clear"),
         ]),
         InputMode::ConfirmQuit { .. } => Line::from(vec![
             Span::styled(
                 " quit? ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Red)
+                    .fg(theme::ON_ACCENT)
+                    .bg(theme::ERROR)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("y", Style::default().fg(Color::Yellow)),
+            Span::styled("y", Style::default().fg(theme::KEY)),
             Span::raw(" / "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", Style::default().fg(theme::KEY)),
             Span::raw(" confirm  "),
-            Span::styled("n", Style::default().fg(Color::Yellow)),
+            Span::styled("n", Style::default().fg(theme::KEY)),
             Span::raw(" / "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme::KEY)),
             Span::raw(" cancel"),
         ]),
         // Normal mode has nothing extra to say — the commands row
@@ -2196,7 +2316,7 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(theme::MUTED);
 
     // Every entry in the popup uses `key_line` so the description column
     // is at the same x for every row in every section. This is what the
@@ -2418,24 +2538,24 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(
                     " /",
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
+                        .fg(theme::ON_ACCENT)
+                        .bg(theme::FOCUS)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
                 Span::raw(buf.clone()),
-                Span::styled("▎", Style::default().fg(Color::Yellow)),
+                Span::styled("▎", Style::default().fg(theme::FOCUS)),
             ],
             _ => vec![
-                Span::styled(" /", Style::default().fg(Color::DarkGray)),
+                Span::styled(" /", Style::default().fg(theme::MUTED)),
                 Span::raw(" "),
                 Span::styled(
                     app.help_search.clone().unwrap_or_default(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::MUTED),
                 ),
                 Span::styled(
                     "  (press / to edit, Esc to clear)",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme::MUTED),
                 ),
             ],
         };
@@ -2449,7 +2569,7 @@ fn section(name: &str) -> Line<'static> {
     Line::styled(
         name.to_string(),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -2469,9 +2589,7 @@ fn key_line(keys: &str, desc: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             key_col,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::KEY).add_modifier(Modifier::BOLD),
         ),
         Span::raw(desc.to_string()),
     ])
@@ -2496,11 +2614,11 @@ fn draw_confirm_popup(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(theme::WARNING))
         .title(Span::styled(
             " confirm deploy ",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::WARNING)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
@@ -2510,29 +2628,29 @@ fn draw_confirm_popup(
 
     // Summary header — mode + profile + host count.
     lines.push(Line::from(vec![
-        Span::styled("mode    ", Style::default().fg(Color::DarkGray)),
+        Span::styled("mode    ", Style::default().fg(theme::MUTED)),
         Span::styled(
             describe_mode(mode),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("profile ", Style::default().fg(Color::DarkGray)),
+        Span::styled("profile ", Style::default().fg(theme::MUTED)),
         Span::styled(
             describe_profile(profile),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("hosts   ", Style::default().fg(Color::DarkGray)),
+        Span::styled("hosts   ", Style::default().fg(theme::MUTED)),
         Span::styled(
             format!("{}", hosts.len()),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(if hosts.len() == 1 { " host" } else { " hosts" }),
@@ -2546,7 +2664,7 @@ fn draw_confirm_popup(
     let visible = hosts.len().min(MAX_LIST);
     for name in &hosts[..visible] {
         lines.push(Line::from(vec![
-            Span::styled("  • ", Style::default().fg(Color::Yellow)),
+            Span::styled("  • ", Style::default().fg(theme::WARNING)),
             Span::raw(name.clone()),
         ]));
     }
@@ -2555,7 +2673,7 @@ fn draw_confirm_popup(
             Span::styled("    ", Style::default()),
             Span::styled(
                 format!("… +{} more", hosts.len() - MAX_LIST),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::MUTED),
             ),
         ]));
     }
@@ -2566,16 +2684,16 @@ fn draw_confirm_popup(
         Span::styled(
             "  y / Enter ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
+                .fg(theme::ON_ACCENT)
+                .bg(theme::SUCCESS)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  confirm    "),
         Span::styled(
             " n / Esc ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Red)
+                .fg(theme::ON_ACCENT)
+                .bg(theme::ERROR)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  cancel"),
@@ -2615,25 +2733,25 @@ fn build_plan_warning_lines(app: &App, hosts: &[String]) -> Vec<Line<'static>> {
             Span::styled(
                 " plan ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
+                    .fg(theme::ON_ACCENT)
+                    .bg(theme::WARNING)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" {name}: compiles {}{suffix}", builds.len()),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::WARNING),
             ),
         ]));
         for b in builds.iter().take(4) {
             lines.push(Line::styled(
                 format!("    ⚒ {b}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::WARNING),
             ));
         }
         if builds.len() > 4 {
             lines.push(Line::styled(
                 format!("    … +{} more", builds.len() - 4),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::MUTED),
             ));
         }
     }
@@ -2659,8 +2777,8 @@ fn cache_drift_warning_lines(app: &App, hosts: &[String]) -> Vec<Line<'static>> 
                     Span::styled(
                         " cache ",
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Red)
+                            .fg(theme::ON_ACCENT)
+                            .bg(theme::ERROR)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
@@ -2669,13 +2787,13 @@ fn cache_drift_warning_lines(app: &App, hosts: &[String]) -> Vec<Line<'static>> 
                             drift.added_substituters.len(),
                             drift.site.label()
                         ),
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(theme::ERROR),
                     ),
                 ]));
                 for url in drift.added_substituters.iter().take(3) {
                     lines.push(Line::styled(
                         format!("    + {url}"),
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(theme::ERROR),
                     ));
                 }
                 if drift.ssh_user_trusted == Some(false) {
@@ -2684,7 +2802,7 @@ fn cache_drift_warning_lines(app: &App, hosts: &[String]) -> Vec<Line<'static>> 
                             "    `{}` is not in trusted-users — overrides are ignored silently",
                             drift.ssh_user.as_deref().unwrap_or("ssh user"),
                         ),
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(theme::ERROR),
                     ));
                 }
             }
@@ -2698,7 +2816,7 @@ fn cache_drift_warning_lines(app: &App, hosts: &[String]) -> Vec<Line<'static>> 
                 "  substituter drift not checked for {} host(s) — Shift+C",
                 unchecked.len()
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         ));
     }
     if !lines.is_empty() {
@@ -2713,10 +2831,12 @@ fn draw_confirm_quit_popup(frame: &mut Frame, area: Rect, deploy_running: bool) 
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
+        .border_style(Style::default().fg(theme::ERROR))
         .title(Span::styled(
             " confirm quit ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -2725,17 +2845,17 @@ fn draw_confirm_quit_popup(frame: &mut Frame, area: Rect, deploy_running: bool) 
     lines.push(Line::raw(""));
     if deploy_running {
         lines.push(Line::from(vec![
-            Span::styled("  ⚠ ", Style::default().fg(Color::Yellow)),
+            Span::styled("  ⚠ ", Style::default().fg(theme::WARNING)),
             Span::styled(
                 "A deploy is currently running!",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::WARNING)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(Span::styled(
             "    It will be killed if you quit.",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::WARNING),
         )));
         lines.push(Line::raw(""));
     }
@@ -2745,16 +2865,16 @@ fn draw_confirm_quit_popup(frame: &mut Frame, area: Rect, deploy_running: bool) 
         Span::styled(
             "  y / Enter ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
+                .fg(theme::ON_ACCENT)
+                .bg(theme::SUCCESS)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  quit    "),
         Span::styled(
             " n / Esc ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Red)
+                .fg(theme::ON_ACCENT)
+                .bg(theme::ERROR)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  cancel"),
@@ -2774,9 +2894,9 @@ fn draw_password_popup(
     frame.render_widget(Clear, popup);
 
     let (title, border_color) = match source {
-        PromptSource::Askpass => (" auth ", Color::Yellow),
-        PromptSource::Sudo => (" sudo ", Color::Red),
-        PromptSource::SudoPre => (" sudo (pre-deploy) ", Color::Magenta),
+        PromptSource::Askpass => (" auth ", theme::WARNING),
+        PromptSource::Sudo => (" sudo ", theme::ERROR),
+        PromptSource::SudoPre => (" sudo (pre-deploy) ", theme::BRAND),
     };
 
     let block = Block::default()
@@ -2806,7 +2926,7 @@ fn draw_password_popup(
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         format!("  {label}"),
-        Style::default().fg(Color::Yellow),
+        Style::default().fg(theme::WARNING),
     )));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
@@ -2819,16 +2939,16 @@ fn draw_password_popup(
         Span::styled(
             "  Enter ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
+                .fg(theme::ON_ACCENT)
+                .bg(theme::SUCCESS)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  send    "),
         Span::styled(
             " Esc ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Red)
+                .fg(theme::ON_ACCENT)
+                .bg(theme::ERROR)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  dismiss"),
@@ -2869,7 +2989,7 @@ fn draw_identity_picker_popup(
     let items: Vec<ListItem> = if entries.is_empty() {
         vec![ListItem::new(Line::styled(
             "  (no keys found in ~/.ssh — type a path below)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         ))]
     } else {
         entries
@@ -2878,8 +2998,8 @@ fn draw_identity_picker_popup(
             .map(|(i, p)| {
                 let style = if i == selected {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .fg(theme::ON_ACCENT)
+                        .bg(theme::ACCENT)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -2899,13 +3019,13 @@ fn draw_identity_picker_popup(
         Span::styled(
             " path ▸ ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
+                .fg(theme::ON_ACCENT)
+                .bg(theme::BRAND)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
         Span::raw(buf.to_string()),
-        Span::styled("▎", Style::default().fg(Color::Magenta)),
+        Span::styled("▎", Style::default().fg(theme::BRAND)),
     ]);
     frame.render_widget(Paragraph::new(input_line), rows[1]);
 }

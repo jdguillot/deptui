@@ -164,6 +164,18 @@ warning, it just builds. That check is why the report names the user.
   passphrase prompts are supported too — they are routed through
   `SSH_ASKPASS` into a masked popup rather than to the terminal (which
   would corrupt the TUI).
+- A terminal at least **80x24**. Below that the UI shows a resize message
+  instead of a layout whose panes no longer fit their contents.
+
+### Colour
+
+Colours are the 16 ANSI names, not fixed RGB, so your own terminal theme
+decides what they look like and the UI reads correctly on light and dark
+backgrounds. Setting [`NO_COLOR`](https://no-color.org) (to any non-empty
+value), or running under `TERM=dumb`, drops colour entirely — chips and
+selections fall back to reverse video, and every state that mattered
+(reachability, `sys:`/`home:` badges) is carried by its glyph rather than
+its colour.
 
 ## Building
 
@@ -291,6 +303,19 @@ Stale size and package data are automatically cleared when `u` is
 re-run or after a successful deploy.
 
 ### Badges
+
+Each host row opens with a reachability dot. The shape carries the state
+on its own, so the list stays readable in monochrome and for red/green
+colour blindness:
+
+| dot | meaning                                        |
+| --- | ---------------------------------------------- |
+| `●` | online (TCP connect to the resolved SSH port)  |
+| `○` | offline                                        |
+| `·` | not probed yet                                 |
+| `⠋` | probe in flight (animated braille spinner)     |
+
+Then one badge per profile:
 
 | badge       | meaning                                              |
 | ----------- | ---------------------------------------------------- |

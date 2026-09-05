@@ -726,7 +726,7 @@ impl App {
         // all "unknown".
         self.refresh_reachability();
 
-        terminal.draw(|f| ui::draw(f, self))?;
+        ui::render(terminal, self)?;
         let mut last_draw = std::time::Instant::now();
 
         while !self.should_quit {
@@ -814,7 +814,7 @@ impl App {
             }
 
             if needs_redraw && !(rate_limited && last_draw.elapsed() < MIN_FRAME_INTERVAL) {
-                terminal.draw(|f| ui::draw(f, self))?;
+                ui::render(terminal, self)?;
                 last_draw = std::time::Instant::now();
             }
         }
@@ -831,7 +831,7 @@ impl App {
                     // we're waiting on instead of freezing on the last
                     // frame.
                     self.busy_label = Some("stopping deploy…".to_string());
-                    let _ = terminal.draw(|f| ui::draw(f, self));
+                    let _ = ui::render(terminal, self);
                     // Bounded so a wedged child can't strand the terminal
                     // in the alternate screen.
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;

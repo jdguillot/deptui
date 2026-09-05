@@ -9,4 +9,5 @@ pub mod event;
 pub mod flake;
 pub mod host;
 pub mod ssh;
+pub mod theme;
 pub mod ui;

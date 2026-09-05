@@ -42,6 +42,8 @@ blocks in the source modules:
 - `deploy.rs` — `strip_ansi`, `ProfileSel::target_suffix`,
   `DeployRequest::target`, `Toggles::default`.
 - `flake.rs` — `Node::has_system`, `Node::has_home`, JSON deserialisation.
+- `theme.rs` — the `NO_COLOR` / `TERM=dumb` decision as a pure function,
+  and the `Monochrome` pass (colour cleared, filled cells reversed).
 - `app.rs` — `App::new` defaults, key handling (quit confirmation,
   navigation, toggles, mode selection, help popup, global search
   navigation), `push_log` cap, override management, `FocusPane`
@@ -62,8 +64,15 @@ rendering paths:
   layout regression only shows up in front of the user. Covers the
   default screen, awkward and sub-minimum terminal sizes, every popup,
   the windowed job log's tail and scroll-back, help scrolling and its
-  in-place clamp, and that the password widget renders only mask
-  characters.
+  in-place clamp, that the password widget renders only mask characters,
+  the below-minimum resize message (and that 80x24 exactly still draws
+  the real layout), and that each reachability state renders its own
+  glyph in the host row.
+
+- `tests/no_color.rs` — deliberately its own binary: `theme::monochrome`
+  caches in a `OnceLock`, so the environment has to be set before
+  anything in the process asks. Asserts a full frame comes out with every
+  fg/bg reset and the filled chips fallen back to reverse video.
 
 Integration tests use `serial_test` to serialize because they mutate the
 process-global `$PATH`. When adding more, follow the same pattern:
@@ -104,6 +113,10 @@ The flow is `flake → nodes → status → user action → deploy`.
         ▼
    ┌─────────┐
    │  ui.rs  │  ratatui rendering (incl. modal + popup)
+   └────┬────┘
+        ▼
+   ┌─────────┐
+   │theme.rs │  semantic colour slots + NO_COLOR pass
    └─────────┘
 ```
 
@@ -392,6 +405,41 @@ Key invariants worth knowing before touching the code:
 - Don't print to stdout/stderr from the main thread once the TUI is up
   — it will corrupt the alternate screen. Use `--log-file` and tracing
   if you need diagnostics.
-- The host badges (`sys:✓` / `sys:↑` / `sys:—` / `sys:!` / `sys:?` / `sys:-`) and
-  the colors are part of the user-facing contract — see README. Keep
-  them consistent if you change rendering.
+- **`ui::render` is the only way to paint a frame.** It wraps
+  `terminal.draw` in a terminal synchronized update (`CSI ? 2026 h` /
+  `l`) so a repaint can't land mid-diff and tear — visible mostly while
+  the job log scrolls. The `SyncUpdate` guard ends the update on drop, so
+  a failed draw can't leave the terminal holding its output. Calling
+  `terminal.draw(|f| ui::draw(f, app))` directly skips all of that;
+  `ui::draw` stays public only for the render tests, which drive a
+  `TestBackend` with no terminal to synchronize.
+- **`ui.rs` never names a colour.** Every style pulls a *role* from
+  `theme.rs` — `FOCUS`, `KEY`, `WARNING`, `BUSY`, `ERROR`, `SUCCESS`,
+  `ACCENT`, `BRAND`, `MUTED`, `ON_ACCENT`, … . Several of those are the
+  same ANSI colour today; they stay separate constants because they
+  answer different questions and a future theme may answer them
+  differently. The slots are all 16-colour ANSI names on purpose: those
+  are *relative*, so the user's terminal theme decides what "yellow" is
+  and the UI sits correctly on light and dark backgrounds.
+- **`NO_COLOR` is honoured by a post-pass, not by the slots.**
+  `theme::Monochrome` is rendered last over `frame.area()` and strips
+  fg/bg from every cell, turning any cell that had a background into
+  reverse video so filled chips survive as chips. Neutering the slots
+  themselves would instead dissolve every chip into body text. This
+  handles the decorative half only — see the next point for the rest.
+- **Colour is never the only signal.** Each reachability state has its
+  own glyph (`●` online, `○` offline, `·` unknown), the way the
+  `sys:`/`home:` badges already did. A red/green pair is the textbook
+  deuteranopia failure, and under `NO_COLOR` three identically-shaped
+  dots collapse into one. Any new state indicator needs a distinct glyph
+  before it needs a colour.
+- **Below 80x24 the UI refuses to draw.** `ui::draw` gates on
+  `MIN_WIDTH`/`MIN_HEIGHT` and renders `draw_too_small` instead. The
+  numbers are real, not ceremonial: the details pane alone is 13 rows,
+  and at 35% of under 80 columns a host row no longer fits its badges.
+  `draw_too_small` has to survive a 1x1 area — no borders, no centring
+  maths that can underflow — because a resize can put it there.
+- The host badges (`sys:✓` / `sys:↑` / `sys:—` / `sys:!` / `sys:?` / `sys:-`),
+  the reachability dots (`●` / `○` / `·`), and the colors are part of the
+  user-facing contract — see README. Keep them consistent if you change
+  rendering.
