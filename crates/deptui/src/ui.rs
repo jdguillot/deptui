@@ -3355,9 +3355,13 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(theme::MUTED),
                 )));
                 for (node, err) in app.agent.scan_failures.iter().take(6) {
+                    // The pane wraps; cap only pathological lengths so
+                    // the informative tail ("Permission denied") is
+                    // never the part that gets cut.
                     let mut err = err.clone();
-                    if err.len() > 70 {
-                        err.truncate(69);
+                    if err.len() > 200 {
+                        let cut = (0..=200).rfind(|&i| err.is_char_boundary(i)).unwrap_or(0);
+                        err.truncate(cut);
                         err.push('…');
                     }
                     lines.push(Line::from(vec![
@@ -3386,11 +3390,19 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(theme::MUTED),
             )));
             lines.push(Line::from(Span::styled(
-                "\"permission denied\" on the socket → add your ssh user to",
+                "socket \"Permission denied\" → add the node's deploy ssh user to",
                 Style::default().fg(theme::MUTED),
             )));
             lines.push(Line::from(Span::styled(
-                "  services.deptui-agent.users. r rescans. To pin a non-node agent:",
+                "  services.deptui-agent.users (root needs no grant); \"No such",
+                Style::default().fg(theme::MUTED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  file\" or \"Connection refused\" → is the service running?",
+                Style::default().fg(theme::MUTED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  (systemctl status deptui-agent). r rescans. To pin a non-node agent:",
                 Style::default().fg(theme::MUTED),
             )));
             lines.push(Line::raw(""));

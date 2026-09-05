@@ -3181,11 +3181,20 @@ resolve the paths so they can be seeded",
                 match agentclient::probe(&target).await {
                     Ok(_) => Ok((name, target)),
                     Err(e) => {
-                        // First line only: ssh banners and multi-line
-                        // errors would drown the empty state.
+                        // The remote CLI prints anyhow chains multi-line
+                        // ("Error: <context>\n\nCaused by:\n  <cause>") and
+                        // the cause is the informative part — keeping only
+                        // the first line once hid "Permission denied"
+                        // behind socket-path boilerplate. Collapse the
+                        // chain into one line instead.
                         let msg = format!("{e:#}");
-                        let first = msg.lines().next().unwrap_or("probe failed").to_string();
-                        Err((name, first))
+                        let joined = msg
+                            .lines()
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty() && *l != "Caused by:")
+                            .collect::<Vec<_>>()
+                            .join(" — ");
+                        Err((name, joined))
                     }
                 }
             });

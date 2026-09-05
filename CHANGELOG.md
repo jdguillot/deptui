@@ -10,6 +10,15 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Scan diagnostics kept the boilerplate and cut the cause: remote
+  error chains are now collapsed onto one line (context — cause) and
+  the empty state no longer truncates at 70 chars, so "Permission
+  denied" / "No such file" / "Connection refused" survive to the
+  screen — each with its remedy named (group grant vs service not
+  running).
+
 ## [0.5.0] — 2026-09-05
 
 ### Fixed
