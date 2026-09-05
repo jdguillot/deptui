@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-05
+
 ### Added
 
 - Agent auto-discovery: pressing `a` with no client config scans the
