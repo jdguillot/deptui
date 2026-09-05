@@ -3346,16 +3346,51 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
         )));
         lines.push(Line::raw(""));
         if app.agent.scanned {
+            // Show what each node actually said — "command not found"
+            // vs "permission denied" vs a timeout are three different
+            // fixes, and guessing between them is miserable.
+            if !app.agent.scan_failures.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "what the deploy nodes said:",
+                    Style::default().fg(theme::MUTED),
+                )));
+                for (node, err) in app.agent.scan_failures.iter().take(6) {
+                    let mut err = err.clone();
+                    if err.len() > 70 {
+                        err.truncate(69);
+                        err.push('…');
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {node}: "), Style::default().fg(theme::ACCENT)),
+                        Span::styled(err, Style::default().fg(theme::ERROR)),
+                    ]));
+                }
+                if app.agent.scan_failures.len() > 6 {
+                    lines.push(Line::from(Span::styled(
+                        format!("  … and {} more", app.agent.scan_failures.len() - 6),
+                        Style::default().fg(theme::MUTED),
+                    )));
+                }
+                lines.push(Line::raw(""));
+            }
             lines.push(Line::from(Span::styled(
-                "discovery needs the host to run deptui-agent, with your ssh key",
+                "\"command not found\" → the agent host must expose the CLI over ssh:",
                 Style::default().fg(theme::MUTED),
             )));
             lines.push(Line::from(Span::styled(
-                "accepted non-interactively and the binary on the ssh PATH.",
+                "  the NixOS module now installs it (environment.systemPackages);",
                 Style::default().fg(theme::MUTED),
             )));
             lines.push(Line::from(Span::styled(
-                "r rescans. For an agent that is not a deploy node, pin it:",
+                "  rebuild the agent host with the current module.",
+                Style::default().fg(theme::MUTED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "\"permission denied\" on the socket → add your ssh user to",
+                Style::default().fg(theme::MUTED),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  services.deptui-agent.users. r rescans. To pin a non-node agent:",
                 Style::default().fg(theme::MUTED),
             )));
             lines.push(Line::raw(""));

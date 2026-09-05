@@ -261,7 +261,11 @@ Zero config: press `a`. The TUI scans your `deploy.nodes` for hosts
 that answer `deptui-agent status` (over ssh, non-interactively) and
 connects to what it finds — the client machine needs no agent setup
 at all; all the real configuration (watches, cadence, hosts, flags)
-lives with the agent itself.
+lives with the agent itself. The NixOS module makes the agent host
+discoverable (it installs the CLI system-wide); grant socket access
+to your ssh user with `services.deptui-agent.users = [ "you" ]` —
+the deploy user `root` needs no grant. When a scan finds nothing,
+the view lists what each node said so the fix is never a guess.
 
 `~/.config/deptui/config.toml` is optional, for pinning an agent that
 is not a deploy node (or ordering several):

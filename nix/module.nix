@@ -136,6 +136,18 @@ in
         what grants deptui users control over the agent.
       '';
     };
+
+    users = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "alice" ];
+      description = ''
+        Users who may control the agent: each is added to the socket
+        group. The deploy ssh user needs this (unless it is root) for
+        `ssh host deptui-agent …` — the TUI's transport and what its
+        agent discovery probes.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -150,14 +162,25 @@ in
       }
     ];
 
-    users.users = lib.mkIf (cfg.user == defaultUser) {
-      ${defaultUser} = {
-        isSystemUser = true;
-        group = cfg.group;
-        home = "/var/lib/deptui-agent";
-        description = "deptui auto-deploy agent";
-      };
-    };
+    # The CLI must be reachable over `ssh host deptui-agent …` — that
+    # is the TUI's remote-control transport and what its agent
+    # discovery probes. The service alone runs fine from the store
+    # path, but without this the agent is invisible to clients.
+    environment.systemPackages = [ cfg.package ];
+
+    users.users = lib.mkMerge [
+      (lib.mkIf (cfg.user == defaultUser) {
+        ${defaultUser} = {
+          isSystemUser = true;
+          group = cfg.group;
+          home = "/var/lib/deptui-agent";
+          description = "deptui auto-deploy agent";
+        };
+      })
+      (lib.genAttrs cfg.users (_: {
+        extraGroups = [ cfg.group ];
+      }))
+    ];
     users.groups = lib.mkIf (cfg.group == defaultUser) { ${defaultUser} = { }; };
 
     # $HOME/.ssh/config for the service user, so both git and the

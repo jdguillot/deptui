@@ -10,6 +10,19 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Agent discovery found nothing even with an agent running: the NixOS
+  module never put the `deptui-agent` CLI on the system PATH, so
+  `ssh host deptui-agent …` — the TUI's transport — failed with
+  "command not found". The module now installs the package
+  (`environment.systemPackages`) and gains
+  `services.deptui-agent.users = [ … ]` to grant socket-group access
+  to the ssh users that need it. The scan also stopped discarding its
+  evidence: the empty state now lists what each deploy node actually
+  said (command not found / permission denied / timeout) with the
+  matching fix for each.
+
 ### Added
 
 - Dev builds, tiered: `packages.deptui-dev` / `packages.deptui-agent-dev`

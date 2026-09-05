@@ -369,6 +369,8 @@ pub struct AgentUi {
     /// At least one scan has completed (distinguishes "none found"
     /// from "haven't looked yet" in the empty state).
     pub scanned: bool,
+    /// Per-node probe errors from the last scan, first line each.
+    pub scan_failures: Vec<(String, String)>,
 }
 
 impl AgentUi {
@@ -387,6 +389,7 @@ impl AgentUi {
             settings_error: settings.load_error.clone(),
             scanning: false,
             scanned: false,
+            scan_failures: Vec::new(),
         }
     }
 
@@ -468,8 +471,13 @@ enum StatusUpdate {
     /// One live log line from `deptui-agent tail`.
     AgentTail(String),
     /// Deploy-node scan finished: `(node name, ssh target)` for every
-    /// node that answered `deptui-agent status`.
-    AgentsDiscovered(Vec<(String, String)>),
+    /// node that answered `deptui-agent status`, plus `(node, error)`
+    /// for every one that didn't — shown in the empty state so a scan
+    /// that finds nothing explains itself instead of shrugging.
+    AgentsDiscovered {
+        found: Vec<(String, String)>,
+        failed: Vec<(String, String)>,
+    },
 }
 
 impl From<probe::Report> for StatusUpdate {
@@ -2856,9 +2864,10 @@ resolve the paths so they can be seeded",
                     self.agent.last_op = Some(format!("! {e}"));
                 }
             },
-            StatusUpdate::AgentsDiscovered(found) => {
+            StatusUpdate::AgentsDiscovered { found, failed } => {
                 self.agent.scanning = false;
                 self.agent.scanned = true;
+                self.agent.scan_failures = failed;
                 let mut added = false;
                 for (name, target) in found {
                     // Configured entries win; discovery only fills gaps
@@ -3170,16 +3179,27 @@ resolve the paths so they can be seeded",
         tokio::spawn(async move {
             let probes = candidates.into_iter().map(|(name, target)| async move {
                 match agentclient::probe(&target).await {
-                    Ok(_) => Some((name, target)),
-                    Err(_) => None,
+                    Ok(_) => Ok((name, target)),
+                    Err(e) => {
+                        // First line only: ssh banners and multi-line
+                        // errors would drown the empty state.
+                        let msg = format!("{e:#}");
+                        let first = msg.lines().next().unwrap_or("probe failed").to_string();
+                        Err((name, first))
+                    }
                 }
             });
-            let found: Vec<(String, String)> = futures::future::join_all(probes)
-                .await
-                .into_iter()
-                .flatten()
-                .collect();
-            let _ = tx.send(StatusUpdate::AgentsDiscovered(found)).await;
+            let mut found = Vec::new();
+            let mut failed = Vec::new();
+            for r in futures::future::join_all(probes).await {
+                match r {
+                    Ok(hit) => found.push(hit),
+                    Err(miss) => failed.push(miss),
+                }
+            }
+            let _ = tx
+                .send(StatusUpdate::AgentsDiscovered { found, failed })
+                .await;
         });
     }
 
@@ -4845,21 +4865,26 @@ mod tests {
             toml::from_str("[agents.pinned]\nssh = \"me@box\"\n").unwrap();
         let mut app = App::with_settings(".".into(), sample_nodes(), settings);
         app.agent.scanning = true;
-        app.apply_status(StatusUpdate::AgentsDiscovered(vec![
-            ("alpha".into(), "root@alpha.lan".into()),
-            // Same target as the pinned entry: not duplicated.
-            ("boxy".into(), "me@box".into()),
-        ]));
+        app.apply_status(StatusUpdate::AgentsDiscovered {
+            found: vec![
+                ("alpha".into(), "root@alpha.lan".into()),
+                // Same target as the pinned entry: not duplicated.
+                ("boxy".into(), "me@box".into()),
+            ],
+            failed: vec![("beta".into(), "deptui-agent: command not found".into())],
+        });
         assert!(!app.agent.scanning);
         assert!(app.agent.scanned);
         let names: Vec<&str> = app.agent.agents.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["pinned", "alpha"]);
 
+        assert_eq!(app.agent.scan_failures.len(), 1);
+
         // A second scan finding the same node adds nothing.
-        app.apply_status(StatusUpdate::AgentsDiscovered(vec![(
-            "alpha".into(),
-            "root@alpha.lan".into(),
-        )]));
+        app.apply_status(StatusUpdate::AgentsDiscovered {
+            found: vec![("alpha".into(), "root@alpha.lan".into())],
+            failed: vec![],
+        });
         assert_eq!(app.agent.agents.len(), 2);
     }
 
