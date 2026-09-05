@@ -19,6 +19,11 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
+        # Single source of truth for the version: the workspace
+        # manifest. The flake hardcoding its own copy is how releases
+        # drift.
+        version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
         # Both binaries shell out at runtime; the wrapper is what makes
         # `nix run`/module installs work without polluting the user's
         # profile with nix/ssh/git pins.
@@ -34,8 +39,7 @@
             extraRuntime ? [ ],
           }:
           pkgs.rustPlatform.buildRustPackage {
-            inherit pname;
-            version = "0.1.0";
+            inherit pname version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
 

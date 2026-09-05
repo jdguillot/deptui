@@ -468,6 +468,25 @@ Key invariants worth knowing before touching the code:
   are disabled at startup via `setrlimit(RLIMIT_CORE, 0)`. Never
   written to disk or logs.
 
+## Versioning & releases
+
+- **One version, one place:** `[workspace.package] version` in the
+  root `Cargo.toml`. Members inherit it (`version.workspace = true`)
+  and `flake.nix` reads it via `fromTOML` — never hardcode a version
+  anywhere else.
+- Pre-1.0 SemVer: **minor** for features (and anything breaking —
+  called out in the changelog), **patch** for fixes. Keybinding and
+  agent config/API changes count as user-facing surface.
+- **CHANGELOG.md discipline:** user-visible changes land in the
+  `[Unreleased]` section *in the same commit* that makes them. A
+  release = move `[Unreleased]` under a dated version heading, bump
+  the workspace version, commit ("Release vX.Y.Z"), then tag:
+  `git tag -a vX.Y.Z -m "vX.Y.Z"` and push with `--follow-tags`.
+- The TUI and agent are released in lockstep (one workspace version).
+  `deptui-agent status` reports its version over the wire; when the
+  two ever need to skew, gate on that field rather than inventing a
+  second version.
+
 ## Project conventions
 
 - **The agent is headless: everything it runs must be non-interactive.**
