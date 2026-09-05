@@ -259,6 +259,17 @@ Key invariants worth knowing before touching the code:
   When clearing the last field of an override, also remove the entry
   from `App.overrides` so the marker disappears — this is what
   `handle_key_edit_override` does.
+- **The mouse adds reach, not abilities.** `ui::draw` rebuilds
+  `App.mouse` (a `MouseMap` of inner rects + linear hit ranges for the
+  strip chips) every frame, and `handle_mouse` routes every hit
+  through the same handlers the keyboard uses (`activate_toggle`,
+  `activate_command`, `move_selection`, `scroll_job_log`). The hit
+  ranges are derived by the same width maths as the spans
+  (`toggle_hit_ranges` / `command_hit_ranges`, which
+  `commands_content_width` is itself derived from) — change a chip's
+  format and the ranges follow or the render test fails. Clicks are
+  inert under modal popups and in the agent view; a frame that draws
+  a different layout must clear the map first.
 - **App input mode is a state machine, not just a flag.** Key dispatch
   in `app::App::handle_key` first short-circuits Ctrl-C and the help
   popup, then routes by `InputMode`. Adding a new modal mode means

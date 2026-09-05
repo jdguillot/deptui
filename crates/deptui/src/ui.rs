@@ -9,6 +9,7 @@ use std::io::{stdout, Stdout};
 
 use anyhow::{Context, Result};
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
@@ -33,11 +34,16 @@ use crate::theme;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-pub fn init() -> Result<Tui> {
+pub fn init(mouse: bool) -> Result<Tui> {
     install_panic_hook();
     enable_raw_mode().context("enabling raw mode")?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen).context("entering alternate screen")?;
+    if mouse {
+        // Mouse capture trades away the terminal's native text
+        // selection (hold Shift for it); `--no-mouse` opts out.
+        execute!(out, EnableMouseCapture).context("enabling mouse capture")?;
+    }
     let backend = CrosstermBackend::new(out);
     let terminal = Terminal::new(backend).context("constructing terminal")?;
     Ok(terminal)
@@ -69,6 +75,8 @@ fn install_panic_hook() {
 /// can both reach it.
 pub fn restore() -> Result<()> {
     let mut out = stdout();
+    // Harmless when capture was never enabled.
+    execute!(out, DisableMouseCapture).ok();
     execute!(out, LeaveAlternateScreen).ok();
     disable_raw_mode().ok();
     Ok(())
@@ -162,6 +170,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
+    // Rebuild the hit-test map for exactly this frame; stale rects
+    // from a previous layout must never catch a click.
+    app.mouse = crate::app::MouseMap::default();
     if app.agent.open {
         // The agent view replaces the whole working area — it is a
         // different *mode* of the app, not a pane. Popups below still
@@ -169,6 +180,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_agent_screen(frame, area, app);
     } else {
         draw_title(frame, chunks[0], app);
+        app.mouse.toggles = Some(inner_rect(chunks[1]));
+        app.mouse.toggle_items = toggle_hit_ranges();
         draw_toggles_strip(frame, chunks[1], app);
         draw_body(frame, chunks[2], app);
         draw_commands_row(frame, chunks[3], app);
@@ -417,11 +430,25 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
         .constraints([Constraint::Min(3), Constraint::Length(details_total)])
         .split(cols[0]);
 
+    app.mouse.hosts = Some(inner_rect(left_rows[0]));
+    app.mouse.job_log = Some(inner_rect(cols[1]));
     draw_host_list(frame, left_rows[0], app);
     // Details needs to clamp its scroll offset against the rendered
     // visible height so we pass &mut App.
     draw_details(frame, left_rows[1], app);
     draw_job_log(frame, cols[1], app);
+}
+
+/// The border-less interior of a fully-bordered pane. All the panes
+/// the mouse map records use `Borders::ALL`, so this stays in step
+/// with `Block::inner` without needing the block itself.
+fn inner_rect(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
 }
 
 fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
@@ -1015,7 +1042,7 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(format!(
                 "{} / {}",
                 app.mode.label(),
-                app.profile_sel.label()
+                profile_selection_label(app.profile_sel)
             )),
         ]),
         Line::from(vec![
@@ -1884,6 +1911,23 @@ fn toggles_content_width() -> usize {
     1 + per_toggle + separators
 }
 
+/// Linear hit ranges for the toggles strip — same width maths as
+/// `toggle_span` / `toggles_content_width`, so a click lands exactly
+/// where the chip painted.
+fn toggle_hit_ranges() -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::with_capacity(TOGGLES.len());
+    let mut pos = 1usize; // leading space
+    for (i, def) in TOGGLES.iter().enumerate() {
+        if i > 0 {
+            pos += 2; // separator
+        }
+        let w = 6 + def.short_label.len();
+        out.push((pos, pos + w, i));
+        pos += w;
+    }
+    out
+}
+
 fn toggle_span(key: &str, label: &str, on: bool, focused: bool) -> Span<'static> {
     // The indicator dot carries the on/off signal in colour. When
     // focused, the chip gets a darker (grey) background — distinct
@@ -1917,7 +1961,7 @@ fn toggle_span(key: &str, label: &str, on: bool, focused: bool) -> Span<'static>
 /// on `app.focus`, so `j/k` in Hosts says "move selection" while in
 /// Details it says "scroll" and surfaces `g/G` and `/` instead. This
 /// mirrors the way the pane-specific keys actually behave.
-fn draw_commands_row(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_commands_row(frame: &mut Frame, area: Rect, app: &mut App) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -1931,6 +1975,8 @@ fn draw_commands_row(frame: &mut Frame, area: Rect, app: &App) {
         .title(Line::from(pane_title_spans("commands", 'c', focused)));
     let cmd_inner = cmd_block.inner(cols[0]);
     frame.render_widget(cmd_block, cols[0]);
+    app.mouse.commands = Some(cmd_inner);
+    app.mouse.command_items = command_hit_ranges(app);
 
     let spans = build_commands_spans(app, focused);
     frame.render_widget(
@@ -2070,7 +2116,12 @@ fn build_commands_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
         }
         first = false;
         let (key, label) = command_hint(app, *cmd, key, label);
-        spans.extend(command_button(key, label, sub == Some(i)));
+        spans.extend(command_button(
+            key,
+            label,
+            command_dot(app, *cmd),
+            sub == Some(i),
+        ));
     }
     spans
 }
@@ -2095,18 +2146,10 @@ fn command_hint(
 /// Rendered width of the commands-button row, accounting for hidden
 /// commands (e.g. Boot when home-only profile is selected).
 fn commands_content_width(app: &App) -> usize {
-    let visible: Vec<_> = COMMANDS
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| app.command_is_visible(*i))
-        .map(|(_, (cmd, key, label))| command_hint(app, *cmd, key, label))
-        .collect();
-    let per_button: usize = visible
-        .iter()
-        .map(|(key, label)| 3 + key.len() + label.len())
-        .sum();
-    let separators = visible.len().saturating_sub(1);
-    1 + per_button + separators
+    // The hit-range builder walks the identical widths; deriving the
+    // total from it keeps click targets and wrap decisions in
+    // lockstep by construction.
+    command_hit_ranges(app).last().map_or(1, |(_, end, _)| *end)
 }
 
 /// Two-span command button: the key in yellow (same colour as the
@@ -2115,7 +2158,12 @@ fn commands_content_width(app: &App) -> usize {
 /// cyan/black highlight on the focused host row, because the host
 /// selection persists across pane focus changes while the command
 /// cursor is transient and shouldn't compete with it.
-fn command_button(key: &'static str, label: &'static str, focused: bool) -> [Span<'static>; 3] {
+fn command_button(
+    key: &'static str,
+    label: &'static str,
+    dot: Option<bool>,
+    focused: bool,
+) -> Vec<Span<'static>> {
     let key_style;
     let sep_style;
     let label_style;
@@ -2135,17 +2183,86 @@ fn command_button(key: &'static str, label: &'static str, focused: bool) -> [Spa
         sep_style = Style::default().fg(theme::MUTED);
         label_style = Style::default();
     }
-    [
+    let mut spans = vec![
         Span::styled(format!(" {key}"), key_style),
         Span::styled(":", sep_style),
-        Span::styled(format!("{label} "), label_style),
-    ]
+    ];
+    // Stateful buttons (the profile toggles) carry an on/off dot like
+    // the numbered toggles strip, so the current selection is visible
+    // as a set — `s:● sys h:● home` reads as "both", not as a mystery
+    // three-state cycle.
+    if let Some(on) = dot {
+        let icon = if on { "● " } else { "○ " };
+        let dot_style = if focused {
+            Style::default().fg(theme::EMPHASIS).bg(theme::SURFACE_SEL)
+        } else if on {
+            Style::default().fg(theme::SUCCESS)
+        } else {
+            Style::default().fg(theme::MUTED)
+        };
+        spans.push(Span::styled(icon.to_string(), dot_style));
+    }
+    spans.push(Span::styled(format!("{label} "), label_style));
+    spans
+}
+
+/// Which command buttons render a state dot, and its current value.
+fn command_dot(app: &App, cmd: crate::app::Command) -> Option<bool> {
+    match cmd {
+        crate::app::Command::ProfileSystem => Some(matches!(
+            app.profile_sel,
+            ProfileSel::All | ProfileSel::System
+        )),
+        crate::app::Command::ProfileHome => Some(matches!(
+            app.profile_sel,
+            ProfileSel::All | ProfileSel::Home
+        )),
+        _ => None,
+    }
+}
+
+/// Linear hit ranges for the visible command buttons — same width
+/// maths as `command_button` / `commands_content_width`.
+fn command_hit_ranges(app: &App) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    let mut pos = 1usize; // leading space
+    let mut first = true;
+    for (i, (cmd, key, label)) in COMMANDS.iter().enumerate() {
+        if !app.command_is_visible(i) {
+            continue;
+        }
+        if !first {
+            pos += 1; // separator
+        }
+        first = false;
+        let (key, label) = command_hint(app, *cmd, key, label);
+        let dot = if command_dot(app, *cmd).is_some() {
+            2
+        } else {
+            0
+        };
+        let w = 3 + key.len() + label.len() + dot;
+        out.push((pos, pos + w, i));
+        pos += w;
+    }
+    out
 }
 
 /// Bottom input strip: renders prompt text when the user is mid-input
 /// (override menu, edit field, confirm popup, etc.) and is left blank
 /// in Normal mode — the commands row above already carries every
 /// informational hint the old cheat sheet used to show.
+/// Human form of the profile selection: the *set* that is selected
+/// (`system+home`), never the word "all" — toggling reads as adding
+/// and removing members, which is what the s/h keys do.
+fn profile_selection_label(sel: ProfileSel) -> &'static str {
+    match sel {
+        ProfileSel::All => "system+home",
+        ProfileSel::System => "system",
+        ProfileSel::Home => "home",
+    }
+}
+
 fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
     let line = match &app.input {
         InputMode::ConfirmDeploy { .. } => Line::from(vec![
@@ -2645,7 +2762,7 @@ fn draw_confirm_popup(
     lines.push(Line::from(vec![
         Span::styled("profile ", Style::default().fg(theme::MUTED)),
         Span::styled(
-            profile.label(),
+            profile_selection_label(profile),
             Style::default()
                 .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),

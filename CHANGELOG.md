@@ -10,6 +10,31 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- Mouse support: wheel-scroll the job log, the help popup, and the
+  host selection; click to focus panes, select hosts, flip toggles,
+  and press command buttons. `--no-mouse` opts out (mouse capture
+  makes terminal-native text selection require holding Shift).
+- Cancel for the agent: `deptui-agent cancel` / `POST /cancel` / `x`
+  in the TUI agent view stops a deploy run in flight and parks its
+  hosts at that revision. Pause acks now say a run in flight keeps
+  going and point at cancel.
+
+### Changed
+
+- Profile selection reads as a set: the `s`/`h` command buttons carry
+  on/off dots (`s:● sys h:● home`) and the details pane / confirm
+  popup say `system+home` instead of `all`.
+
+### Fixed
+
+- Pressing `a` with no agent configured did nothing: the setup hint
+  was filtered out of the job log (untagged app-level lines were
+  never shown anywhere). Untagged lines now always show, and `a`
+  always opens the agent view — with setup instructions and any
+  settings-file parse error when no agent is configured.
+
 ## [0.2.0] — 2026-09-05
 
 The auto-deploy agent release. deptui grows from a single-binary TUI

@@ -13,7 +13,11 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
@@ -397,6 +401,40 @@ pub struct AgentManaged {
     pub offline: bool,
 }
 
+/// Hit-test map for mouse input, rebuilt by `ui::draw` every frame so
+/// clicks resolve against exactly what is on screen. Rects are the
+/// *inner* (border-less) areas. Strip items are linear column ranges
+/// (row-major over the inner rect, so a wrapped strip still resolves).
+#[derive(Debug, Default, Clone)]
+pub struct MouseMap {
+    pub toggles: Option<Rect>,
+    pub hosts: Option<Rect>,
+    pub job_log: Option<Rect>,
+    pub commands: Option<Rect>,
+    /// `(start, end, toggle index)` linear ranges inside `toggles`.
+    pub toggle_items: Vec<(usize, usize, usize)>,
+    /// `(start, end, COMMANDS index)` linear ranges inside `commands`.
+    pub command_items: Vec<(usize, usize, usize)>,
+}
+
+fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+/// Resolve a click inside `inner` to a strip item via its linear
+/// position. Wrap-aware by construction: `Wrap` lays the spans out
+/// row-major, which is exactly how the linear position walks.
+fn linear_hit(items: &[(usize, usize, usize)], inner: Rect, x: u16, y: u16) -> Option<usize> {
+    if !rect_contains(inner, x, y) {
+        return None;
+    }
+    let pos = (y - inner.y) as usize * inner.width as usize + (x - inner.x) as usize;
+    items
+        .iter()
+        .find(|(start, end, _)| (*start..*end).contains(&pos))
+        .map(|(_, _, idx)| *idx)
+}
+
 /// Background work updates we receive over the status channel.
 #[derive(Debug)]
 enum StatusUpdate {
@@ -567,6 +605,8 @@ pub struct App {
     /// inside `host.rs` so the underlying nix/ssh children are
     /// reaped, not orphaned.
     probe_tasks: Vec<JoinHandle<()>>,
+    /// Mouse hit-test map, rebuilt each frame by the renderer.
+    pub mouse: MouseMap,
     /// Agent view state + the ambient managed-host map for badges.
     pub agent: AgentUi,
     /// Node name → what the agent last reported about it. Drives the
@@ -639,6 +679,7 @@ impl App {
             cached_password: None,
             pending_deploy: None,
             probe_tasks: Vec::new(),
+            mouse: MouseMap::default(),
             agent: AgentUi::new(&settings),
             agent_managed: HashMap::new(),
             should_quit: false,
@@ -859,7 +900,77 @@ impl App {
         match ev {
             AppEvent::Tick => self.tick_counter = self.tick_counter.wrapping_add(1),
             AppEvent::Term(CtEvent::Key(key)) => self.handle_key(key),
+            AppEvent::Term(CtEvent::Mouse(me)) => self.handle_mouse(me),
             AppEvent::Term(_) => {}
+        }
+    }
+
+    /// Mouse input. Wheel scrolls whichever pane is under the pointer
+    /// (job log, host list, help popup); left click focuses panes,
+    /// selects host rows, flips toggles, and presses command buttons.
+    /// Everything routes through the same handlers the keyboard uses —
+    /// the mouse adds no new abilities, only new reach.
+    fn handle_mouse(&mut self, me: MouseEvent) {
+        // The help popup is modal: the wheel scrolls it, nothing else
+        // reacts underneath.
+        if self.show_help {
+            match me.kind {
+                MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => self.help_scroll = self.help_scroll.saturating_add(3),
+                _ => {}
+            }
+            return;
+        }
+        // Modal inputs (confirm popups, password prompts) and the agent
+        // view are keyboard-only for now; a stray click must not
+        // confirm or cancel anything.
+        if self.agent.open || !matches!(self.input, InputMode::Normal) {
+            return;
+        }
+        let (x, y) = (me.column, me.row);
+        let map = self.mouse.clone();
+        match me.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = matches!(me.kind, MouseEventKind::ScrollUp);
+                if map.job_log.is_some_and(|r| rect_contains(r, x, y)) {
+                    // Wheel-up scrolls back in history, matching `k`.
+                    self.scroll_job_log(if up { 3 } else { -3 });
+                } else if map.hosts.is_some_and(|r| rect_contains(r, x, y)) {
+                    self.move_selection(if up { -1 } else { 1 });
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(i) = map
+                    .toggles
+                    .and_then(|r| linear_hit(&map.toggle_items, r, x, y))
+                {
+                    self.focus = FocusPane::Toggles;
+                    self.toggle_index = i;
+                    self.activate_toggle(i);
+                } else if let Some(i) = map
+                    .commands
+                    .and_then(|r| linear_hit(&map.command_items, r, x, y))
+                {
+                    if self.command_is_visible(i) {
+                        self.focus = FocusPane::Commands;
+                        self.command_index = i;
+                        self.activate_command(i);
+                    }
+                } else if let Some(r) = map.hosts.filter(|r| rect_contains(*r, x, y)) {
+                    self.focus = FocusPane::Hosts;
+                    let idx = (y - r.y) as usize;
+                    if idx < self.nodes.len() {
+                        self.selected = idx;
+                    }
+                } else if map.job_log.is_some_and(|r| rect_contains(r, x, y)) {
+                    self.focus = FocusPane::JobLog;
+                } else if map.toggles.is_some_and(|r| rect_contains(r, x, y)) {
+                    self.focus = FocusPane::Toggles;
+                } else if map.commands.is_some_and(|r| rect_contains(r, x, y)) {
+                    self.focus = FocusPane::Commands;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4531,6 +4642,99 @@ mod tests {
         let rows = app.agent.host_rows();
         let (w, h, paused) = app.selected_agent_host(&rows).unwrap();
         assert_eq!((w.as_str(), h.as_str(), paused), ("w", "b", true));
+    }
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn linear_hit_resolves_wrapped_positions() {
+        let inner = Rect {
+            x: 2,
+            y: 1,
+            width: 10,
+            height: 2,
+        };
+        let items = vec![(1, 6, 0), (8, 14, 1)];
+        // First row.
+        assert_eq!(linear_hit(&items, inner, 3, 1), Some(0));
+        assert_eq!(linear_hit(&items, inner, 8, 1), None); // gap
+                                                           // Item 1 wraps onto row two: linear pos 12 = (1*10)+2.
+        assert_eq!(linear_hit(&items, inner, 4, 2), Some(1));
+        // Outside the rect entirely.
+        assert_eq!(linear_hit(&items, inner, 3, 5), None);
+    }
+
+    #[test]
+    fn mouse_clicks_select_hosts_flip_toggles_press_buttons() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.mouse.hosts = Some(Rect {
+            x: 1,
+            y: 5,
+            width: 20,
+            height: 5,
+        });
+        app.mouse.toggles = Some(Rect {
+            x: 1,
+            y: 1,
+            width: 60,
+            height: 1,
+        });
+        app.mouse.toggle_items = vec![(0, 10, 0)];
+        app.mouse.commands = Some(Rect {
+            x: 1,
+            y: 20,
+            width: 60,
+            height: 1,
+        });
+        // Button 4 = the ProfileSystem command in COMMANDS.
+        let sys_idx = COMMANDS
+            .iter()
+            .position(|(c, _, _)| *c == Command::ProfileSystem)
+            .unwrap();
+        app.mouse.command_items = vec![(0, 10, sys_idx)];
+
+        // Click the second host row.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 6));
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.focus, FocusPane::Hosts);
+
+        // Click toggle 0 (skip-checks) — flips it and moves focus.
+        assert!(!app.toggles.skip_checks);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1));
+        assert!(app.toggles.skip_checks);
+        assert_eq!(app.focus, FocusPane::Toggles);
+
+        // Click the sys profile button: system leaves the selection.
+        assert_eq!(app.profile_sel, ProfileSel::All);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 20));
+        assert_eq!(app.profile_sel, ProfileSel::Home);
+
+        // Wheel over the hosts pane moves the selection.
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 3, 6));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn mouse_is_inert_during_modal_input() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.mouse.hosts = Some(Rect {
+            x: 1,
+            y: 5,
+            width: 20,
+            height: 5,
+        });
+        app.input = InputMode::ConfirmQuit {
+            deploy_running: false,
+        };
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 6));
+        assert_eq!(app.selected, 0, "clicks must not act under a modal popup");
     }
 
     #[test]

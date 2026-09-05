@@ -37,6 +37,11 @@ struct Cli {
     #[arg(long = "build-arg", value_name = "ARG")]
     build_args: Vec<String>,
 
+    /// Disable mouse capture (mouse capture makes terminal-native text
+    /// selection require holding Shift).
+    #[arg(long)]
+    no_mouse: bool,
+
     /// Internal: act as an SSH_ASKPASS helper. SSH calls this with the prompt
     /// as $1. Not intended for direct use.
     #[arg(long, hide = true)]
@@ -71,7 +76,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut terminal = ui::init()?;
+    let mut terminal = ui::init(!cli.no_mouse)?;
     let mut app = App::with_settings(cli.flake.clone(), nodes, Settings::load());
     app.extra_build_args = cli.build_args;
     let result = app.run(&mut terminal).await;

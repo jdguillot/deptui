@@ -353,6 +353,15 @@ Optional flags:
 | `--log-file` | write tracing logs to a file (TUI stays clean)   |
 | `--build-arg` | extra `nix build` arg, forwarded after deploy-rs's `--` (repeatable) |
 
+## Mouse
+
+The panes are mouse-aware: the wheel scrolls the job log (and the help
+popup) and moves the host selection; left click focuses panes, selects
+host rows, flips the numbered toggles, and presses command buttons —
+everything routes through the same handlers the keyboard uses. Mouse
+capture makes your terminal's native text selection require holding
+Shift; start with `--no-mouse` to opt out entirely.
+
 ## Key bindings
 
 | key            | action                                                       |
@@ -371,7 +380,7 @@ Optional flags:
 | `Shift+U`      | full update check: closure size delta + package diff         |
 | `Shift+P`      | build plan preflight: what gets compiled + download size     |
 | `Shift+C`      | substituter drift: caches this deploy adds but can't use     |
-| `s` / `h`       | toggle system / home profile in the deploy target (both on = all; the last one can't be turned off) |
+| `s` / `h`       | toggle the system / home profile in the deploy target — the buttons show the selected set as dots (`s:● sys h:● home`); the last one can't be turned off |
 | `Shift+S` / `Shift+B` / `Shift+D` | deploy: switch now / boot entry / dry run  |
 | `a`            | open the agent view (auto-deploy daemon status & control)    |
 | `x`            | cancel the running deploy (kills its whole process group)    |

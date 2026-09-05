@@ -534,3 +534,56 @@ fn agent_view_explains_missing_and_broken_settings() {
     assert!(out.contains("could not be loaded"), "{out}");
     assert!(out.contains("agnets"), "parse error text missing: {out}");
 }
+
+/// The renderer rebuilds the mouse hit-test map every frame; clicks
+/// resolve against exactly what was painted.
+#[test]
+fn draw_populates_the_mouse_map() {
+    let mut app = App::new(".".into(), nodes());
+    let _ = render(&mut app, 120, 40);
+    let hosts = app.mouse.hosts.expect("hosts rect recorded");
+    assert!(hosts.height > 0 && hosts.width > 0);
+    assert!(app.mouse.job_log.is_some());
+    assert!(app.mouse.toggles.is_some());
+    assert!(app.mouse.commands.is_some());
+    assert!(!app.mouse.toggle_items.is_empty());
+    assert!(!app.mouse.command_items.is_empty());
+    // Ranges are within the strip's drawable area.
+    let toggles = app.mouse.toggles.unwrap();
+    let max_end = app
+        .mouse
+        .toggle_items
+        .iter()
+        .map(|(_, e, _)| *e)
+        .max()
+        .unwrap();
+    assert!(
+        max_end <= (toggles.width as usize) * 2,
+        "{max_end} vs {toggles:?}"
+    );
+
+    // The agent view replaces the layout — no stale main-screen rects
+    // may survive into its frames.
+    app.agent.open = true;
+    let _ = render(&mut app, 120, 40);
+    assert!(app.mouse.hosts.is_none(), "agent view must clear the map");
+}
+
+/// Profile selection renders as a set with on/off dots, not "all".
+#[test]
+fn profile_buttons_show_dots_and_selection_reads_as_a_set() {
+    let mut app = App::new(".".into(), nodes());
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("s:● sys"), "sys dot on: {out}");
+    assert!(out.contains("h:● home"), "home dot on: {out}");
+    assert!(out.contains("system+home"), "details shows the set: {out}");
+    assert!(!out.contains("switch / all"), "the word all is gone: {out}");
+
+    app.input = InputMode::ConfirmDeploy {
+        hosts: vec!["alpha".into()],
+        mode: Mode::Switch,
+        profile: ProfileSel::System,
+    };
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("system"), "{out}");
+}
