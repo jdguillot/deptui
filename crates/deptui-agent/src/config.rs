@@ -234,10 +234,6 @@ impl HostConfig {
         t
     }
 
-    // Wired up by the offline catch-up runner/daemon work; the knob
-    // ships first so the config surface is stable. Remove the allow
-    // when the runner reads it.
-    #[allow(dead_code)]
     pub fn catch_up(&self) -> bool {
         self.catch_up.unwrap_or(true)
     }
@@ -284,8 +280,9 @@ impl WatchConfig {
     /// Recheck cadence for offline hosts with a pending update.
     pub fn offline_recheck(&self) -> Result<Duration> {
         match &self.offline_recheck {
-            Some(s) => parse_duration(s)
-                .with_context(|| format!("watch `{}`: offline_recheck", self.name)),
+            Some(s) => {
+                parse_duration(s).with_context(|| format!("watch `{}`: offline_recheck", self.name))
+            }
             None => Ok(Duration::from_secs(120)),
         }
     }

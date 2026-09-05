@@ -32,6 +32,15 @@ was explicitly confirmed; treat this as the contract for implementation.
 - Hosts deploy **sequentially**. Updates arriving mid-run **coalesce to the
   newest** head. **No same-commit retry**: a failed host is parked
   (failed-at-C) until a new commit, a kick, or a force-deploy.
+- **Offline catch-up** (per-host `catch_up`, default on): before each
+  deploy the runner probes the target (BatchMode ssh). A host that is
+  down gets outcome `offline` — a *pending update*, not a parked
+  failure. The daemon re-probes the stored ssh target at the watch's
+  `offline_recheck` cadence (default 2m) and, the moment the host
+  answers, triggers a "catch-up" poll so normal eligibility deploys the
+  coalesced newest revision. Markers persist in state, so rechecks
+  resume across agent restarts. `catch_up = false` restores
+  attempt-and-park.
   `auto-rollback` / `magic-rollback` follow deploy-rs defaults but are
   exposed as per-host settings. `interactive_sudo` is **rejected** in agent
   config (headless — no PTY/askpass path).

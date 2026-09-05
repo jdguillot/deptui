@@ -26,9 +26,15 @@ struct Env {
     config_path: PathBuf,
     /// Every `deploy` invocation appends its argv here.
     deploy_log: PathBuf,
+    /// While this file exists, the `ssh` shim reports the host down.
+    down_marker: PathBuf,
 }
 
 fn setup(deploy_exit: i32) -> Env {
+    setup_with(deploy_exit, "")
+}
+
+fn setup_with(deploy_exit: i32, extra_host_cfg: &str) -> Env {
     let shims = TempDir::new().unwrap();
     let deploy_log = shims.path().join("deploy-calls.log");
 
@@ -48,6 +54,20 @@ fn setup(deploy_exit: i32) -> Env {
     )
     .unwrap();
     fs::set_permissions(&deploy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // `ssh` shim: up unless the down-marker exists. The catch-up probe
+    // (and the daemon's rechecks) go through this.
+    let down_marker = shims.path().join("host-down");
+    let ssh = shims.path().join("ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nif [ -e {} ]; then echo 'Connection refused' >&2; exit 255; fi\nexit 0\n",
+            down_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
 
     let shim_path = format!(
         "{}:{}",
@@ -76,8 +96,10 @@ name = "infra"
 repo = "{repo}"
 branch = "main"
 interval = "1h"
+offline_recheck = "1s"
 
 [watch.hosts.web]
+{extra_host_cfg}
 "#,
             state = state.path().display(),
             repo = repo.path().display(),
@@ -92,6 +114,7 @@ interval = "1h"
         state,
         config_path,
         deploy_log,
+        down_marker,
     }
 }
 
@@ -99,6 +122,8 @@ fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
@@ -288,4 +313,111 @@ fn daemon_serves_status_pause_kick_over_socket() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn offline_host_is_pending_not_failed_and_catches_up() {
+    let env = setup(0);
+    fs::write(&env.down_marker, "").unwrap();
+
+    // Down at deploy time: not an error, no deploy attempt, no parking.
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "offline is pending, not failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("offline"));
+    assert_eq!(deploy_calls(&env).len(), 0, "no deploy while down");
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.state.path().join("state.json")).unwrap())
+            .unwrap();
+    let host = &state["watches"]["infra"]["hosts"]["web"];
+    assert!(host["failed"].is_null(), "not parked: {state}");
+    assert_eq!(host["offline"]["target"], "root@web.lan");
+    assert!(host["offline"]["rev"].is_string());
+
+    // Back online: the pending update lands and the marker clears.
+    fs::remove_file(&env.down_marker).unwrap();
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert_eq!(deploy_calls(&env).len(), 1);
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.state.path().join("state.json")).unwrap())
+            .unwrap();
+    let host = &state["watches"]["infra"]["hosts"]["web"];
+    assert!(host["offline"].is_null(), "marker cleared: {state}");
+    assert!(host["deployed"]["rev"].is_string());
+}
+
+#[test]
+fn catch_up_off_attempts_deploy_while_down() {
+    let env = setup_with(0, "catch_up = false\n");
+    fs::write(&env.down_marker, "").unwrap();
+
+    // No pre-probe: the deploy is attempted regardless (our shim
+    // "succeeds" — the point is that the attempt happened).
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(deploy_calls(&env).len(), 1, "deploy attempted while down");
+}
+
+#[test]
+fn daemon_recheck_deploys_when_host_returns() {
+    let env = setup(0);
+    fs::write(&env.down_marker, "").unwrap();
+    let socket = env.state.path().join("agent.sock");
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("--config")
+        .arg(&env.config_path)
+        .arg("run")
+        .env("PATH", &env.shim_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let wait_for = |what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| {
+        let start = Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for("socket", Box::new(|| socket.exists()));
+
+    let host_field = |field: &str| -> serde_json::Value {
+        let out = agent(&env, &["status", "--json"]);
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        status["watches"][0]["hosts"][0][field].clone()
+    };
+
+    let out = agent(&env, &["kick"]);
+    assert!(out.status.success());
+    wait_for(
+        "offline marker",
+        Box::new(|| host_field("offline_rev").is_string()),
+    );
+    assert_eq!(deploy_calls(&env).len(), 0);
+
+    // Host comes back: the 1s recheck notices and the update lands
+    // without any human involvement.
+    fs::remove_file(&env.down_marker).unwrap();
+    wait_for(
+        "catch-up deploy",
+        Box::new(|| host_field("deployed_rev").is_string()),
+    );
+    assert!(!deploy_calls(&env).is_empty());
+    assert!(host_field("offline_rev").is_null());
+
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
 }

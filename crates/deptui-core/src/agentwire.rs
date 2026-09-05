@@ -57,6 +57,12 @@ pub struct HostStatus {
     pub failed_message: Option<String>,
     #[serde(default)]
     pub unreachable: Option<String>,
+    /// Set when the host was down at deploy time (catch-up pending):
+    /// the revision waiting to land and when the host was found down.
+    #[serde(default)]
+    pub offline_rev: Option<String>,
+    #[serde(default)]
+    pub offline_time: Option<u64>,
 }
 
 /// Per-host outcome inside a run: `"ok"`, `"failed"`, or `"skipped"`.

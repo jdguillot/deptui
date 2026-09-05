@@ -8,9 +8,13 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::broadcast;
 
+use std::process::Stdio;
+use std::time::Duration;
+
 use deptui_core::askpass::AskpassEnv;
 use deptui_core::deploy::{self, DeployRequest, LogLine, ProfileInfo};
 use deptui_core::flake;
+use deptui_core::host::build_ssh_target;
 
 use crate::config::{NotifyConfig, WatchConfig};
 use crate::notify::{self, Event};
@@ -24,6 +28,43 @@ pub struct RunPlan {
     pub trigger: String,
     /// Node names, in order.
     pub hosts: Vec<String>,
+}
+
+/// How one host ended, when the deploy machinery itself didn't error.
+pub enum DeployOutcome {
+    Deployed,
+    /// The host was down before we started and `catch_up` is on: the
+    /// update stays pending and the daemon re-probes `target`.
+    Offline {
+        target: String,
+        message: String,
+    },
+}
+
+/// BatchMode reachability probe, mirroring what a deploy will need.
+/// Shared by the pre-deploy catch-up probe, the daemon's startup
+/// validation, its offline rechecks, and the `validate` subcommand.
+pub async fn check_reachable(
+    target: &str,
+    override_: &deptui_core::ssh::SshOverride,
+) -> Result<(), String> {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
+    for arg in override_.ssh_args() {
+        cmd.arg(arg);
+    }
+    cmd.arg(target)
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => Ok(()),
+        Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Ok(Err(e)) => Err(format!("spawning ssh: {e}")),
+        Err(_) => Err("ssh probe timed out".to_string()),
+    }
 }
 
 /// The agent never answers an ssh prompt: SSH_ASKPASS points at
@@ -98,6 +139,7 @@ pub async fn execute(
                     host: host.clone(),
                     outcome: "failed".into(),
                     message: Some(msg.clone()),
+                    target: None,
                 });
                 notify::dispatch(
                     notify_cfg,
@@ -121,7 +163,22 @@ pub async fn execute(
         )
         .await;
         match outcome {
-            Ok(()) => {
+            Ok(DeployOutcome::Offline { target, message }) => {
+                log(
+                    &mut record,
+                    format!(
+                        "[{}] {host}: offline ({target}) — update pending until it answers",
+                        watch.name
+                    ),
+                );
+                record.hosts.push(HostRun {
+                    host: host.clone(),
+                    outcome: "offline".into(),
+                    message: Some(message),
+                    target: Some(target),
+                });
+            }
+            Ok(DeployOutcome::Deployed) => {
                 log(
                     &mut record,
                     format!("[{}] {host}: deployed {short}", watch.name),
@@ -130,6 +187,7 @@ pub async fn execute(
                     host: host.clone(),
                     outcome: "ok".into(),
                     message: None,
+                    target: None,
                 });
                 notify::dispatch(
                     notify_cfg,
@@ -152,6 +210,7 @@ pub async fn execute(
                     host: host.clone(),
                     outcome: "failed".into(),
                     message: Some(msg.clone()),
+                    target: None,
                 });
                 notify::dispatch(
                     notify_cfg,
@@ -186,7 +245,7 @@ async fn deploy_host(
     rev: &str,
     notify_cfg: &NotifyConfig,
     mut log: impl FnMut(String),
-) -> Result<()> {
+) -> Result<DeployOutcome> {
     let hc = watch
         .hosts
         .get(host)
@@ -197,6 +256,17 @@ async fn deploy_host(
             &rev[..rev.len().min(12)]
         )
     })?;
+
+    // Offline catch-up: probe before deploying so a sleeping host is a
+    // pending update, not a parked failure. With catch_up off the
+    // deploy is attempted regardless and a dead host fails normally.
+    if hc.catch_up() {
+        let override_ = hc.ssh_override();
+        let target = build_ssh_target(node, "system", &override_);
+        if let Err(message) = check_reachable(&target, &override_).await {
+            return Ok(DeployOutcome::Offline { target, message });
+        }
+    }
 
     notify::dispatch(
         notify_cfg,
@@ -253,7 +323,7 @@ async fn deploy_host(
         return Err(anyhow!("deploy failed to run: {e}"));
     }
     match exit {
-        Some(0) => Ok(()),
+        Some(0) => Ok(DeployOutcome::Deployed),
         Some(code) => Err(anyhow!("deploy exited with code {code}")),
         None => Err(anyhow!("deploy ended without an exit status")),
     }

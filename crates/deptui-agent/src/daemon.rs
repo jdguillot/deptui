@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +18,7 @@ use deptui_core::host::build_ssh_target;
 
 use crate::config::{AgentConfig, Cadence, WatchConfig};
 use crate::notify::{self, Event};
-use crate::runner::{self, RunPlan};
+use crate::runner::{self, check_reachable, RunPlan};
 use crate::state::{now_unix, AgentState, FailStamp, Stamp};
 use crate::wire;
 
@@ -78,6 +77,9 @@ pub struct Daemon {
     cadences: BTreeMap<String, Cadence>,
     /// Next scheduled poll per watch.
     next_poll: BTreeMap<String, Instant>,
+    /// Next offline-host re-probe per watch, present only while some
+    /// host of that watch has a pending (offline) update.
+    recheck_at: BTreeMap<String, Instant>,
     running: Option<RunningRun>,
     /// Watches that asked for a poll while a run was in flight
     /// (coalescing) or explicitly via kick.
@@ -108,6 +110,7 @@ impl Daemon {
             state,
             cadences,
             next_poll,
+            recheck_at: BTreeMap::new(),
             running: None,
             pending: Vec::new(),
             log_tx,
@@ -153,13 +156,27 @@ impl Daemon {
         self.next_poll.insert(watch.to_string(), next);
     }
 
-    /// The soonest scheduled poll, for the select! sleep.
+    /// The soonest scheduled poll or offline recheck, for the select!
+    /// sleep.
     fn earliest_poll(&self) -> Instant {
         self.next_poll
             .values()
+            .chain(self.recheck_at.values())
             .min()
             .copied()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))
+    }
+
+    /// Arm (or re-arm) the offline recheck timer for a watch.
+    fn schedule_recheck(&mut self, watch: &str) {
+        let Some(wcfg) = self.watch_cfg(watch) else {
+            return;
+        };
+        let cadence = wcfg
+            .offline_recheck()
+            .unwrap_or_else(|_| Duration::from_secs(120));
+        self.recheck_at
+            .insert(watch.to_string(), Instant::now() + cadence);
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -170,6 +187,17 @@ impl Daemon {
             self.cfg.socket.display()
         );
         self.startup_validation().await;
+        // Offline markers survive restarts; resume their rechecks.
+        let resumed: Vec<String> = self
+            .state
+            .watches
+            .iter()
+            .filter(|(_, ws)| ws.hosts.values().any(|h| h.offline.is_some()))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for w in resumed {
+            self.schedule_recheck(&w);
+        }
         loop {
             let deadline = self.earliest_poll();
             tokio::select! {
@@ -179,6 +207,7 @@ impl Daemon {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     self.poll_due().await;
+                    self.recheck_due().await;
                 }
                 _ = shutdown_signal() => {
                     tracing::info!("shutting down");
@@ -301,6 +330,8 @@ impl Daemon {
                             failed_time: hs.failed.as_ref().map(|s| s.time),
                             failed_message: hs.failed.as_ref().map(|s| s.message.clone()),
                             unreachable: hs.unreachable.clone(),
+                            offline_rev: hs.offline.as_ref().map(|o| o.rev.clone()),
+                            offline_time: hs.offline.as_ref().map(|o| o.time),
                         }
                     })
                     .collect();
@@ -492,6 +523,72 @@ impl Daemon {
         }
     }
 
+    /// Re-probe the offline hosts of every watch whose recheck timer is
+    /// due. A host that answers gets its marker cleared and the watch a
+    /// "catch-up" poll — normal eligibility then deploys the coalesced
+    /// newest revision. Hosts still down re-arm the timer.
+    async fn recheck_due(&mut self) {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .recheck_at
+            .iter()
+            .filter(|(_, t)| **t <= now)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for watch in due {
+            self.recheck_at.remove(&watch);
+            let offline: Vec<(String, crate::state::OfflineStamp)> = self
+                .state
+                .watches
+                .get(&watch)
+                .map(|ws| {
+                    ws.hosts
+                        .iter()
+                        .filter_map(|(h, hs)| hs.offline.clone().map(|o| (h.clone(), o)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if offline.is_empty() {
+                continue;
+            }
+            let overrides: BTreeMap<String, deptui_core::ssh::SshOverride> = self
+                .watch_cfg(&watch)
+                .map(|w| {
+                    w.hosts
+                        .iter()
+                        .map(|(h, hc)| (h.clone(), hc.ssh_override()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut back = Vec::new();
+            let mut still_down = false;
+            for (host, stamp) in &offline {
+                let override_ = overrides.get(host).cloned().unwrap_or_default();
+                match check_reachable(&stamp.target, &override_).await {
+                    Ok(()) => back.push(host.clone()),
+                    Err(_) => still_down = true,
+                }
+            }
+            if !back.is_empty() {
+                let ws = self.state.watch_mut(&watch);
+                for host in &back {
+                    if let Some(hs) = ws.hosts.get_mut(host) {
+                        hs.offline = None;
+                    }
+                }
+                self.save_state();
+                tracing::info!(
+                    "watch {watch}: {} back online — catching up",
+                    back.join(", ")
+                );
+                self.request_poll(&watch, "catch-up").await;
+            }
+            if still_down {
+                self.schedule_recheck(&watch);
+            }
+        }
+    }
+
     /// Poll one watch now; start a run when there's something to do.
     async fn request_poll(&mut self, watch: &str, trigger: &str) {
         if self.running.is_some() {
@@ -619,6 +716,7 @@ impl Daemon {
                             time,
                         });
                         hs.failed = None;
+                        hs.offline = None;
                     }
                     "failed" => {
                         hs.failed = Some(FailStamp {
@@ -626,14 +724,26 @@ impl Daemon {
                             time,
                             message: hr.message.clone().unwrap_or_default(),
                         });
+                        hs.offline = None;
+                    }
+                    "offline" => {
+                        hs.offline = Some(crate::state::OfflineStamp {
+                            rev: rev.clone(),
+                            time,
+                            target: hr.target.clone().unwrap_or_default(),
+                        });
                     }
                     _ => {}
                 }
             }
         }
+        let had_offline = record.hosts.iter().any(|h| h.outcome == "offline");
         self.state.push_run(&watch, record);
         self.running = None;
         self.save_state();
+        if had_offline {
+            self.schedule_recheck(&watch);
+        }
         // Coalesce: whatever queued up while we were deploying gets its
         // poll now — at most one deploy pipeline runs at a time.
         let pending = std::mem::take(&mut self.pending);
@@ -655,29 +765,5 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
-    }
-}
-
-/// BatchMode reachability probe, mirroring what a deploy will need.
-pub async fn check_reachable(
-    target: &str,
-    override_: &deptui_core::ssh::SshOverride,
-) -> Result<(), String> {
-    let mut cmd = tokio::process::Command::new("ssh");
-    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
-    for arg in override_.ssh_args() {
-        cmd.arg(arg);
-    }
-    cmd.arg(target)
-        .arg("true")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => Ok(()),
-        Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-        Ok(Err(e)) => Err(format!("spawning ssh: {e}")),
-        Err(_) => Err("ssh probe timed out".to_string()),
     }
 }

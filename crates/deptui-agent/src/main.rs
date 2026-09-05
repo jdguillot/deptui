@@ -351,6 +351,13 @@ fn print_status(s: &wire::AgentStatus) {
             if let (Some(rev), Some(t)) = (&h.failed_rev, h.failed_time) {
                 bits.push(format!("FAILED {} at {}", short(rev), fmt_time(t)));
             }
+            if let (Some(rev), Some(t)) = (&h.offline_rev, h.offline_time) {
+                bits.push(format!(
+                    "OFFLINE since {} — {} pending",
+                    fmt_time(t),
+                    short(rev)
+                ));
+            }
             if let Some(u) = &h.unreachable {
                 bits.push(format!("unreachable: {u}"));
             }
@@ -471,6 +478,7 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                         time,
                     });
                     hs.failed = None;
+                    hs.offline = None;
                 }
                 "failed" => {
                     any_failed = true;
@@ -478,6 +486,14 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                         rev: rev.clone(),
                         time,
                         message: hr.message.clone().unwrap_or_default(),
+                    });
+                    hs.offline = None;
+                }
+                "offline" => {
+                    hs.offline = Some(state::OfflineStamp {
+                        rev: rev.clone(),
+                        time,
+                        target: hr.target.clone().unwrap_or_default(),
                     });
                 }
                 _ => {}
@@ -539,7 +555,7 @@ async fn validate(cli: &Cli, state_dir: Option<PathBuf>) -> Result<()> {
             };
             let override_ = hc.ssh_override();
             let target = deptui_core::host::build_ssh_target(node, "system", &override_);
-            match daemon::check_reachable(&target, &override_).await {
+            match runner::check_reachable(&target, &override_).await {
                 Ok(()) => println!("{}: {host} ({target}) ok", w.name),
                 Err(e) => {
                     eprintln!("{}: {host} ({target}) UNREACHABLE: {e}", w.name);

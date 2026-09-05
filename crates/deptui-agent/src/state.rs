@@ -64,12 +64,27 @@ pub struct HostState {
     /// is what ssh said.
     #[serde(default)]
     pub unreachable: Option<String>,
+    /// Set when the host was down at deploy time and `catch_up` is on:
+    /// the update is pending, the daemon re-probes `target` at the
+    /// watch's `offline_recheck` cadence and deploys the moment the
+    /// host answers. Cleared by any later success or real failure.
+    #[serde(default)]
+    pub offline: Option<OfflineStamp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stamp {
     pub rev: String,
     pub time: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineStamp {
+    pub rev: String,
+    pub time: u64,
+    /// Resolved `user@host` ssh target, stored so rechecks don't need a
+    /// clone + discovery round-trip.
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,10 +114,14 @@ pub struct RunRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostRun {
     pub host: String,
-    /// `"ok"`, `"failed"`, or `"skipped"`.
+    /// `"ok"`, `"failed"`, `"offline"`, or `"skipped"`.
     pub outcome: String,
     #[serde(default)]
     pub message: Option<String>,
+    /// For `"offline"`: the resolved ssh target, so the daemon can
+    /// store it in [`OfflineStamp`] without re-resolving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 pub fn now_unix() -> u64 {
