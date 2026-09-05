@@ -4,6 +4,7 @@
 //! modules; nothing in here may depend on ratatui, crossterm, or any
 //! other UI concern.
 
+pub mod agentwire;
 pub mod askpass;
 pub mod deploy;
 pub mod flake;

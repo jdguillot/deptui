@@ -332,7 +332,7 @@ impl Daemon {
                 }
             }
             for r in &ws.history {
-                out.push(wire::RunSummary::from_record(name, r));
+                out.push(crate::wire::summary_from_record(name, r));
             }
         }
         if let Some(w) = &watch {
