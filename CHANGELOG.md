@@ -10,6 +10,31 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-09-05
+
+### Added
+
+- The agent log now has full job-log parity — it *is* the job-log
+  component, swapped in while the view is open: filter (selecting a
+  host filters to it; `Space` marks several; watch-level lines always
+  show), search (`/`, `n`/`N`), visual selection and yank (`v`/`V`,
+  `y`), scrolling (`j`/`k`, `g`/`G`, wheel), drag-to-copy, and the
+  search/visual/scroll title chips. `Tab` moves focus between the
+  watches pane and the log. On open the log backfills from the
+  agent's stored run history (capped at the usual 2000 lines), so
+  search and yank cover past runs.
+
+### Changed
+
+- Approval moved from `y` to `Enter` in the agent view (`y` is yank
+  now, matching the main screen).
+
+### Fixed
+
+- v0.8.0's agent view still sent the removed `deploy` verb from its
+  approve key — the key was dead. (Another silently-missed patch,
+  found while rewriting the handler.)
+
 ## [0.8.0] — 2026-09-05
 
 ### Changed

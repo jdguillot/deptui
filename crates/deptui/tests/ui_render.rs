@@ -431,9 +431,16 @@ fn agent_view_renders_status_and_tail() {
     let mut app = app_with_agent();
     app.agent.open = true;
     app.agent.status = Some(agent_status());
-    app.agent
-        .tail
-        .push_back("[infra] run #1 (kick): deploying".into());
+    // The view is open, so the shared log fields hold the agent log.
+    // Watch-level lines land untagged (always visible); host lines
+    // carry the host and follow the filter.
+    app.log.push(LogEntry {
+        text: "run #1 (kick): deploying".into(),
+        is_err: false,
+        host: None,
+        kind: deptui::host::LogKind::Plain,
+    });
+    log_line(&mut app, "building closure", "alpha");
     let out = render(&mut app, 120, 40);
     assert!(out.contains("agent"), "{out}");
     assert!(out.contains("homelab"), "agent name missing: {out}");

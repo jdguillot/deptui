@@ -300,10 +300,18 @@ default_agent = "homelab"
 ssh = "me@deploy-box"    # any ssh destination; socket access = group membership
 ```
 
-`a` opens the agent view (status, pause/resume, kick, cancel,
-force-deploy, live log). Pause gates *future* polls; `x`/`cancel`
-stops a deploy already running — its hosts stay parked at that
-revision until a new commit, a kick after one, or a force-deploy. Agent-managed hosts show an `[agent]` badge in the host
+`a` opens the agent view: watch/host status with pause/resume, kick,
+cancel, and approval (`Enter`), plus the **agent log** — which is the
+same job-log component as the main screen, with the same powers:
+`Tab` moves focus between the watches pane and the log, selecting a
+host filters the log to it (`Space` marks several), `/` searches with
+`n`/`N`, `v`/`V` start visual selection and `y` yanks, `g`/`G` jump,
+the wheel scrolls, and dragging copies. The log backfills from the
+agent's stored run history on open, so search and yank cover past
+runs, not just what streamed while you watched. Pause gates *future*
+polls; `x`/`cancel` stops a deploy already running — its hosts stay
+parked at that revision until a new commit, a kick after one, or an
+approval. Agent-managed hosts show an `[agent]` badge in the host
 list — `[agent!]` when the last agent deploy failed, `[agent~]` when
 an update is pending on an offline host.
 

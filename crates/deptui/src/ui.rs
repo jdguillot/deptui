@@ -1531,7 +1531,11 @@ fn highlight_segments(
 /// run yet) and always focusable, so the user can Tab or `l` to it
 /// before kicking off a job and then scroll once output starts.
 fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
-    let focused = app.focus == FocusPane::JobLog;
+    let focused = if app.agent.open {
+        app.agent.log_focused
+    } else {
+        app.focus == FocusPane::JobLog
+    };
 
     // Compute inner dimensions first (borders only — title doesn't
     // shrink it) so we can clamp the scroll *before* building the
@@ -1746,6 +1750,12 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
             ),
             Span::raw(" "),
         ]
+    } else if app.agent.open {
+        // No jump letter in the agent view — Tab toggles the halves.
+        vec![Span::styled(
+            " agent log ",
+            focus_title_style(focused).add_modifier(Modifier::BOLD),
+        )]
     } else {
         pane_title_spans("job log", 'p', focused)
     };
@@ -1765,7 +1775,11 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
 
     if tagged.is_empty() {
         let empty = Line::styled(
-            " (no deploy output for this host — press s / b / d to start, or mark hosts with Space)",
+            if app.agent.open {
+                " (no agent output for this host yet — u kicks a check; Space marks more hosts)"
+            } else {
+                " (no deploy output for this host — press s / b / d to start, or mark hosts with Space)"
+            },
             Style::default().fg(theme::MUTED),
         );
         frame.render_widget(Paragraph::new(empty), inner);
@@ -3358,7 +3372,11 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
         crate::app::CopyPane::AgentWatches,
         inner_rect(body[0]),
     );
-    draw_agent_tail(frame, body[1], app);
+    // The agent log IS the job-log component: the buffers were swapped
+    // when the view opened, so search, visual selection, yank, filter
+    // and this renderer are the same code the main screen runs.
+    app.mouse.job_log = Some(inner_rect(body[1]));
+    draw_job_log(frame, body[1], app);
     capture_copy_pane(
         frame,
         app,
@@ -3389,7 +3407,7 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(theme::WARNING),
             ),
             Span::styled(
-                "y",
+                "Enter",
                 Style::default().fg(theme::KEY).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" confirms  ", Style::default().fg(theme::MUTED)),
@@ -3416,12 +3434,16 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
             Style::default().fg(theme::MUTED),
         ));
     };
-    hint("j/k", "select");
+    hint("Tab", "log/watches");
+    hint("j/k", "select/scroll");
+    hint("Space", "mark filter");
     hint("u", "kick");
     hint("x", "cancel run");
     hint("p", "pause host");
     hint("P", "pause agent");
-    hint("y", "approve");
+    hint("Enter", "approve");
+    hint("/", "search");
+    hint("v/V", "select text");
     hint("r", "refresh");
     // Cycling agents means nothing with a single one configured —
     // advertising a dead key was its own bug report.
@@ -3447,16 +3469,14 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
-    // The watches pane owns the keyboard while the view is open, so it
-    // wears the focus border like any focused pane on the main screen.
+    // Focus ring follows the Tab split: watches vs the agent log.
+    let focused = !app.agent.log_focused;
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::FOCUS))
+        .border_style(focus_border_style(focused))
         .title(Span::styled(
             " watches ",
-            Style::default()
-                .fg(theme::FOCUS)
-                .add_modifier(Modifier::BOLD),
+            focus_title_style(focused).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -3781,40 +3801,6 @@ fn format_unix_ago_or_in(t: u64) -> String {
         }
     } else {
         format_unix_ago(t)
-    }
-}
-
-fn draw_agent_tail(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::MUTED))
-        .title(Span::styled(
-            " agent log (live) ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Tail-window: the last lines that fit, like the job log's tail.
-    let viewport = inner.height as usize;
-    let start = app.agent.tail.len().saturating_sub(viewport);
-    let lines: Vec<Line> = app
-        .agent
-        .tail
-        .iter()
-        .skip(start)
-        .map(|l| Line::raw(l.clone()))
-        .collect();
-    if lines.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "waiting for agent output…",
-                Style::default().fg(theme::MUTED),
-            ))),
-            inner,
-        );
-    } else {
-        frame.render_widget(Paragraph::new(lines), inner);
     }
 }
 

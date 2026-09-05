@@ -116,3 +116,28 @@ pub async fn probe(target: &str) -> Result<agentwire::AgentStatus> {
     }
     serde_json::from_slice(&out.stdout).context("parsing agent status JSON")
 }
+
+/// Recent runs from the agent's stored history (newest first, as the
+/// agent returns them). Used by the agent log's backfill.
+pub async fn fetch_history(
+    target: &str,
+    askpass: &AskpassEnv,
+) -> Result<Vec<agentwire::RunSummary>> {
+    let bytes = run_verb(target, askpass, &["history", "--json"]).await?;
+    serde_json::from_slice(&bytes).context("parsing agent history JSON")
+}
+
+/// The captured log of one stored run, one line per element.
+pub async fn fetch_run_log(
+    target: &str,
+    askpass: &AskpassEnv,
+    watch: &str,
+    run: u64,
+) -> Result<Vec<String>> {
+    let run_s = run.to_string();
+    let bytes = run_verb(target, askpass, &["log", watch, "--run", &run_s]).await?;
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}

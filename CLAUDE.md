@@ -262,6 +262,18 @@ Key invariants worth knowing before touching the code:
   When clearing the last field of an override, also remove the entry
   from `App.overrides` so the marker disappears — this is what
   `handle_key_edit_override` does.
+- **The agent log IS the job log.** Opening the agent view swaps the
+  agent's `LogStash` into the shared `App` log fields
+  (`swap_log_state`) and back on close — search, visual selection,
+  yank, scroll, filtering, and `draw_job_log` all run unchanged on
+  whichever log is installed, so parity can't drift. Corollaries:
+  `push_log_line` writes through `main_log_mut()` (app messages must
+  not leak into the agent log while swapped), tail/backfill ingest
+  writes through `agent_log_mut()`, and
+  `filtered_log_indices_for_job_log` picks its axes (marked/selected
+  node vs agent marks/selected watch-row host) off `agent.open`.
+  Watch-tagged agent lines are stored untagged so they behave like
+  the main screen's app-level messages.
 - **The mouse adds reach, not abilities.** `ui::draw` rebuilds
   `App.mouse` (a `MouseMap` of inner rects + linear hit ranges for the
   strip chips) every frame, and `handle_mouse` routes every hit

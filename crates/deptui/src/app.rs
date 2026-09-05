@@ -342,6 +342,20 @@ pub struct LastDeploy {
     pub ok: bool,
 }
 
+/// One log pane's complete state: buffer, scroll, search, selection.
+/// The main job log and the agent log each own one of these; opening
+/// the agent view swaps which one sits in the `App` fields the shared
+/// machinery operates on.
+#[derive(Default)]
+pub struct LogStash {
+    pub entries: Vec<LogEntry>,
+    pub scroll: usize,
+    pub top_offset: usize,
+    pub visual: Option<VisualSel>,
+    pub search: Option<String>,
+    pub search_match_idx: usize,
+}
+
 /// Everything the agent view needs, plus the ambient state (badges,
 /// failure notice) the main screen shows even when the view is closed.
 pub struct AgentUi {
@@ -357,8 +371,21 @@ pub struct AgentUi {
     pub loading: bool,
     /// Selected row in the flattened watch/host listing.
     pub sel: usize,
-    /// Live tail from `deptui-agent tail`, capped like the job log.
-    pub tail: VecDeque<String>,
+    /// The agent log's own state bundle. While the view is OPEN this
+    /// holds the stashed MAIN job log; while closed it holds the agent
+    /// log. `App::swap_log_state` flips them, which is what gives the
+    /// agent log full parity — search, visual selection, yank, filter
+    /// and rendering all run through the very same `App` fields and
+    /// code paths as the main job log.
+    pub log_state: LogStash,
+    /// Host marks for the agent log's filter (Space in the watches
+    /// pane), the analogue of the main screen's marked hosts.
+    pub marked: Vec<String>,
+    /// Which half of the agent view owns j/k: false = watches pane,
+    /// true = the log. Tab toggles, like the main screen's focus.
+    pub log_focused: bool,
+    /// History backfill has been requested for the current agent.
+    pub backfilled: bool,
     tail_task: Option<JoinHandle<()>>,
     /// Last op ack, shown in the view's footer.
     pub last_op: Option<String>,
@@ -390,7 +417,10 @@ impl AgentUi {
             error: None,
             loading: false,
             sel: 0,
-            tail: VecDeque::new(),
+            log_state: LogStash::default(),
+            marked: Vec::new(),
+            log_focused: false,
+            backfilled: false,
             tail_task: None,
             last_op: None,
             pending_approve: None,
@@ -543,6 +573,9 @@ enum StatusUpdate {
     AgentOp(Result<String, String>),
     /// One live log line from `deptui-agent tail`.
     AgentTail(String),
+    /// Historic run logs fetched for the agent log's backfill,
+    /// oldest line first.
+    AgentBackfill(Vec<String>),
     /// Deploy-node scan finished: `(node name, ssh target)` for every
     /// node that answered `deptui-agent status`, plus `(node, error)`
     /// for every one that didn't — shown in the empty state so a scan
@@ -1095,7 +1128,30 @@ impl App {
         }
 
         if self.agent.open {
-            // Everything else in the agent view stays keyboard-driven.
+            let map = self.mouse.clone();
+            match me.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let up = matches!(me.kind, MouseEventKind::ScrollUp);
+                    if map.job_log.is_some_and(|r| rect_contains(r, x, y)) {
+                        self.scroll_job_log(if up { 3 } else { -3 });
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // Clicks move the Tab-focus between the halves; the
+                    // drag-copy handling above already armed a
+                    // selection if this press starts one.
+                    if map.job_log.is_some_and(|r| rect_contains(r, x, y)) {
+                        self.agent.log_focused = true;
+                    } else if self
+                        .copy_panes
+                        .iter()
+                        .any(|(p, r, _)| *p == CopyPane::AgentWatches && rect_contains(*r, x, y))
+                    {
+                        self.agent.log_focused = false;
+                    }
+                }
+                _ => {}
+            }
             return;
         }
         let map = self.mouse.clone();
@@ -2371,6 +2427,13 @@ impl App {
     /// One implementation, shared with the renderer — see
     /// [`joblog::filtered_indices`].
     pub fn filtered_log_indices_for_job_log(&self) -> Vec<usize> {
+        if self.agent.open {
+            // Same filter rules, agent axes: Space-marked hosts win,
+            // otherwise the watches pane's selected host; untagged
+            // (watch-level) lines always show.
+            let selected = self.selected_agent_host_name();
+            return joblog::filtered_indices(&self.log, &self.agent.marked, selected.as_deref());
+        }
         joblog::filtered_indices(
             &self.log,
             &self.marked,
@@ -3075,9 +3138,20 @@ resolve the paths so they can be seeded",
                 }
             }
             StatusUpdate::AgentTail(line) => {
-                self.agent.tail.push_back(line);
-                while self.agent.tail.len() > 2000 {
-                    self.agent.tail.pop_front();
+                self.push_agent_log_line(line);
+            }
+            StatusUpdate::AgentBackfill(lines) => {
+                // Prepend history before whatever streamed in live
+                // while the fetch ran, keeping chronology, then cap.
+                let parsed: Vec<LogEntry> =
+                    lines.iter().map(|l| self.parse_agent_line(l)).collect();
+                let buf = self.agent_log_mut();
+                let live = std::mem::take(buf);
+                buf.extend(parsed);
+                buf.extend(live);
+                let excess = buf.len().saturating_sub(2000);
+                if excess > 0 {
+                    buf.drain(..excess);
                 }
             }
             StatusUpdate::FlakeDiscover(new_nodes) => {
@@ -3317,15 +3391,150 @@ resolve the paths so they can be seeded",
         hosts.iter().any(|h| self.agent_managed.contains_key(h))
     }
 
+    /// Flip which log (main or agent) occupies the shared `App` log
+    /// fields. Called on view open and close; everything between sees
+    /// a normal job log and cannot tell which one it is.
+    fn swap_log_state(&mut self) {
+        std::mem::swap(&mut self.log, &mut self.agent.log_state.entries);
+        std::mem::swap(&mut self.job_log_scroll, &mut self.agent.log_state.scroll);
+        std::mem::swap(
+            &mut self.job_log_top_offset,
+            &mut self.agent.log_state.top_offset,
+        );
+        std::mem::swap(&mut self.visual_sel, &mut self.agent.log_state.visual);
+        std::mem::swap(&mut self.log_search, &mut self.agent.log_state.search);
+        std::mem::swap(
+            &mut self.log_search_match_idx,
+            &mut self.agent.log_state.search_match_idx,
+        );
+    }
+
+    /// The MAIN job log buffer, wherever it currently lives.
+    fn main_log_mut(&mut self) -> &mut Vec<LogEntry> {
+        if self.agent.open {
+            &mut self.agent.log_state.entries
+        } else {
+            &mut self.log
+        }
+    }
+
+    /// The AGENT log buffer, wherever it currently lives.
+    fn agent_log_mut(&mut self) -> &mut Vec<LogEntry> {
+        if self.agent.open {
+            &mut self.log
+        } else {
+            &mut self.agent.log_state.entries
+        }
+    }
+
+    /// Ingest one agent log line ("[tag] text"): the tag becomes the
+    /// entry's host when it names a configured host, so the host
+    /// filter works; watch-level lines stay untagged and are always
+    /// visible, like the main screen's app-level messages.
+    fn push_agent_log_line(&mut self, line: String) {
+        let entry = self.parse_agent_line(&line);
+        let buf = self.agent_log_mut();
+        buf.push(entry);
+        let excess = buf.len().saturating_sub(2000);
+        if excess > 0 {
+            buf.drain(..excess);
+        }
+    }
+
+    fn parse_agent_line(&self, line: &str) -> LogEntry {
+        let mut host = None;
+        let mut text = line.to_string();
+        if let Some(rest) = line.strip_prefix('[') {
+            if let Some((tag, body)) = rest.split_once("] ") {
+                let is_host = self
+                    .agent
+                    .status
+                    .as_ref()
+                    .map(|st| {
+                        st.watches
+                            .iter()
+                            .any(|w| w.hosts.iter().any(|h| h.name == tag))
+                    })
+                    // No status yet: assume host — worst case a watch
+                    // tag is filterable until status arrives.
+                    .unwrap_or(true);
+                if is_host {
+                    host = Some(tag.to_string());
+                    text = body.to_string();
+                }
+            }
+        }
+        let is_err = text.contains("FAILED") || text.starts_with('!');
+        LogEntry {
+            text,
+            is_err,
+            host,
+            kind: LogKind::Plain,
+        }
+    }
+
+    /// The host name the agent log filters to when nothing is marked:
+    /// the watches pane's selected row.
+    pub fn selected_agent_host_name(&self) -> Option<String> {
+        let rows = self.agent.host_rows();
+        let (wi, hi) = *rows.get(self.agent.sel)?;
+        let st = self.agent.status.as_ref()?;
+        Some(st.watches.get(wi)?.hosts.get(hi)?.name.clone())
+    }
+
+    /// Backfill the agent log from stored run history (newest runs
+    /// first, oldest lines first once assembled), capped like the live
+    /// buffer. One fetch per view/agent; `r` on an empty log retries.
+    fn backfill_agent_log(&mut self) {
+        if self.agent.backfilled {
+            return;
+        }
+        self.agent.backfilled = true;
+        let Some((_, ssh)) = self.agent.current_agent() else {
+            return;
+        };
+        let ssh = ssh.to_string();
+        let tx = self.status_tx.clone();
+        let env = self.askpass_env.clone();
+        tokio::spawn(async move {
+            let mut lines: Vec<String> = Vec::new();
+            if let Ok(runs) = agentclient::fetch_history(&ssh, &env).await {
+                // fetch_history returns newest-first; collect whole runs
+                // until the cap, then restore chronological order.
+                let mut chunks: Vec<Vec<String>> = Vec::new();
+                let mut total = 0usize;
+                for run in &runs {
+                    if total >= 2000 {
+                        break;
+                    }
+                    if let Ok(log) =
+                        agentclient::fetch_run_log(&ssh, &env, &run.watch, run.id).await
+                    {
+                        total += log.len();
+                        chunks.push(log);
+                    }
+                }
+                for chunk in chunks.into_iter().rev() {
+                    lines.extend(chunk);
+                }
+            }
+            let _ = tx.send(StatusUpdate::AgentBackfill(lines)).await;
+        });
+    }
+
     /// `a` — open the full-screen agent view. Always opens: with no
     /// agents configured the view renders setup instructions (and any
     /// settings parse error) instead of being a dead key.
     fn open_agent_view(&mut self) {
         self.agent.open = true;
         self.agent.sel = 0;
+        self.agent.log_focused = false;
+        // From here the shared log fields ARE the agent log.
+        self.swap_log_state();
         if !self.agent.agents.is_empty() {
             self.fetch_agent_status();
             self.start_agent_tail();
+            self.backfill_agent_log();
         } else {
             // Zero-config path: the flake already names every host —
             // ask them who runs an agent instead of demanding a
@@ -3393,7 +3602,10 @@ resolve the paths so they can be seeded",
     }
 
     fn close_agent_view(&mut self) {
+        // Order matters: swap back while `open` is still true would
+        // invert the buffer helpers. Flip the flag, then restore.
         self.agent.open = false;
+        self.swap_log_state();
         self.stop_agent_tail();
     }
 
@@ -3459,21 +3671,119 @@ resolve the paths so they can be seeded",
     fn handle_key_agent(&mut self, key: KeyEvent) {
         let rows = self.agent.host_rows();
         // A pending approval confirm unwinds first: Esc cancels it
-        // (rather than closing the view), any other key falls through.
+        // (rather than closing the view), Enter confirms below, any
+        // other key falls through.
         if self.agent.pending_approve.is_some() && key.code == KeyCode::Esc {
             self.agent.pending_approve = None;
             return;
         }
+
+        // ---- log keys, global exactly like the main screen ----
+        // The buffers are swapped while the view is open, so these are
+        // the same handlers the main job log uses — full parity by
+        // construction.
         match key.code {
+            KeyCode::Char('/') => {
+                self.input = InputMode::SearchLog { buf: String::new() };
+                return;
+            }
+            KeyCode::Char('n') if self.log_search.is_some() => {
+                self.search_job_log_jump(1);
+                return;
+            }
+            KeyCode::Char('N') if self.log_search.is_some() => {
+                self.search_job_log_jump(-1);
+                return;
+            }
+            KeyCode::Char('v') => {
+                self.agent.log_focused = true;
+                self.enter_visual_mode(VisualMode::Char);
+                return;
+            }
+            KeyCode::Char('V') => {
+                self.agent.log_focused = true;
+                self.enter_visual_mode(VisualMode::Line);
+                return;
+            }
+            KeyCode::Char('y') if self.visual_sel.is_some() => {
+                self.yank_visual();
+                return;
+            }
+            KeyCode::Char('g') => {
+                self.jump_to_top();
+                return;
+            }
+            KeyCode::Char('G') => {
+                self.snap_to_tail();
+                return;
+            }
+            KeyCode::Tab => {
+                self.agent.log_focused = !self.agent.log_focused;
+                return;
+            }
+            _ => {}
+        }
+
+        // Visual mode owns the movement keys while active (same
+        // contract as the main screen's job-log arm).
+        if self.visual_sel.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.visual_move_cursor(-1, 0);
+                    return;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.visual_move_cursor(1, 0);
+                    return;
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.visual_move_cursor(0, -1);
+                    return;
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.visual_move_cursor(0, 1);
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.visual_sel = None;
+                    return;
+                }
+                _ => {
+                    self.visual_sel = None;
+                }
+            }
+        }
+
+        match key.code {
+            KeyCode::Esc if self.log_search.is_some() => {
+                // Same unwind order as the main screen: search clears
+                // before Esc means "close".
+                self.log_search = None;
+            }
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('a') => self.close_agent_view(),
             KeyCode::Char('j') | KeyCode::Down => {
-                if !rows.is_empty() {
+                if self.agent.log_focused {
+                    self.scroll_job_log(-1);
+                } else if !rows.is_empty() {
                     self.agent.sel = (self.agent.sel + 1) % rows.len();
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if !rows.is_empty() {
+                if self.agent.log_focused {
+                    self.scroll_job_log(1);
+                } else if !rows.is_empty() {
                     self.agent.sel = (self.agent.sel + rows.len() - 1) % rows.len();
+                }
+            }
+            // Space — mark/unmark the selected host for the log filter,
+            // mirroring the main screen's marks.
+            KeyCode::Char(' ') => {
+                if let Some(name) = self.selected_agent_host_name() {
+                    if let Some(i) = self.agent.marked.iter().position(|m| m == &name) {
+                        self.agent.marked.remove(i);
+                    } else {
+                        self.agent.marked.push(name);
+                    }
                 }
             }
             KeyCode::Char('r') => {
@@ -3513,13 +3823,43 @@ resolve the paths so they can be seeded",
             // cancel key). Pause only gates future polls; this is the
             // stop button.
             KeyCode::Char('x') => self.agent_op(vec!["cancel".into()]),
-            // `d` — force-deploy the selected host at the last-seen rev.
-            KeyCode::Char('d') => {
-                if let Some((watch, host, _)) = self.selected_agent_host(&rows) {
-                    self.agent_op(vec!["deploy".into(), host, "--watch".into(), watch]);
+            // Enter — approve the selected host for the next update
+            // round (two-step: first press shows the warning footer,
+            // second confirms; on an approved host, revokes). The
+            // agent never deploys immediately on this.
+            KeyCode::Enter => {
+                let Some((watch, host, _)) = self.selected_agent_host(&rows) else {
+                    return;
+                };
+                let approved = self
+                    .agent
+                    .status
+                    .as_ref()
+                    .and_then(|s| {
+                        let (wi, hi) = *rows.get(self.agent.sel)?;
+                        Some(s.watches.get(wi)?.hosts.get(hi)?.approved)
+                    })
+                    .unwrap_or(false);
+                if approved {
+                    self.agent_op(vec![
+                        "approve".into(),
+                        host,
+                        "--watch".into(),
+                        watch,
+                        "--revoke".into(),
+                    ]);
+                    self.agent.pending_approve = None;
+                } else if self.agent.pending_approve.as_ref()
+                    == Some(&(watch.clone(), host.clone()))
+                {
+                    self.agent.pending_approve = None;
+                    self.agent_op(vec!["approve".into(), host, "--watch".into(), watch]);
+                } else {
+                    self.agent.pending_approve = Some((watch, host));
                 }
             }
-            // `[` / `]` — cycle between configured agents.
+            // `[` / `]` — cycle between configured agents. The log
+            // belongs to the agent, so it resets and backfills anew.
             KeyCode::Char('[') | KeyCode::Char(']') => {
                 let n = self.agent.agents.len();
                 if n > 1 {
@@ -3531,7 +3871,10 @@ resolve the paths so they can be seeded",
                     self.agent.status = None;
                     self.agent.error = None;
                     self.agent.sel = 0;
-                    self.agent.tail.clear();
+                    self.agent_log_mut().clear();
+                    self.agent.backfilled = false;
+                    self.agent.marked.clear();
+                    self.backfill_agent_log();
                     self.fetch_agent_status();
                     self.start_agent_tail();
                 }
@@ -4038,7 +4381,11 @@ target's store instead.",
     /// Push a line with an explicit [`LogKind`], so the renderer can
     /// style it from data instead of parsing the text.
     fn push_log_line(&mut self, text: String, is_err: bool, host: Option<String>, kind: LogKind) {
-        self.log.push(LogEntry {
+        // Always the MAIN job log — while the agent view is open the
+        // shared fields hold the agent log, and app-level messages
+        // must not leak into it.
+        let buf = self.main_log_mut();
+        buf.push(LogEntry {
             text,
             is_err,
             host,
@@ -4046,9 +4393,9 @@ target's store instead.",
         });
         // Cap so we don't grow forever during long sessions.
         const MAX: usize = 2000;
-        if self.log.len() > MAX {
-            let drop = self.log.len() - MAX;
-            self.log.drain(0..drop);
+        if buf.len() > MAX {
+            let drop = buf.len() - MAX;
+            buf.drain(0..drop);
         }
     }
 }
@@ -5132,6 +5479,96 @@ mod tests {
             failed: vec![],
         });
         assert_eq!(app.agent.agents.len(), 2);
+    }
+
+    /// The agent view swaps the shared log fields: agent lines and
+    /// main lines never mix, state (search/scroll) survives per side,
+    /// and app-level messages keep landing in the MAIN log even while
+    /// the agent log is on screen.
+    #[tokio::test]
+    async fn agent_log_swap_keeps_the_two_logs_apart() {
+        let settings: crate::settings::Settings =
+            toml::from_str("[agents.box]\nssh = \"me@box\"\n").unwrap();
+        let mut app = App::with_settings(".".into(), sample_nodes(), settings);
+        app.push_log("main line", false);
+        app.log_search = Some("main".into());
+        assert_eq!(app.log.len(), 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.agent.open);
+        // Shared fields now hold the (empty) agent log; search reset.
+        assert!(app.log.is_empty());
+        assert!(app.log_search.is_none());
+
+        // Tail lines land in the agent log; app messages in the main.
+        app.apply_status(StatusUpdate::AgentTail("[web] building".into()));
+        app.apply_status(StatusUpdate::AgentTail("[infra] run #1 finished".into()));
+        app.push_log("app-level while open", false);
+        assert_eq!(app.log.len(), 2, "agent log holds the tail lines");
+        // Host tag parsed; unknown-as-host fallback applies without
+        // status, watch tags with status become untagged.
+        assert_eq!(app.log[0].host.as_deref(), Some("web"));
+
+        // Backfill prepends before live lines.
+        app.apply_status(StatusUpdate::AgentBackfill(vec!["[infra] old run".into()]));
+        assert_eq!(app.log[0].text, "old run");
+        assert_eq!(app.log.len(), 3);
+
+        // Close: the main log comes back intact, message included.
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.agent.open);
+        assert_eq!(app.log.len(), 2);
+        assert_eq!(app.log[0].text, "main line");
+        assert_eq!(app.log[1].text, "app-level while open");
+        assert_eq!(app.log_search.as_deref(), Some("main"));
+
+        // Re-open: the agent log survived the round-trip too.
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.log.len(), 3);
+        assert_eq!(app.log[0].text, "old run");
+    }
+
+    #[test]
+    fn agent_line_parse_classifies_tags() {
+        let settings: crate::settings::Settings =
+            toml::from_str("[agents.box]\nssh = \"me@box\"\n").unwrap();
+        let mut app = App::with_settings(".".into(), sample_nodes(), settings);
+        app.agent.status = Some(agentwire::AgentStatus {
+            version: "0".into(),
+            paused: false,
+            watches: vec![agentwire::WatchStatus {
+                name: "infra".into(),
+                repo: "r".into(),
+                ref_label: "branch main".into(),
+                paused: false,
+                last_seen: None,
+                next_poll: None,
+                running: None,
+                hosts: vec![agentwire::HostStatus {
+                    name: "web".into(),
+                    paused: false,
+                    deployed_rev: None,
+                    deployed_time: None,
+                    failed_rev: None,
+                    failed_time: None,
+                    failed_message: None,
+                    unreachable: None,
+                    offline_rev: None,
+                    offline_time: None,
+                    held_rev: None,
+                    held_time: None,
+                    approved: false,
+                }],
+            }],
+        });
+        // Host tag → tagged; watch tag → untagged (always visible).
+        let e = app.parse_agent_line("[web] pushing closure");
+        assert_eq!(e.host.as_deref(), Some("web"));
+        assert_eq!(e.text, "pushing closure");
+        let e = app.parse_agent_line("[infra] run #9 finished: 1 held");
+        assert_eq!(e.host, None);
+        let e = app.parse_agent_line("[web] host FAILED — boom");
+        assert!(e.is_err);
     }
 
     #[test]
