@@ -442,6 +442,10 @@ Key invariants worth knowing before touching the code:
 
 ## Project conventions
 
+- **Commit messages must not contain Claude session links.** No
+  `Claude-Session:` trailers or `claude.ai/code/session_…` URLs —
+  they are workstation-local noise in a public history. (A
+  `Co-Authored-By` credit line is fine.)
 - The project shells out heavily. Treat `nix`, `deploy`, and `ssh` as
   load-bearing dependencies — every code path that touches them should
   surface stderr to the user, not swallow it.
