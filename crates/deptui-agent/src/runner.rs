@@ -26,8 +26,18 @@ pub struct RunPlan {
     pub run_id: u64,
     pub rev: String,
     pub trigger: String,
-    /// Node names, in order.
-    pub hosts: Vec<String>,
+    pub hosts: Vec<PlanHost>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanHost {
+    pub name: String,
+    /// First encounter: this agent has never deployed the host, so it
+    /// must adopt (probe; deploy only if the target already matches or
+    /// the host opted into bootstrap deploys), never blind-deploy —
+    /// a repo that is *behind* the host would otherwise be rolled
+    /// forward onto it as a rollback.
+    pub adopt: bool,
 }
 
 /// How one host ended, when the deploy machinery itself didn't error.
@@ -42,6 +52,14 @@ pub enum DeployOutcome {
     /// The user cancelled the run while this host was deploying; the
     /// process group has been torn down.
     Cancelled,
+    /// First encounter and the target already runs the watched
+    /// revision's closure: recorded as deployed, nothing pushed.
+    Adopted,
+    /// First encounter and the target runs something else: refused to
+    /// deploy over it. The message says what differed.
+    Held {
+        message: String,
+    },
 }
 
 /// BatchMode reachability probe, mirroring what a deploy will need.
@@ -169,14 +187,20 @@ pub async fn execute(
             log(&mut record, format!("[{}] {msg}", watch.name));
             for host in &plan.hosts {
                 record.hosts.push(HostRun {
-                    host: host.clone(),
+                    host: host.name.clone(),
                     outcome: "failed".into(),
                     message: Some(msg.clone()),
                     target: None,
                 });
                 notify::dispatch(
                     notify_cfg,
-                    Event::new("failure", &watch.name, Some(host), &plan.rev, msg.clone()),
+                    Event::new(
+                        "failure",
+                        &watch.name,
+                        Some(&host.name),
+                        &plan.rev,
+                        msg.clone(),
+                    ),
                 );
             }
             record.finished = Some(now_unix());
@@ -185,7 +209,8 @@ pub async fn execute(
     };
 
     let mut cancelled = false;
-    for host in &plan.hosts {
+    for ph in &plan.hosts {
+        let host = &ph.name;
         // Cancelled between hosts (or before the first): everything
         // not yet started is parked at this revision too — "stop this
         // deploy" must not quietly resume at the next poll.
@@ -203,6 +228,7 @@ pub async fn execute(
             &flake_ref,
             &nodes,
             host,
+            ph.adopt,
             &plan.rev,
             notify_cfg,
             cancel_rx.clone(),
@@ -210,6 +236,40 @@ pub async fn execute(
         )
         .await;
         match outcome {
+            Ok(DeployOutcome::Adopted) => {
+                log(
+                    &mut record,
+                    format!(
+                        "[{}] {host}: already running {short} — adopted without deploying",
+                        watch.name
+                    ),
+                );
+                record.hosts.push(HostRun {
+                    host: host.clone(),
+                    outcome: "adopted".into(),
+                    message: None,
+                    target: None,
+                });
+            }
+            Ok(DeployOutcome::Held { message }) => {
+                log(
+                    &mut record,
+                    format!(
+                        "[{}] {host}: HELD — {message} (deptui-agent deploy {host} adopts it)",
+                        watch.name
+                    ),
+                );
+                record.hosts.push(HostRun {
+                    host: host.clone(),
+                    outcome: "held".into(),
+                    message: Some(message.clone()),
+                    target: None,
+                });
+                notify::dispatch(
+                    notify_cfg,
+                    Event::new("held", &watch.name, Some(host), &plan.rev, message),
+                );
+            }
             Ok(DeployOutcome::Cancelled) => {
                 cancelled = true;
                 log(
@@ -305,6 +365,7 @@ async fn deploy_host(
     flake_ref: &str,
     nodes: &[flake::Node],
     host: &str,
+    adopt: bool,
     rev: &str,
     notify_cfg: &NotifyConfig,
     mut cancel_rx: watch::Receiver<bool>,
@@ -338,6 +399,53 @@ async fn deploy_host(
              deptui-agent.service and the module's restartOnUpdate is enabled, the \
              activation will stop this agent mid-deploy"
         ));
+    }
+
+    // First encounter (unless the host opted into bootstrap deploys):
+    // probe instead of deploying. A fresh agent state says nothing
+    // about the *host* — it may already run this revision (adopt), or
+    // something newer the repo hasn't caught up with (hold; a blind
+    // deploy here is a rollback).
+    if adopt && !hc.bootstrap_deploys() {
+        let override_ = hc.ssh_override();
+        let askpass = askpass_disabled();
+        let profiles: Vec<String> = node
+            .ordered_profiles()
+            .into_iter()
+            .filter(|p| {
+                match hc
+                    .profile_sel()
+                    .unwrap_or(deptui_core::deploy::ProfileSel::All)
+                {
+                    deptui_core::deploy::ProfileSel::All => true,
+                    deptui_core::deploy::ProfileSel::System => p == "system",
+                    deptui_core::deploy::ProfileSel::Home => p == "home",
+                }
+            })
+            .collect();
+        for profile in &profiles {
+            match deptui_core::host::check_profile_up_to_date(
+                flake_ref, node, profile, &override_, &askpass,
+            )
+            .await
+            {
+                Ok(check) if check.up_to_date => continue,
+                Ok(check) => {
+                    let what = if check.not_deployed {
+                        format!("profile `{profile}` has never been deployed there")
+                    } else {
+                        format!("profile `{profile}` differs from the watched revision")
+                    };
+                    return Ok(DeployOutcome::Held { message: what });
+                }
+                Err(e) => {
+                    return Ok(DeployOutcome::Held {
+                        message: format!("first-encounter probe failed: {e:#}"),
+                    });
+                }
+            }
+        }
+        return Ok(DeployOutcome::Adopted);
     }
 
     notify::dispatch(

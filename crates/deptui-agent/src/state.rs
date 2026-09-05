@@ -64,6 +64,12 @@ pub struct HostState {
     /// is what ssh said.
     #[serde(default)]
     pub unreachable: Option<String>,
+    /// First-encounter hold: the agent found this host running
+    /// something *other* than the watched revision and refused to
+    /// deploy over it. Cleared by a successful deploy (force or
+    /// bootstrap) or a later equality adoption.
+    #[serde(default)]
+    pub held: Option<Stamp>,
     /// Set when the host was down at deploy time and `catch_up` is on:
     /// the update is pending, the daemon re-probes `target` at the
     /// watch's `offline_recheck` cadence and deploys the moment the

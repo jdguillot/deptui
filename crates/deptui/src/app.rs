@@ -420,6 +420,8 @@ impl AgentUi {
 pub struct AgentManaged {
     pub failed: bool,
     pub offline: bool,
+    /// First-encounter hold: awaiting adoption.
+    pub held: bool,
 }
 
 /// Panes whose rendered cells can be drag-selected and copied. The
@@ -2983,6 +2985,7 @@ resolve the paths so they can be seeded",
                                 let entry = self.agent_managed.entry(h.name.clone()).or_default();
                                 entry.failed |= h.failed_rev.is_some();
                                 entry.offline |= h.offline_rev.is_some();
+                                entry.held |= h.held_rev.is_some();
                             }
                         }
                         self.agent.status = Some(status);
@@ -4891,6 +4894,8 @@ mod tests {
                         unreachable: None,
                         offline_rev: None,
                         offline_time: None,
+                        held_rev: None,
+                        held_time: None,
                     },
                     agentwire::HostStatus {
                         name: "b".into(),
@@ -4903,6 +4908,8 @@ mod tests {
                         unreachable: None,
                         offline_rev: None,
                         offline_time: None,
+                        held_rev: None,
+                        held_time: None,
                     },
                 ],
             }],

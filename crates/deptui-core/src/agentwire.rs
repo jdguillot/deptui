@@ -63,6 +63,12 @@ pub struct HostStatus {
     pub offline_rev: Option<String>,
     #[serde(default)]
     pub offline_time: Option<u64>,
+    /// First-encounter hold: the host runs something other than the
+    /// watched revision and the agent refused to deploy over it.
+    #[serde(default)]
+    pub held_rev: Option<String>,
+    #[serde(default)]
+    pub held_time: Option<u64>,
 }
 
 /// Per-host outcome inside a run: `"ok"`, `"failed"`, or `"skipped"`.

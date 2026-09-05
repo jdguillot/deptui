@@ -100,7 +100,7 @@ impl NotifyConfig {
     /// in via `events`.
     pub fn wants_event(&self, kind: &str) -> bool {
         match kind {
-            "failure" | "unreachable" => true,
+            "failure" | "unreachable" | "held" => true,
             other => self.events.iter().any(|e| e == other),
         }
     }
@@ -169,6 +169,15 @@ pub struct HostConfig {
     /// message can explain rather than "unknown field".
     #[serde(default)]
     pub interactive_sudo: Option<bool>,
+    /// First-encounter policy. `"hold"` (default): a host this agent
+    /// has never deployed is *probed* — already running the watched
+    /// revision → adopted silently; anything else → held + notified,
+    /// until a force-deploy (or a matching revision) appears. A fresh
+    /// agent must never roll a host backwards just because the repo
+    /// is behind reality. `"deploy"`: pure GitOps — first encounter
+    /// deploys like any update.
+    #[serde(default)]
+    pub bootstrap: Option<String>,
     /// When the host is down at deploy time, remember the update and
     /// push it as soon as the agent sees the host answer again
     /// (default true). Off: the deploy is attempted anyway and a dead
@@ -232,6 +241,10 @@ impl HostConfig {
             t.remote_build = v;
         }
         t
+    }
+
+    pub fn bootstrap_deploys(&self) -> bool {
+        matches!(self.bootstrap.as_deref(), Some("deploy"))
     }
 
     pub fn catch_up(&self) -> bool {
@@ -388,6 +401,14 @@ impl AgentConfig {
                     .with_context(|| format!("watch `{}` host `{host}`", w.name))?;
                 hc.deploy_mode()
                     .with_context(|| format!("watch `{}` host `{host}`", w.name))?;
+                if let Some(b) = &hc.bootstrap {
+                    if b != "hold" && b != "deploy" {
+                        bail!(
+                            "watch `{}` host `{host}`: bootstrap must be \"hold\" or \"deploy\", got `{b}`",
+                            w.name
+                        );
+                    }
+                }
                 if hc.interactive_sudo.is_some() {
                     bail!(
                         "watch `{}` host `{host}`: `interactive_sudo` is not available in the \

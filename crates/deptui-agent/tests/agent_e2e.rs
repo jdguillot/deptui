@@ -31,7 +31,10 @@ struct Env {
 }
 
 fn setup(deploy_exit: i32) -> Env {
-    setup_with(deploy_exit, "")
+    // The general tests predate first-encounter adoption and exercise
+    // the deploy pipeline itself; opting into bootstrap deploys keeps
+    // them meaningful. Adoption has its own tests below.
+    setup_with(deploy_exit, "bootstrap = \"deploy\"\n")
 }
 
 fn setup_with(deploy_exit: i32, extra_host_cfg: &str) -> Env {
@@ -352,7 +355,7 @@ fn offline_host_is_pending_not_failed_and_catches_up() {
 
 #[test]
 fn catch_up_off_attempts_deploy_while_down() {
-    let env = setup_with(0, "catch_up = false\n");
+    let env = setup_with(0, "bootstrap = \"deploy\"\ncatch_up = false\n");
     fs::write(&env.down_marker, "").unwrap();
 
     // No pre-probe: the deploy is attempted regardless (our shim
@@ -578,6 +581,104 @@ fn daemon_runs_and_answers_with_zero_watches() {
     );
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(status["watches"].as_array().map(Vec::len), Some(0));
+
+    unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+    let _ = daemon.wait();
+}
+
+/// First-encounter adoption (the unintended-rollback fix): a fresh
+/// agent must never blind-deploy a host it has never touched. The
+/// probe (shimmed to fail here → "differs") holds instead, `check`
+/// still exits 0, and the same revision is not re-probed.
+#[test]
+fn first_encounter_holds_instead_of_deploying() {
+    let env = setup_with(0, "");
+
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "held is not a failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("HELD"));
+    assert_eq!(deploy_calls(&env).len(), 0, "no deploy on first encounter");
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.state.path().join("state.json")).unwrap())
+            .unwrap();
+    let host = &state["watches"]["infra"]["hosts"]["web"];
+    assert!(host["held"]["rev"].is_string(), "{state}");
+    assert!(host["deployed"].is_null());
+
+    // Same revision again: parked, no re-probe spam.
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert_eq!(deploy_calls(&env).len(), 0);
+}
+
+/// The daemon does not poll at startup — only the schedule, a kick,
+/// or offline catch-up trigger runs. A kick on a fresh agent holds;
+/// an explicit force-deploy adopts.
+#[test]
+fn daemon_waits_for_cadence_and_force_deploy_adopts() {
+    let env = setup_with(0, "");
+    let socket = env.state.path().join("agent.sock");
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("--config")
+        .arg(&env.config_path)
+        .arg("run")
+        .env("PATH", &env.shim_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let wait_for = |what: &str, mut cond: Box<dyn FnMut() -> bool + '_>| {
+        let start = Instant::now();
+        while !cond() {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_for("socket", Box::new(|| socket.exists()));
+
+    let host_field = |field: &str| -> serde_json::Value {
+        let out = agent(&env, &["status", "--json"]);
+        let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        status["watches"][0]["hosts"][0][field].clone()
+    };
+
+    // No startup poll: several seconds in, nothing has happened (the
+    // watch interval is 1h).
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(deploy_calls(&env).len(), 0, "startup must not poll");
+    assert!(host_field("held_rev").is_null(), "startup must not probe");
+
+    // kick → first encounter → held, still no deploy.
+    let out = agent(&env, &["kick"]);
+    assert!(out.status.success());
+    wait_for(
+        "hold marker",
+        Box::new(|| host_field("held_rev").is_string()),
+    );
+    assert_eq!(deploy_calls(&env).len(), 0);
+
+    // Explicit adoption-by-deploy.
+    let out = agent(&env, &["deploy", "web", "--watch", "infra"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_for(
+        "adoption deploy",
+        Box::new(|| host_field("deployed_rev").is_string()),
+    );
+    assert_eq!(deploy_calls(&env).len(), 1);
+    assert!(host_field("held_rev").is_null(), "hold cleared by adoption");
 
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();

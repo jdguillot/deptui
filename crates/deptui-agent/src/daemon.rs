@@ -356,6 +356,8 @@ impl Daemon {
                             unreachable: hs.unreachable.clone(),
                             offline_rev: hs.offline.as_ref().map(|o| o.rev.clone()),
                             offline_time: hs.offline.as_ref().map(|o| o.time),
+                            held_rev: hs.held.as_ref().map(|s| s.rev.clone()),
+                            held_time: hs.held.as_ref().map(|s| s.time),
                         }
                     })
                     .collect();
@@ -530,7 +532,11 @@ impl Daemon {
                 run_id,
                 rev: rev.clone(),
                 trigger: format!("deploy {host}"),
-                hosts: vec![host.clone()],
+                hosts: vec![crate::runner::PlanHost {
+                    name: host.clone(),
+                    // Explicit: the human is adopting by deploying.
+                    adopt: false,
+                }],
             },
         );
         self.save_state();
@@ -679,7 +685,18 @@ impl Daemon {
             if hs.failed.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str()) {
                 continue;
             }
-            hosts.push(name.clone());
+            // Held at this revision: the human hasn't blessed the agent
+            // for this host yet. A *new* revision re-probes (the host
+            // may have caught up), same one waits.
+            if hs.held.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str()) {
+                continue;
+            }
+            hosts.push(crate::runner::PlanHost {
+                name: name.clone(),
+                // First encounter = this agent has never deployed (or
+                // tried to deploy) the host.
+                adopt: hs.deployed.is_none() && hs.failed.is_none(),
+            });
         }
         if hosts.is_empty() {
             if changed {
@@ -759,6 +776,23 @@ impl Daemon {
                         });
                         hs.failed = None;
                         hs.offline = None;
+                        hs.held = None;
+                    }
+                    // Adoption: the host already ran this revision.
+                    "adopted" => {
+                        hs.deployed = Some(Stamp {
+                            rev: rev.clone(),
+                            time,
+                        });
+                        hs.failed = None;
+                        hs.offline = None;
+                        hs.held = None;
+                    }
+                    "held" => {
+                        hs.held = Some(Stamp {
+                            rev: rev.clone(),
+                            time,
+                        });
                     }
                     "failed" => {
                         hs.failed = Some(FailStamp {

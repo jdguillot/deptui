@@ -393,6 +393,8 @@ fn agent_status() -> deptui_core::agentwire::AgentStatus {
                     unreachable: None,
                     offline_rev: None,
                     offline_time: None,
+                    held_rev: None,
+                    held_time: None,
                 },
                 HostStatus {
                     name: "beta".into(),
@@ -405,6 +407,8 @@ fn agent_status() -> deptui_core::agentwire::AgentStatus {
                     unreachable: None,
                     offline_rev: None,
                     offline_time: None,
+                    held_rev: None,
+                    held_time: None,
                 },
             ],
         }],
@@ -474,6 +478,7 @@ fn managed_hosts_get_agent_badges_and_title_notice() {
         AgentManaged {
             failed: false,
             offline: true,
+            held: false,
         },
     );
     app.agent_managed.insert(
@@ -481,6 +486,7 @@ fn managed_hosts_get_agent_badges_and_title_notice() {
         AgentManaged {
             failed: true,
             offline: false,
+            held: false,
         },
     );
     let out = render(&mut app, 120, 40);

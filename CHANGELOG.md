@@ -10,6 +10,23 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-05
+
+### Changed
+
+- **First encounters adopt instead of deploying.** A fresh agent used
+  to treat every host as "needs deploy" and would happily roll a host
+  *backwards* to a stale repo the moment it started. Now a host the
+  agent has never deployed is probed: already running the watched
+  revision → adopted silently; anything else → held + notified, until
+  a force-deploy (or a matching revision) appears. Per-host
+  `bootstrap = "deploy"` restores pure-GitOps first-run deploys. Held
+  hosts show as `HELD` in status, `≠` in the agent view, and
+  `[agent≠]` in the host list.
+- **Starting the agent no longer triggers an immediate poll.** The
+  first poll follows the configured cadence; only the schedule, kicks,
+  and offline catch-up start runs.
+
 ## [0.6.2] — 2026-09-05
 
 ### Fixed

@@ -580,6 +580,8 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
             if let Some(m) = app.agent_managed.get(&node.name) {
                 let (label, color) = if m.failed {
                     (" [agent!]", theme::ERROR)
+                } else if m.held {
+                    (" [agent≠]", theme::WARNING)
                 } else if m.offline {
                     (" [agent~]", theme::WARNING)
                 } else {
@@ -3567,6 +3569,8 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 // Glyph carries the state (colour reinforces).
                 let (glyph, style) = if h.failed_rev.is_some() {
                     ("!", Style::default().fg(theme::ERROR))
+                } else if h.held_rev.is_some() {
+                    ("≠", Style::default().fg(theme::WARNING))
                 } else if h.offline_rev.is_some() {
                     ("~", Style::default().fg(theme::WARNING))
                 } else if h.paused {
@@ -3589,6 +3593,12 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 }
                 if let Some(rev) = &h.failed_rev {
                     state.push(format!("FAILED {}", short_rev(rev)));
+                }
+                if let Some(rev) = &h.held_rev {
+                    state.push(format!(
+                        "HELD {} — target differs from repo; d adopts",
+                        short_rev(rev)
+                    ));
                 }
                 if let (Some(rev), Some(t)) = (&h.offline_rev, h.offline_time) {
                     state.push(format!(

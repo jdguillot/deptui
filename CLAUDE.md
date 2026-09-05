@@ -530,6 +530,15 @@ Key invariants worth knowing before touching the code:
   return); a real deploy failure parks the host until a new revision.
   Keep the two paths distinct — collapsing them re-introduces either
   retry storms or missed catch-ups.
+- **First encounter = adopt, not deploy.** A host with no recorded
+  deploy history is probed (`check_profile_up_to_date` per selected
+  profile): identical → outcome `adopted` (recorded as deployed);
+  different or unprobeable → outcome `held` (notify fires; parked at
+  that rev; a *new* rev re-probes). Only a force-deploy or `bootstrap
+  = "deploy"` deploys a first-encounter host — this is the guard
+  against a fresh agent rolling hosts back to a stale repo. The
+  daemon's first poll also waits for the cadence: starting the agent
+  is not a deploy trigger.
 - **Pause is not stop.** Pause gates *future* polls; `cancel`
   (`POST /cancel`, CLI `cancel`, TUI `x` in the agent view) is what
   stops a run in flight — it signals the deploy's process group via

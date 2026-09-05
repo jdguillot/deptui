@@ -373,6 +373,13 @@ fn print_status(s: &wire::AgentStatus) {
             if let (Some(rev), Some(t)) = (&h.failed_rev, h.failed_time) {
                 bits.push(format!("FAILED {} at {}", short(rev), fmt_time(t)));
             }
+            if let (Some(rev), Some(t)) = (&h.held_rev, h.held_time) {
+                bits.push(format!(
+                    "HELD since {} — target differs from {}; `deptui-agent deploy` adopts",
+                    fmt_time(t),
+                    short(rev)
+                ));
+            }
             if let (Some(rev), Some(t)) = (&h.offline_rev, h.offline_time) {
                 bits.push(format!(
                     "OFFLINE since {} — {} pending",
@@ -463,16 +470,26 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
         };
         state.watch_mut(&w.name).last_seen = Some(rev.clone());
         let ws = state.watches.get(&w.name).unwrap();
-        let hosts: Vec<String> = w
+        let hosts: Vec<runner::PlanHost> = w
             .hosts
             .keys()
-            .filter(|h| {
-                let hs = ws.hosts.get(*h).cloned().unwrap_or_default();
-                !hs.paused
-                    && hs.deployed.as_ref().map(|s| s.rev.as_str()) != Some(rev.as_str())
-                    && hs.failed.as_ref().map(|s| s.rev.as_str()) != Some(rev.as_str())
+            .filter_map(|h| {
+                let hs = ws.hosts.get(h).cloned().unwrap_or_default();
+                let same = |s: &Option<state::Stamp>| {
+                    s.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str())
+                };
+                if hs.paused
+                    || same(&hs.deployed)
+                    || same(&hs.held)
+                    || hs.failed.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str())
+                {
+                    return None;
+                }
+                Some(runner::PlanHost {
+                    name: h.clone(),
+                    adopt: hs.deployed.is_none() && hs.failed.is_none(),
+                })
             })
-            .cloned()
             .collect();
         if hosts.is_empty() {
             println!("{}: up to date at {}", w.name, short(&rev));
@@ -499,13 +516,20 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                 .entry(hr.host.clone())
                 .or_default();
             match hr.outcome.as_str() {
-                "ok" => {
+                "ok" | "adopted" => {
                     hs.deployed = Some(state::Stamp {
                         rev: rev.clone(),
                         time,
                     });
                     hs.failed = None;
                     hs.offline = None;
+                    hs.held = None;
+                }
+                "held" => {
+                    hs.held = Some(state::Stamp {
+                        rev: rev.clone(),
+                        time,
+                    });
                 }
                 "failed" => {
                     any_failed = true;

@@ -47,6 +47,7 @@ impl Event {
             "success" => format!("deployed: {host} ({})", self.watch),
             "start" => format!("deploying: {host} ({})", self.watch),
             "unreachable" => format!("unreachable: {host} ({})", self.watch),
+            "held" => format!("held (needs adoption): {host} ({})", self.watch),
             _ => format!("{}: {host} ({})", self.kind, self.watch),
         }
     }
@@ -55,7 +56,7 @@ impl Event {
 /// Dispatch an event to every configured channel. Spawned tasks own
 /// their errors; the caller never waits on delivery.
 pub fn dispatch(cfg: &NotifyConfig, event: Event) {
-    if event.kind == "failure" || event.kind == "unreachable" {
+    if matches!(event.kind.as_str(), "failure" | "unreachable" | "held") {
         if let Some(cmd) = &cfg.on_failure {
             spawn_hook(cmd.clone(), event.clone());
         }

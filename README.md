@@ -229,6 +229,16 @@ Rules the agent lives by:
 - **No same-commit retry.** A failed host is parked until a new
   revision, a kick, or a force-deploy. deploy-rs's magic rollback has
   already made the target safe.
+- **First encounters adopt, never blind-deploy.** A host this agent
+  has never deployed is *probed* on its first eligible run: already
+  running the watched revision → adopted silently; anything else →
+  **held** and notified — a fresh agent must never roll a host
+  backwards just because the repo is behind reality. Adopt with
+  `deptui-agent deploy HOST` (or `d` in the TUI's agent view), or opt
+  a host into pure GitOps with `bootstrap = "deploy"`.
+- **Starting the agent is not a deploy trigger.** The first poll
+  waits for the configured cadence; only the schedule, a kick, and
+  offline catch-up start runs.
 - **Offline hosts catch up.** A host that is down when an update
   arrives is *pending*, not failed: the agent re-probes it
   (`offline_recheck`) and deploys the moment it answers. Per-host
