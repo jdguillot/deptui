@@ -419,11 +419,14 @@ pub struct App {
     /// Lines from the bottom of the job log the user has scrolled up.
     /// `0` means "auto-tail" (always show the latest line).
     pub job_log_scroll: usize,
-    /// Last known rendered height (in rows) of the job log viewport.
-    /// Set by `draw_job_log` each frame; used by `visual_move_cursor`
-    /// to implement vim-style edge scrolling (view only moves when the
-    /// cursor reaches the top or bottom edge of the visible area).
-    pub job_log_viewport_height: usize,
+    /// Entries-from-tail offset of the topmost *visible* job-log
+    /// entry, published by `draw_job_log` each frame and consumed by
+    /// `visual_move_cursor` for vim-style edge scrolling. This is NOT
+    /// `job_log_scroll + rows - 1`: visible lines wrap, so fewer
+    /// entries fit than the pane has rows — an edge check against the
+    /// row count let the cursor walk one entry past the visible top
+    /// per wrapped row before scrolling started.
+    pub job_log_top_offset: usize,
     /// Active visual selection in the job log (`v` / `V`). `None` when not in
     /// visual mode. Indices are into `filtered_log_indices_for_job_log()`.
     pub visual_sel: Option<VisualSel>,
@@ -516,7 +519,7 @@ impl App {
             last_deploy: None,
             last_deploys: HashMap::new(),
             job_log_scroll: 0,
-            job_log_viewport_height: 0,
+            job_log_top_offset: 0,
             visual_sel: None,
             show_help: false,
             help_scroll: 0,
@@ -2031,13 +2034,18 @@ impl App {
         // reaches the top or bottom edge of the visible area. This keeps
         // the context stable while selecting instead of chasing every move.
         //
-        // Coordinate system: job_log_scroll = lines above the tail.
-        // The viewport shows cursor_from_tail values in [scroll, scroll+vh-1].
+        // Coordinate system: job_log_scroll = entries above the tail.
+        // The renderer publishes the from-tail offset of the entry that
+        // actually sits on the pane's top row (`job_log_top_offset`);
+        // wrapped lines make that smaller than scroll + rows - 1, which
+        // is why an edge check against the row count used to let the
+        // cursor walk past the visible top before scrolling began.
         let cursor_from_tail = filtered.len().saturating_sub(1 + new_line);
-        let vh = self.job_log_viewport_height.max(1);
-        if cursor_from_tail > self.job_log_scroll + vh.saturating_sub(1) {
-            // Cursor moved above the top edge — scroll up to reveal it.
-            self.job_log_scroll = cursor_from_tail.saturating_sub(vh.saturating_sub(1));
+        let top = self.job_log_top_offset.max(self.job_log_scroll);
+        if cursor_from_tail > top {
+            // Cursor crossed the top edge — scroll up by the overshoot;
+            // the next frame re-publishes the new top.
+            self.job_log_scroll += cursor_from_tail - top;
         } else if cursor_from_tail < self.job_log_scroll {
             // Cursor moved below the bottom edge — scroll down to reveal it.
             self.job_log_scroll = cursor_from_tail;
@@ -4379,5 +4387,31 @@ mod tests {
         assert!(ps.extra.local_size.is_none());
         assert!(ps.extra.pkg_diff.is_none());
         assert_eq!(st.last_error.as_deref(), Some("host unreachable"));
+    }
+
+    #[test]
+    fn visual_edge_scroll_starts_at_the_rendered_top_not_the_row_count() {
+        let mut app = App::new(".".into(), sample_nodes());
+        for i in 0..10 {
+            app.push_log_tagged(&format!("line {i}"), false, Some("alpha".into()));
+        }
+        app.focus = FocusPane::JobLog;
+        // The renderer saw wrapped lines: only the last 4 entries fit,
+        // so the entry on the pane's top row is 3 entries from the tail
+        // even though the pane itself is taller in rows.
+        app.job_log_top_offset = 3;
+        app.job_log_scroll = 0;
+        app.enter_visual_mode(VisualMode::Line);
+
+        // Moving up to the visible top must not scroll.
+        for _ in 0..3 {
+            app.visual_move_cursor(-1, 0);
+        }
+        assert_eq!(app.job_log_scroll, 0);
+
+        // The very next step crosses the top — scrolling starts
+        // immediately, not a few rows later.
+        app.visual_move_cursor(-1, 0);
+        assert_eq!(app.job_log_scroll, 1);
     }
 }

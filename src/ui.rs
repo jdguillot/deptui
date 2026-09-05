@@ -1456,7 +1456,6 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     });
 
     let visible = inner.height as usize;
-    app.job_log_viewport_height = visible;
     if app.job_log_scroll >= tagged.len() {
         app.job_log_scroll = tagged.len().saturating_sub(1);
     }
@@ -1599,12 +1598,20 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     // would over the full list. Its scroll clamp only ever bites when the
     // window already reaches entry 0 — at any smaller scroll the window
     // provably holds more rows than the clamp needs.
-    let y_offset = if tagged.is_empty() {
+    let (y_offset, top_window_idx) = if tagged.is_empty() {
         app.job_log_scroll = 0;
-        0
+        (0, 0)
     } else {
         compute_tail_scroll_offset(&all_lines, &mut app.job_log_scroll, inner.width, visible)
     };
+    // Publish the from-tail offset of the entry on the pane's top row
+    // so visual-mode edge scrolling reacts at the *real* top. Wrapped
+    // lines mean fewer entries fit than the pane has rows, so this is
+    // usually less than scroll + rows - 1.
+    app.job_log_top_offset = tagged
+        .len()
+        .saturating_sub(1)
+        .saturating_sub(window_start + top_window_idx);
 
     // Now build the title with the already-clamped scroll value.
     let in_visual = app.visual_sel.is_some();
@@ -1665,7 +1672,10 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
 /// value that produces `y_offset == 0` — otherwise holding `k` past
 /// the top would accumulate phantom entry counts that the `[↑N]`
 /// chip would happily display, without any visual movement in the
-/// pane. Returns the resulting `y_offset` (in physical rows).
+/// pane. Returns `(y_offset, top_idx)`: the paragraph scroll in
+/// physical rows, and the index (within `all_lines`) of the entry
+/// whose rows occupy the top of the viewport — the renderer publishes
+/// that as `App::job_log_top_offset` for visual-mode edge scrolling.
 ///
 /// Implementation: measure each line's wrapped row count once, then
 /// walk from the tail summing row counts. The smallest `scroll`
@@ -1677,10 +1687,10 @@ fn compute_tail_scroll_offset(
     scroll: &mut usize,
     width: u16,
     visible: usize,
-) -> u16 {
+) -> (u16, usize) {
     if all_lines.is_empty() || width == 0 {
         *scroll = 0;
-        return 0;
+        return (0, 0);
     }
     let w = width as usize;
     // Cheap row-count estimate: use Line::width() instead of
@@ -1730,7 +1740,18 @@ fn compute_tail_scroll_offset(
         per_entry_rows[tail_start..].iter().sum()
     };
     let y = max_row_offset.saturating_sub(row_scroll);
-    y.min(u16::MAX as usize) as u16
+    // The entry whose wrapped rows reach below `y` sits on the top row
+    // of the viewport.
+    let mut top_idx = 0usize;
+    let mut rows_above = 0usize;
+    for (i, r) in per_entry_rows.iter().enumerate() {
+        if rows_above + r > y {
+            top_idx = i;
+            break;
+        }
+        rows_above += r;
+    }
+    (y.min(u16::MAX as usize) as u16, top_idx)
 }
 
 /// Pane-title chip rendered next to a log pane label when the user
@@ -3008,6 +3029,19 @@ mod tests {
         let segments = style_entry(&entry, Style::default(), None);
         assert_eq!(joined_text(&segments), entry.text);
         assert_eq!(entry.text, "[pkg] usbutils: 018 → 018, 019, 019-man");
+    }
+
+    #[test]
+    fn tail_scroll_reports_the_wrapped_top_entry() {
+        // 10 entries, each 10 chars wide, in a 5-col / 4-row pane:
+        // every entry wraps to 2 rows, so only 2 entries are visible
+        // and the top of the pane shows entry 8 — not entry 6, which a
+        // row-count model would predict.
+        let lines: Vec<Line<'_>> = (0..10).map(|_| Line::raw("aaaaaaaaaa")).collect();
+        let mut scroll = 0usize;
+        let (y, top_idx) = compute_tail_scroll_offset(&lines, &mut scroll, 5, 4);
+        assert_eq!(y, 16);
+        assert_eq!(top_idx, 8);
     }
 
     #[test]
