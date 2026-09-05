@@ -399,7 +399,10 @@ Key invariants worth knowing before touching the code:
   pane holds only the summary + extras; it is display-only and not a
   focus stop — Tab cycles toggles → hosts → job log → commands, and the
   pane-jump keys are `f`/`p`/`t`/`c`. Commands/info row is below both
-  columns: commands left (60%), info right (40%).
+  columns: commands left (60%), info right (40%). The command buttons
+  are packed onto rows at button boundaries (`layout_commands`) — the
+  strip grows to fit every visible button rather than wrapping or
+  clipping, and the mouse hit ranges derive from the same layout.
 - **Per-profile state is a map, not field pairs.**
   `HostStatus.profiles: BTreeMap<String, ProfileStatus>` holds the
   update state, extras, and build plan for every profile a node

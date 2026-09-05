@@ -12,6 +12,11 @@ release is tagged `vX.Y.Z`.
 
 ### Added
 
+- The probe preflights are now command buttons: `U:size`, `P:plan`,
+  and `C:drift` join the commands row (clickable, like everything
+  there), grouped probes → marks/profiles → deploys → ssh/agent. The
+  row packs whole buttons onto extra rows instead of clipping, so
+  every button stays visible (and clickable) down to 80x24.
 - Mouse support: wheel-scroll the job log, the help popup, and the
   host selection; click to focus panes, select hosts, flip toggles,
   and press command buttons. `--no-mouse` opts out (mouse capture

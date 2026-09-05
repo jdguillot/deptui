@@ -587,3 +587,32 @@ fn profile_buttons_show_dots_and_selection_reads_as_a_set() {
     let out = render(&mut app, 120, 40);
     assert!(out.contains("system"), "{out}");
 }
+
+/// The probe preflights live in the commands row now, and the row
+/// packs whole buttons onto extra rows instead of clipping — every
+/// button must be visible even at the 80x24 floor.
+#[test]
+fn command_row_shows_probe_buttons_and_never_clips() {
+    for (w, h) in [(80, 24), (120, 40), (200, 50)] {
+        let mut app = App::new(".".into(), nodes());
+        let out = render(&mut app, w, h);
+        for button in [
+            "refresh", "updates", "size", "plan", "drift", "agent", "ssh",
+        ] {
+            assert!(out.contains(button), "{button} missing at {w}x{h}: {out}");
+        }
+        // Hit ranges cover every visible command, and stay within the
+        // rows the packed layout produced.
+        let inner = app.mouse.commands.expect("commands rect");
+        let items = &app.mouse.command_items;
+        assert!(
+            items.len() >= 13,
+            "expected all buttons hit-mapped: {items:?}"
+        );
+        let max_end = items.iter().map(|(_, e, _)| *e).max().unwrap();
+        assert!(
+            max_end <= inner.width as usize * inner.height as usize,
+            "ranges exceed drawable area at {w}x{h}: {max_end} vs {inner:?}"
+        );
+    }
+}

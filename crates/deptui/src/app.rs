@@ -81,6 +81,12 @@ pub const TOGGLE_COUNT: usize = deploy::TOGGLES.len();
 pub enum Command {
     Refresh,
     Updates,
+    /// Shift+U — closure-size delta + package diff for the selection.
+    SizeDiff,
+    /// Shift+P — build-plan preflight.
+    BuildPlan,
+    /// Shift+C — substituter-drift check.
+    CacheDrift,
     /// Mark every host / clear all marks. The button's key + label
     /// flip between "A mark all" and "X unmark" with the mark state,
     /// mirroring the long-standing Shift+A / Shift+X bindings.
@@ -100,20 +106,25 @@ pub enum Command {
 /// command. The key column is informational (the real binding lives in
 /// `handle_key_normal`); if you rename a binding, update both.
 pub const COMMANDS: &[(Command, &str, &str)] = &[
+    // Probes first — the row scans in groups: what you check, what you
+    // select, what you deploy, then the rest.
     (Command::Refresh, "r", "refresh"),
     (Command::Updates, "u", "updates"),
+    (Command::SizeDiff, "U", "size"),
+    (Command::BuildPlan, "P", "plan"),
+    (Command::CacheDrift, "C", "drift"),
     // The stored key/label are the unmarked spelling; `ui::command_hint`
     // swaps in ("X", "unmark") while any host is marked. The real
     // bindings are the Shift+A / Shift+X arms in `handle_key_normal`.
     (Command::MarkAll, "A", "mark all"),
-    (Command::Agent, "a", "agent"),
     (Command::ProfileSystem, "s", "sys"),
     (Command::ProfileHome, "h", "home"),
     (Command::Switch, "S", "switch"),
     (Command::Boot, "B", "boot"),
     (Command::DryRun, "D", "dry"),
     (Command::Cancel, "x", "cancel"),
-    (Command::Override, "o", "override"),
+    (Command::Override, "o", "ssh"),
+    (Command::Agent, "a", "agent"),
 ];
 
 /// Which override field the user is currently editing. Drives both the
@@ -1571,6 +1582,9 @@ impl App {
         match cmd {
             Command::Refresh => self.refresh_reachability(),
             Command::Updates => self.refresh_updates_for_selected(),
+            Command::SizeDiff => self.refresh_sizes_for_selected(),
+            Command::BuildPlan => self.refresh_build_plan_for_selected(),
+            Command::CacheDrift => self.refresh_cache_drift_for_selected(),
             Command::MarkAll => {
                 if self.marked.is_empty() {
                     self.mark_all();

@@ -152,12 +152,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let cmd_inner_w = cmd_col_w.saturating_sub(2);
     let info_inner_w = info_col_w.saturating_sub(2);
     let info_content_w = info_content_width(app);
-    let cmd_content_w = commands_content_width(app);
-    let commands_height: u16 = if info_content_w > info_inner_w || cmd_content_w > cmd_inner_w {
-        4
-    } else {
-        3
-    };
+    // The button row packs whole buttons onto as many rows as it
+    // needs (capped); the info half still word-wraps onto up to two.
+    let cmd_rows = layout_commands(app, cmd_inner_w).len().max(1);
+    let info_rows = if info_content_w > info_inner_w { 2 } else { 1 };
+    let commands_height: u16 = 2 + cmd_rows.max(info_rows) as u16;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1976,13 +1975,10 @@ fn draw_commands_row(frame: &mut Frame, area: Rect, app: &mut App) {
     let cmd_inner = cmd_block.inner(cols[0]);
     frame.render_widget(cmd_block, cols[0]);
     app.mouse.commands = Some(cmd_inner);
-    app.mouse.command_items = command_hit_ranges(app);
+    app.mouse.command_items = command_hit_ranges(app, cmd_inner.width as usize);
 
-    let spans = build_commands_spans(app, focused);
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
-        cmd_inner,
-    );
+    let lines = build_commands_lines(app, focused, cmd_inner.width as usize);
+    frame.render_widget(Paragraph::new(lines), cmd_inner);
 
     // Right: informational hints. Never takes focus.
     let info_block = Block::default()
@@ -2098,32 +2094,73 @@ fn info_content_width(app: &App) -> usize {
 /// Build the right-hand commands button row. Pulled out of
 /// `draw_commands_row` for the same width-measurement reason as
 /// `build_toggles_spans`.
-fn build_commands_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
+/// One visible command button, hint-resolved, with its rendered width.
+struct CmdBtn {
+    idx: usize,
+    key: &'static str,
+    label: &'static str,
+    dot: Option<bool>,
+    width: usize,
+}
+
+/// Pack whole buttons onto rows of `inner_w` columns — a button is
+/// never split mid-chip, so the rendered lines and the click hit
+/// ranges agree exactly (word-wrap would drift them apart at every
+/// row break). Each row leads with one space; buttons are separated
+/// by one.
+fn layout_commands(app: &App, inner_w: usize) -> Vec<Vec<CmdBtn>> {
+    let mut rows: Vec<Vec<CmdBtn>> = vec![Vec::new()];
+    let mut pos = 1usize;
+    for (i, (cmd, key, label)) in COMMANDS.iter().enumerate() {
+        if !app.command_is_visible(i) {
+            continue;
+        }
+        let (key, label) = command_hint(app, *cmd, key, label);
+        let dot = command_dot(app, *cmd);
+        let width = 3 + key.len() + label.len() + if dot.is_some() { 2 } else { 0 };
+        let row_full = {
+            let row = rows.last().expect("starts non-empty");
+            !row.is_empty() && pos + 1 + width > inner_w + 1
+        };
+        if row_full {
+            rows.push(Vec::new());
+            pos = 1;
+        }
+        let row = rows.last_mut().expect("just ensured");
+        if !row.is_empty() {
+            pos += 1;
+        }
+        row.push(CmdBtn {
+            idx: i,
+            key,
+            label,
+            dot,
+            width,
+        });
+        pos += width;
+    }
+    rows
+}
+
+fn build_commands_lines(app: &App, focused: bool, inner_w: usize) -> Vec<Line<'static>> {
     let sub = if focused {
         Some(app.command_index)
     } else {
         None
     };
-    let mut spans: Vec<Span> = Vec::with_capacity(COMMANDS.len() * 3 + 1);
-    spans.push(Span::raw(" "));
-    let mut first = true;
-    for (i, (cmd, key, label)) in COMMANDS.iter().enumerate() {
-        if !app.command_is_visible(i) {
-            continue;
-        }
-        if !first {
-            spans.push(Span::raw(" "));
-        }
-        first = false;
-        let (key, label) = command_hint(app, *cmd, key, label);
-        spans.extend(command_button(
-            key,
-            label,
-            command_dot(app, *cmd),
-            sub == Some(i),
-        ));
-    }
-    spans
+    layout_commands(app, inner_w)
+        .into_iter()
+        .map(|row| {
+            let mut spans: Vec<Span> = vec![Span::raw(" ")];
+            for (j, b) in row.iter().enumerate() {
+                if j > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.extend(command_button(b.key, b.label, b.dot, sub == Some(b.idx)));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// The displayed key + label for a command button. Most are static;
@@ -2141,15 +2178,6 @@ fn command_hint(
         crate::app::Command::MarkAll if !app.marked.is_empty() => ("X", "unmark"),
         _ => (key, label),
     }
-}
-
-/// Rendered width of the commands-button row, accounting for hidden
-/// commands (e.g. Boot when home-only profile is selected).
-fn commands_content_width(app: &App) -> usize {
-    // The hit-range builder walks the identical widths; deriving the
-    // total from it keeps click targets and wrap decisions in
-    // lockstep by construction.
-    command_hit_ranges(app).last().map_or(1, |(_, end, _)| *end)
 }
 
 /// Two-span command button: the key in yellow (same colour as the
@@ -2221,29 +2249,20 @@ fn command_dot(app: &App, cmd: crate::app::Command) -> Option<bool> {
     }
 }
 
-/// Linear hit ranges for the visible command buttons — same width
-/// maths as `command_button` / `commands_content_width`.
-fn command_hit_ranges(app: &App) -> Vec<(usize, usize, usize)> {
+/// Linear hit ranges for the command buttons, derived from the same
+/// packed layout the renderer draws — a click can only disagree with
+/// a chip if the two ever read different layouts.
+fn command_hit_ranges(app: &App, inner_w: usize) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
-    let mut pos = 1usize; // leading space
-    let mut first = true;
-    for (i, (cmd, key, label)) in COMMANDS.iter().enumerate() {
-        if !app.command_is_visible(i) {
-            continue;
+    for (row_i, row) in layout_commands(app, inner_w).into_iter().enumerate() {
+        let mut pos = row_i * inner_w + 1;
+        for (j, b) in row.iter().enumerate() {
+            if j > 0 {
+                pos += 1;
+            }
+            out.push((pos, pos + b.width, b.idx));
+            pos += b.width;
         }
-        if !first {
-            pos += 1; // separator
-        }
-        first = false;
-        let (key, label) = command_hint(app, *cmd, key, label);
-        let dot = if command_dot(app, *cmd).is_some() {
-            2
-        } else {
-            0
-        };
-        let w = 3 + key.len() + label.len() + dot;
-        out.push((pos, pos + w, i));
-        pos += w;
     }
     out
 }
