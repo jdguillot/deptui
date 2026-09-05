@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Fast agent iteration: debug-build deptui-agent and push it to a host,
+# skipping the nix sandbox entirely (no vendoring, no fresh crate
+# graph — cargo's incremental build, a few seconds after the first).
+#
+#   scripts/dev-agent me@deploy-box
+#
+# The binary lands at /tmp/deptui-agent-dev on the host. Run it there
+# against the real config, with the systemd service stopped so the two
+# don't fight over the socket:
+#
+#   sudo systemctl stop deptui-agent
+#   /tmp/deptui-agent-dev --config /etc/deptui-agent/config.toml run
+#
+# Caveat: a debug binary built on this machine links this machine's
+# nix-store glibc. Between two NixOS boxes on similar channels that
+# resolves fine; if the exec fails with "No such file or directory",
+# fall back to `nix build .#deptui-agent && nix copy --to ssh-ng://HOST ./result`
+# or build from the repo clone on the target.
+set -euo pipefail
+
+target="${1:?usage: scripts/dev-agent <ssh-target>}"
+here="$(cd "$(dirname "$0")/.." && pwd)"
+
+echo ">> cargo build -p deptui-agent (debug)"
+cargo build --manifest-path "$here/Cargo.toml" -p deptui-agent
+
+bin="$here/target/debug/deptui-agent"
+echo ">> pushing to $target:/tmp/deptui-agent-dev"
+rsync -z --info=progress2 "$bin" "$target:/tmp/deptui-agent-dev" 2>/dev/null \
+  || scp -q "$bin" "$target:/tmp/deptui-agent-dev"
+ssh "$target" chmod +x /tmp/deptui-agent-dev
+
+version="$(ssh "$target" /tmp/deptui-agent-dev --version 2>/dev/null || true)"
+if [ -n "$version" ]; then
+  echo ">> on $target: $version"
+else
+  echo "!! pushed, but the binary did not run on $target — likely a glibc"
+  echo "   mismatch; see the caveat at the top of this script."
+  exit 1
+fi
+echo ">> run it there:"
+echo "   sudo systemctl stop deptui-agent   # if the service is running"
+echo "   /tmp/deptui-agent-dev --config /etc/deptui-agent/config.toml run"

@@ -325,6 +325,27 @@ selections fall back to reverse video, and every state that mattered
 (reachability, `sys:`/`home:` badges) is carried by its glyph rather than
 its colour.
 
+## Development loop
+
+Fast iteration never needs the nix sandbox:
+
+```bash
+nix develop                      # toolchain + deploy/nix/ssh on PATH
+cargo run -- /path/to/flake      # the TUI, incremental debug build
+cargo run -p deptui-agent -- --config /tmp/agent-test/config.toml check
+cargo test -p deptui-agent       # the agent's e2e suite runs against shims
+```
+
+To try agent changes on a real host without a nix rebuild:
+
+```bash
+scripts/dev-agent me@deploy-box   # debug build + push to /tmp/deptui-agent-dev
+```
+
+then run it there against the real config (stop the service first so
+they don't fight over the socket). `nix build` is for release-shaped
+artifacts, not the edit loop.
+
 ## Building
 
 This project lives in a Nix flake. The dev shell installs the Rust
