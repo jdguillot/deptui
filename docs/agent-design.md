@@ -96,7 +96,12 @@ was explicitly confirmed; treat this as the contract for implementation.
   forwarding); log tail = `deptui-agent tail` streaming NDJSON over the
   same ssh exec. The CLI verbs double as the scripting interface and the
   GH-Action-over-ssh interface.
-- **`a`** opens a full-screen agent view (screen swap, not a pane):
+- **`a`** opens a full-screen agent view (screen swap, not a pane).
+  To free `a`, profile selection changes shape: **`s` and `h` become
+  independent toggles** (system on/off, home on/off) instead of the
+  tri-state `s`/`h`/`a` selection — both on covers what `a` (all) did;
+  toggling the last one off is refused (at least one profile stays
+  selected). Agent view:
   connection status, per-watch ref/last-seen commit, per-host last
   deploy/state (ok/failed/paused), pause/resume/kick/force-deploy keys,
   log tail reusing the job-log rendering machinery. Picker line at top when
