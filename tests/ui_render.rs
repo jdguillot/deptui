@@ -24,6 +24,7 @@ fn log_line(app: &mut App, text: &str, host: &str) {
         text: text.to_string(),
         is_err: false,
         host: Some(host.to_string()),
+        kind: deptui::host::LogKind::Plain,
     });
 }
 

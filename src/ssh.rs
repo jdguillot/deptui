@@ -69,17 +69,7 @@ impl SshOverride {
     /// that case so we don't accidentally clobber the flake's own
     /// `sshOpts`.
     pub fn deploy_ssh_opts(&self) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(id) = &self.identity {
-            parts.push("-i".to_string());
-            parts.push(id.to_string_lossy().into_owned());
-        }
-        if let Some(opts) = &self.extra_opts {
-            for token in opts.split_whitespace() {
-                parts.push("-o".to_string());
-                parts.push(token.to_string());
-            }
-        }
+        let parts = self.ssh_args();
         if parts.is_empty() {
             None
         } else {

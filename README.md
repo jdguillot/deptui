@@ -40,7 +40,7 @@ immediate switch or as a new boot entry for next boot.
 - **Toggles** for the deploy-rs flags you reach for most:
   `--skip-checks`, `--magic-rollback`, `--auto-rollback`,
   `--remote-build`, `--interactive-sudo`. Always-visible state strip.
-- **Pane-jump keys** (`f`/`i`/`p`/`t`/`c`) for instant focus on any
+- **Pane-jump keys** (`f`/`p`/`t`/`c`) for instant focus on any
   pane; `Tab`/`Shift+Tab` for sequential cycling.
 - **Build plan preflight** (`Shift+P`) — runs the dry-run deploy-rs
   would run and reports what will be compiled, what will be fetched, and
@@ -223,7 +223,7 @@ Optional flags:
 | `g` / `G`      | jump to top / snap to tail                                   |
 | `Space`        | mark/unmark host for batch operations                        |
 | `Tab` / `Shift+Tab` | cycle focus forward / backward                          |
-| `f`/`i`/`p`/`t`/`c` | jump to hosts / details / job log / toggles / commands  |
+| `f`/`p`/`t`/`c` | jump to hosts / job log / toggles / commands                |
 | `r`            | refresh online/offline for every host                        |
 | `u`            | cheap-tier update check (paths + activation time)            |
 | `Shift+U`      | full update check: closure size delta + package diff         |

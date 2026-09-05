@@ -23,43 +23,44 @@ use crate::deploy::{self, DeployRequest, LogLine, Mode, ProfileSel, Toggles};
 use crate::event::{spawn as spawn_events, AppEvent};
 use crate::flake::Node;
 use crate::host::{
-    self, BuildPlan, BuildSite, HostStatus, ProfileCheck, ProfileExtra, Reachability,
-    SubstituterDrift, UpdateState,
+    BuildPlan, BuildSite, HostStatus, LogKind, ProfileExtra, Reachability, SubstituterDrift,
+    UpdateState,
 };
+use crate::joblog;
+pub use crate::joblog::{LogEntry, VisualMode, VisualSel};
+use crate::probe;
 use crate::ssh::SshOverride;
 use crate::ui::{self, Tui};
 
 /// Focusable regions of the UI. Each one has its own keyboard
-/// affordance when focused: Hosts moves the selection, Details scrolls
-/// the log, Toggles lets you flip the deploy-rs flags without hitting
-/// 1–5, and Commands exposes every keybind action as a navigable button
-/// row. Tab/Shift-Tab cycles forward/back; Shift+H/L also crosses
+/// affordance when focused: Hosts moves the selection, Toggles lets
+/// you flip the deploy-rs flags without hitting 1–5, and Commands
+/// exposes every keybind action as a navigable button row. Tab/Shift-Tab cycles forward/back; Shift+H/L also crosses
 /// sub-nav boundaries inside Toggles and Commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
     Toggles,
     Hosts,
-    Details,
     JobLog,
     Commands,
 }
 
 impl FocusPane {
     /// Row in the grid layout. 0 = toggles (top), 1 = middle (hosts /
-    /// details / job log), 2 = commands (bottom). Used by the vertical
+    /// job log), 2 = commands (bottom). Used by the vertical
     /// pane-move keys to decide what "up" and "down" mean.
     pub fn row(self) -> usize {
         match self {
             FocusPane::Toggles => 0,
-            FocusPane::Hosts | FocusPane::Details | FocusPane::JobLog => 1,
+            FocusPane::Hosts | FocusPane::JobLog => 1,
             FocusPane::Commands => 2,
         }
     }
 }
 
-/// Number of toggle cells, kept in one place so the nav bounds check
-/// stays consistent with the rendering code.
-pub const TOGGLE_COUNT: usize = 5;
+/// Number of toggle cells — derived from the toggle table so the nav
+/// bounds check can't drift from what the strip renders.
+pub const TOGGLE_COUNT: usize = deploy::TOGGLES.len();
 
 /// Every action that can be bound to a command-pane button. The pane
 /// renders each variant as a short label and `activate_command`
@@ -99,17 +100,6 @@ pub const COMMANDS: &[(Command, &str, &str)] = &[
     (Command::Override, "o", "override"),
 ];
 
-#[derive(Debug, Clone)]
-pub struct LogEntry {
-    pub text: String,
-    pub is_err: bool,
-    /// Which host's deploy produced this line, if any. `None` is for
-    /// app-level status messages (reachability sweeps, toggle flips,
-    /// banner strings, etc.). Used by the batch-log pane to colour-tag
-    /// each line with its origin host.
-    pub host: Option<String>,
-}
-
 /// Which override field the user is currently editing. Drives both the
 /// prompt label and where the parsed buffer gets stored on Enter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,51 +117,6 @@ impl OverrideField {
             OverrideField::User => "ssh user",
             OverrideField::Identity => "identity file",
             OverrideField::Opts => "extra ssh opts",
-        }
-    }
-}
-
-/// Which log pane an in-progress `/` search is targeted at. The two
-/// log panes (details + job log) maintain independent scroll positions
-/// and content filters, so a single global search would land on the
-/// wrong line. We pin the target at the moment the user presses `/` and
-/// keep using it for `n` / `Shift+N` until they start a new search.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchTarget {
-    /// The right-column job log (host-tagged deploy output only).
-    JobLog,
-}
-
-/// Whether the visual selection in the job log is character-level or line-level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VisualMode {
-    /// `v` — cursor tracks (line, col); partial-line selection is possible.
-    Char,
-    /// `V` — whole lines only; col component is ignored.
-    Line,
-}
-
-/// Active visual selection in the job log pane. Indices are in terms of the
-/// *filtered* log (same index space as `filtered_log_indices_for_job_log`).
-#[derive(Debug, Clone)]
-pub struct VisualSel {
-    pub mode: VisualMode,
-    /// The end the user *started* the selection from. Fixed until selection ends.
-    pub anchor: (usize, usize), // (filtered_line_idx, char_col)
-    /// The end the user is currently moving. Drives `j`/`k`/`h`/`l`.
-    pub cursor: (usize, usize),
-}
-
-impl VisualSel {
-    /// Returns the normalised range `(start, end)` where start ≤ end.
-    /// Both elements are `(filtered_line_idx, char_col)`.
-    pub fn normalized(&self) -> ((usize, usize), (usize, usize)) {
-        let (al, ac) = self.anchor;
-        let (cl, cc) = self.cursor;
-        if al < cl || (al == cl && ac <= cc) {
-            ((al, ac), (cl, cc))
-        } else {
-            ((cl, cc), (al, ac))
         }
     }
 }
@@ -310,7 +255,6 @@ pub enum InputMode {
     /// While in this mode `n`/`Shift+N` are still typed into the buf —
     /// they only become "next match" / "previous match" after Enter.
     SearchLog {
-        target: SearchTarget,
         buf: String,
     },
     /// User pressed `/` while the help popup was open and is typing a
@@ -374,48 +318,50 @@ pub struct LastDeploy {
 /// Background work updates we receive over the status channel.
 #[derive(Debug)]
 enum StatusUpdate {
-    Reachability(String, Reachability),
+    /// A background probe reported progress or its final result.
+    Probe(probe::Report),
     /// Re-discovered flake nodes from the last `r` refresh. Merges new
     /// nodes into the running list without disturbing existing state.
     FlakeDiscover(Vec<Node>),
-    UpdateProbe {
-        node: String,
-        profile: String,
-        result: Result<ProfileCheck, String>,
-    },
-    /// Closure-size probe result: `(local_bytes, remote_bytes)`. Owned
-    /// by the medium-tier update details (`U`).
-    SizeProbe {
-        node: String,
-        profile: String,
-        result: Result<(u64, u64), String>,
-    },
-    /// `nix store diff-closures` output for the expensive-tier check
-    /// (`p`). Empty string = closures identical.
-    PkgDiffProbe {
-        node: String,
-        profile: String,
-        result: Result<String, String>,
-    },
-    /// Build-plan preflight result (`Shift+P`).
-    BuildPlanProbe {
-        node: String,
-        profile: String,
-        result: Result<BuildPlan, String>,
-    },
-    /// Substituter-drift check result (`Shift+C`).
-    CacheDriftProbe {
-        node: String,
-        result: Result<SubstituterDrift, String>,
-    },
-    /// Free-form progress line from a long-running probe (currently
-    /// only the package diff). Forwarded into the host-tagged log so
-    /// the user sees activity instead of a silent spinner.
-    LogLine {
-        node: String,
-        text: String,
-        is_err: bool,
-    },
+}
+
+impl From<probe::Report> for StatusUpdate {
+    fn from(report: probe::Report) -> Self {
+        StatusUpdate::Probe(report)
+    }
+}
+
+/// Everything that exists only while a deploy batch is running: the
+/// in-flight child's plumbing plus the queue of hosts behind it. Held
+/// as one `Option<DeploySession>` on [`App`] so "is a deploy running"
+/// is a single question and teardown cannot forget a field — dropping
+/// the session drops the state. Every teardown path (exit, spawn
+/// error, cancel, quit) takes the session and reads what it needs off
+/// the taken value.
+struct DeploySession {
+    /// Log lines from the running child.
+    rx: mpsc::Receiver<LogLine>,
+    /// The task driving the child. Detached (not aborted) on cancel so
+    /// its process-group teardown can finish — see `cancel_deploy`.
+    task: JoinHandle<()>,
+    /// Tears down the deploy's whole process group. Aborting `task`
+    /// only reaches the direct `deploy` child, leaving the `nix`
+    /// builders and `ssh` it forked running.
+    cancel: Option<deploy::DeployCanceller>,
+    /// When the deploy was started with `--interactive-sudo`, lets the
+    /// TUI write the sudo password to the child's piped stdin.
+    stdin_tx: Option<mpsc::Sender<String>>,
+    /// The host currently being deployed. Not in `queue`.
+    current: String,
+    /// Hosts still waiting after the current one finishes.
+    queue: VecDeque<String>,
+    /// Parameters the user confirmed for the whole batch, applied to
+    /// every host in it.
+    mode: Mode,
+    profile: ProfileSel,
+    /// Progress: `total` stays fixed while the queue drains.
+    total: usize,
+    done: usize,
 }
 
 pub struct App {
@@ -450,10 +396,6 @@ pub struct App {
     /// lines aren't highlighted. Cleared by Esc in the prompt or by
     /// committing an empty query.
     pub log_search: Option<String>,
-    /// Which pane the committed `log_search` belongs to. The two log
-    /// panes share `App.log_search` storage but only the targeted one
-    /// renders highlights and responds to `n`/`Shift+N`.
-    pub log_search_target: Option<SearchTarget>,
     /// 1-based index of the "active" match occurrence across the entire
     /// targeted pane. `n` increments, `N` decrements, wrapping at the
     /// edges. The rendering pass highlights this occurrence in cyan
@@ -474,12 +416,8 @@ pub struct App {
     /// hosts shows the right history per host instead of bleeding the
     /// global last-deploy onto every selection.
     pub last_deploys: HashMap<String, LastDeploy>,
-    /// Lines from the bottom of the details/status log the user has
-    /// scrolled up. `0` means "auto-tail" (always show the latest line).
-    pub log_scroll: usize,
-    /// Same contract as `log_scroll` but for the job log pane, which
-    /// has its own independent scroll state so the user can focus it
-    /// and scroll without disturbing the details log position.
+    /// Lines from the bottom of the job log the user has scrolled up.
+    /// `0` means "auto-tail" (always show the latest line).
     pub job_log_scroll: usize,
     /// Last known rendered height (in rows) of the job log viewport.
     /// Set by `draw_job_log` each frame; used by `visual_move_cursor`
@@ -504,22 +442,11 @@ pub struct App {
     status_tx: mpsc::Sender<StatusUpdate>,
     status_rx: mpsc::Receiver<StatusUpdate>,
 
-    /// In-flight deploy. We hold both the receiver (for log lines) and the
-    /// task handle so we can cancel.
-    deploy_rx: Option<mpsc::Receiver<LogLine>>,
-    deploy_task: Option<JoinHandle<()>>,
+    /// The running deploy batch, if any. See [`DeploySession`].
+    deploy: Option<DeploySession>,
     /// Extra `nix build` arguments from `--build-arg`, forwarded to
     /// deploy-rs after `--`.
     pub extra_build_args: Vec<String>,
-    /// Tears down the deploy's whole process group. Aborting
-    /// `deploy_task` only reaches the direct `deploy` child, leaving the
-    /// `nix` builders and `ssh` it forked running — which is why the
-    /// machine stayed busy after a cancel.
-    deploy_cancel: Option<deploy::DeployCanceller>,
-    /// When the in-flight deploy was started with `--interactive-sudo`, this
-    /// sender lets the TUI write the sudo password to the child's piped
-    /// stdin. `None` otherwise. Dropped on cancel or deploy completion.
-    deploy_stdin_tx: Option<mpsc::Sender<String>>,
 
     /// App-level askpass environment: script and socket paths, cloned
     /// into every task that spawns SSH.
@@ -549,24 +476,6 @@ pub struct App {
     /// inside `host.rs` so the underlying nix/ssh children are
     /// reaped, not orphaned.
     probe_tasks: Vec<JoinHandle<()>>,
-    /// Pending hosts to deploy after the current one finishes. Populated
-    /// when the user kicks off a multi-host deploy. The currently
-    /// running host is NOT in this queue (it lives in `current_target`).
-    deploy_queue: VecDeque<String>,
-    /// Sticky parameters for the in-flight queue so each subsequent
-    /// host is deployed with the same mode/profile/toggles the user
-    /// originally confirmed.
-    queue_mode: Mode,
-    queue_profile: ProfileSel,
-    /// Total hosts in the run that produced the current queue. Stays
-    /// fixed while the queue drains so progress is `done/total`. Reset
-    /// to 0 when the queue is empty.
-    pub queue_total: usize,
-    pub queue_done: usize,
-    /// The host currently being deployed (if any). Separate from the
-    /// queue so the running host can be displayed independently.
-    pub current_target: Option<String>,
-
     /// True once we receive a quit request.
     should_quit: bool,
 }
@@ -602,12 +511,10 @@ impl App {
             log: Vec::new(),
             busy_label: None,
             log_search: None,
-            log_search_target: None,
             log_search_match_idx: 0,
             help_search: None,
             last_deploy: None,
             last_deploys: HashMap::new(),
-            log_scroll: 0,
             job_log_scroll: 0,
             job_log_viewport_height: 0,
             visual_sel: None,
@@ -617,11 +524,8 @@ impl App {
             tick_counter: 0,
             status_tx,
             status_rx,
-            deploy_rx: None,
-            deploy_task: None,
+            deploy: None,
             extra_build_args: Vec::new(),
-            deploy_cancel: None,
-            deploy_stdin_tx: None,
             askpass_env: AskpassEnv {
                 script_path: "/dev/null".into(),
                 socket_path: "/dev/null".into(),
@@ -632,12 +536,6 @@ impl App {
             cached_password: None,
             pending_deploy: None,
             probe_tasks: Vec::new(),
-            deploy_queue: VecDeque::new(),
-            queue_mode: Mode::Switch,
-            queue_profile: ProfileSel::All,
-            queue_total: 0,
-            queue_done: 0,
-            current_target: None,
             should_quit: false,
         }
     }
@@ -695,7 +593,7 @@ impl App {
     /// Returns true when background work is in flight (spinners are
     /// animating), meaning tick-driven redraws are needed.
     fn has_inflight_work(&self) -> bool {
-        if self.deploy_task.is_some() {
+        if self.deploy.is_some() {
             return true;
         }
         if self.probe_tasks.iter().any(|h| !h.is_finished()) {
@@ -765,7 +663,7 @@ impl App {
                     self.apply_status(update);
                 }
 
-                Some(line) = recv_optional(&mut self.deploy_rx) => {
+                Some(line) = recv_deploy(&mut self.deploy) => {
                     self.handle_deploy_line(line);
                     // Drain whatever else is already queued before painting.
                     // `nix` can emit output far faster than a full-screen
@@ -775,7 +673,7 @@ impl App {
                     // what the log "just stopping" mid-deploy looks like.
                     let mut drained = 0usize;
                     while drained < MAX_LOG_DRAIN {
-                        let Some(rx) = self.deploy_rx.as_mut() else {
+                        let Some(rx) = self.deploy.as_mut().map(|s| &mut s.rx) else {
                             // An `Exit` line cleared the receiver (and may
                             // have started the next host in the batch).
                             break;
@@ -793,7 +691,7 @@ impl App {
                     // a follow-up paint, so a skipped frame is never a
                     // dropped one. Once it finishes there are no more ticks
                     // to rely on, so that frame has to go out now.
-                    rate_limited = self.deploy_task.is_some();
+                    rate_limited = self.deploy.is_some();
                 }
 
                 Some(prompt) = self.askpass_prompt_rx.recv() => {
@@ -823,8 +721,8 @@ impl App {
         // `cancel_deploy`: signal the process group and give the task a
         // moment to reap it, otherwise quitting the TUI would leave a
         // detached `nix` build running.
-        if let Some(t) = self.deploy_task.take() {
-            match self.deploy_cancel.take() {
+        if let Some(mut session) = self.deploy.take() {
+            match session.cancel.take() {
                 Some(c) => {
                     c.cancel();
                     // Teardown takes at least `CANCEL_GRACE`, so say what
@@ -834,9 +732,10 @@ impl App {
                     let _ = ui::render(terminal, self);
                     // Bounded so a wedged child can't strand the terminal
                     // in the alternate screen.
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), t).await;
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), session.task).await;
                 }
-                None => t.abort(),
+                None => session.task.abort(),
             }
         }
 
@@ -864,7 +763,7 @@ impl App {
                 self.should_quit = true;
             } else {
                 self.input = InputMode::ConfirmQuit {
-                    deploy_running: self.deploy_task.is_some(),
+                    deploy_running: self.deploy.is_some(),
                 };
             }
             return;
@@ -947,8 +846,8 @@ impl App {
             InputMode::ConfirmQuit { deploy_running } => {
                 self.handle_key_confirm_quit(key, deploy_running);
             }
-            InputMode::SearchLog { target, buf } => {
-                self.handle_key_search_log(key, target, buf);
+            InputMode::SearchLog { buf } => {
+                self.handle_key_search_log(key, buf);
             }
             InputMode::SearchHelp { buf } => {
                 self.handle_key_search_help(key, buf);
@@ -1068,7 +967,7 @@ impl App {
             }
             KeyCode::Char('q') => {
                 self.input = InputMode::ConfirmQuit {
-                    deploy_running: self.deploy_task.is_some(),
+                    deploy_running: self.deploy.is_some(),
                 };
                 return;
             }
@@ -1119,14 +1018,10 @@ impl App {
             // btop-style direct pane jumps. Picked letters that don't
             // collide with anything else: `f` = focus hosts (the
             // obvious `h` is taken by the home-profile shortcut and
-            // `n` is taken by search-next), `i` = inspect details,
-            // `p` = pipeline (job) log, `t` = toggles, `c` = commands.
+            // `n` is taken by search-next), `p` = pipeline (job) log,
+            // `t` = toggles, `c` = commands.
             KeyCode::Char('f') => {
                 self.focus = FocusPane::Hosts;
-                return;
-            }
-            KeyCode::Char('i') => {
-                self.focus = FocusPane::Details;
                 return;
             }
             KeyCode::Char('p') => {
@@ -1155,17 +1050,13 @@ impl App {
         // `/` opens the job-log search from any pane, matching how vim
         // and lazygit make search always reachable.
         if key.code == KeyCode::Char('/') && !shift {
-            self.input = InputMode::SearchLog {
-                target: SearchTarget::JobLog,
-                buf: String::new(),
-            };
+            self.input = InputMode::SearchLog { buf: String::new() };
             return;
         }
 
         // `n`/`N` jump between search matches from any pane — the search
         // is global so navigating results should be too.
-        if self.log_search.is_some() && matches!(self.log_search_target, Some(SearchTarget::JobLog))
-        {
+        if self.log_search.is_some() {
             match key.code {
                 KeyCode::Char('n') if !shift => {
                     self.search_job_log_jump(1);
@@ -1195,10 +1086,6 @@ impl App {
                 }
                 _ => {}
             },
-            FocusPane::Details => {
-                // Details pane no longer has a scrollable log — key
-                // events fall through to the global action keys below.
-            }
             FocusPane::JobLog => {
                 // --- visual mode intercept ---
                 if self.visual_sel.is_some() {
@@ -1332,14 +1219,14 @@ impl App {
         }
     }
 
-    /// Advance focus in reading order: Toggles → Hosts → Details →
-    /// JobLog → Commands → Toggles. Tab uses this; Shift+Tab uses
-    /// [`focus_prev`].
+    /// Advance focus in reading order: Toggles → Hosts → JobLog →
+    /// Commands → Toggles. Tab uses this; Shift+Tab uses
+    /// [`focus_prev`]. The details pane is display-only and is not a
+    /// focus stop.
     fn focus_next(&mut self) {
         self.focus = match self.focus {
             FocusPane::Toggles => FocusPane::Hosts,
-            FocusPane::Hosts => FocusPane::Details,
-            FocusPane::Details => FocusPane::JobLog,
+            FocusPane::Hosts => FocusPane::JobLog,
             FocusPane::JobLog => FocusPane::Commands,
             FocusPane::Commands => FocusPane::Toggles,
         };
@@ -1349,8 +1236,7 @@ impl App {
         self.focus = match self.focus {
             FocusPane::Toggles => FocusPane::Commands,
             FocusPane::Hosts => FocusPane::Toggles,
-            FocusPane::Details => FocusPane::Hosts,
-            FocusPane::JobLog => FocusPane::Details,
+            FocusPane::JobLog => FocusPane::Hosts,
             FocusPane::Commands => FocusPane::JobLog,
         };
     }
@@ -1359,26 +1245,23 @@ impl App {
     ///   Left column:  Hosts (top) | Details (bottom)
     ///   Right column: JobLog (full height)
     ///
-    /// Shift+L from Hosts or Details moves to JobLog.
+    /// Shift+L from Hosts moves to JobLog.
     /// Shift+H from JobLog moves back to Hosts.
     /// Clamped at both ends (no wrap) so stray Shift+L at the right
     /// edge doesn't teleport back to the host list.
     fn pane_move_horizontal(&mut self, delta: i32) {
         self.focus = match (self.focus, delta) {
-            (FocusPane::Hosts, 1) | (FocusPane::Details, 1) => FocusPane::JobLog,
+            (FocusPane::Hosts, 1) => FocusPane::JobLog,
             (FocusPane::JobLog, -1) => FocusPane::Hosts,
             _ => self.focus, // already at edge or not in the middle row
         };
     }
 
-    /// Vertical pane move. With the new layout Hosts and Details stack
-    /// vertically in the left column, so Shift+J/K navigate between
-    /// them in addition to crossing the row boundary.
+    /// Vertical pane move.
     ///
-    ///   Shift+J:  Toggles → Hosts → Details → Commands
+    ///   Shift+J:  Toggles → Hosts → Commands
     ///             JobLog  → Commands
     ///   Shift+K:  Commands → JobLog
-    ///             Details  → Hosts → Toggles
     ///             Hosts    → Toggles
     ///
     /// Clamped at the top and bottom edges.
@@ -1386,11 +1269,9 @@ impl App {
         self.focus = match (self.focus, delta) {
             // Down
             (FocusPane::Toggles, 1) => FocusPane::Hosts,
-            (FocusPane::Hosts, 1) => FocusPane::Details,
-            (FocusPane::Details, 1) | (FocusPane::JobLog, 1) => FocusPane::Commands,
+            (FocusPane::Hosts, 1) | (FocusPane::JobLog, 1) => FocusPane::Commands,
             // Up
             (FocusPane::Commands, -1) => FocusPane::JobLog,
-            (FocusPane::Details, -1) => FocusPane::Hosts,
             (FocusPane::Hosts, -1) | (FocusPane::JobLog, -1) => FocusPane::Toggles,
             // Edges / no-ops
             _ => self.focus,
@@ -1433,34 +1314,15 @@ impl App {
     /// check themselves. Kept in one place so both direct-number keys
     /// (`1-5`) and Enter-on-focus go through identical logic.
     fn activate_toggle(&mut self, idx: usize) {
-        match idx {
-            0 => {
-                self.toggles.skip_checks = !self.toggles.skip_checks;
-                self.log_toggle("skip-checks", self.toggles.skip_checks);
+        let Some(def) = deploy::TOGGLES.get(idx) else {
+            return;
+        };
+        let on = (def.toggle)(&mut self.toggles);
+        self.log_toggle(def.name, on);
+        if on {
+            if let Some(hint) = def.on_hint {
+                self.push_log(hint, false);
             }
-            1 => {
-                self.toggles.magic_rollback = !self.toggles.magic_rollback;
-                self.log_toggle("magic-rollback", self.toggles.magic_rollback);
-            }
-            2 => {
-                self.toggles.auto_rollback = !self.toggles.auto_rollback;
-                self.log_toggle("auto-rollback", self.toggles.auto_rollback);
-            }
-            3 => {
-                self.toggles.remote_build = !self.toggles.remote_build;
-                self.log_toggle("remote-build", self.toggles.remote_build);
-            }
-            4 => {
-                self.toggles.interactive_sudo = !self.toggles.interactive_sudo;
-                self.log_toggle("interactive-sudo", self.toggles.interactive_sudo);
-                if self.toggles.interactive_sudo {
-                    self.push_log(
-                        "  interactive-sudo: TUI will prompt securely when sudo asks for a password",
-                        false,
-                    );
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1755,7 +1617,7 @@ impl App {
     /// for one of the log panes. Enter commits, Esc cancels (clearing
     /// any prior committed search), Backspace edits, every other
     /// printable char appends to the buffer.
-    fn handle_key_search_log(&mut self, key: KeyEvent, target: SearchTarget, mut buf: String) {
+    fn handle_key_search_log(&mut self, key: KeyEvent, mut buf: String) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
@@ -1764,7 +1626,6 @@ impl App {
                 // for the user to "turn search off entirely".
                 self.input = InputMode::Normal;
                 self.log_search = None;
-                self.log_search_target = None;
             }
             KeyCode::Enter => {
                 self.input = InputMode::Normal;
@@ -1772,29 +1633,23 @@ impl App {
                 if trimmed.is_empty() {
                     // Committing empty == clearing.
                     self.log_search = None;
-                    self.log_search_target = None;
                     return;
                 }
                 self.log_search = Some(trimmed);
-                self.log_search_target = Some(target);
                 // Jump to the first match nearest the tail (newest).
-                match target {
-                    SearchTarget::JobLog => {
-                        self.job_log_scroll = 0;
-                        self.search_job_log_jump_initial();
-                    }
-                }
+                self.job_log_scroll = 0;
+                self.search_job_log_jump_initial();
             }
             KeyCode::Backspace => {
                 buf.pop();
-                self.input = InputMode::SearchLog { target, buf };
+                self.input = InputMode::SearchLog { buf };
             }
             KeyCode::Char(c) if !ctrl => {
                 buf.push(c);
-                self.input = InputMode::SearchLog { target, buf };
+                self.input = InputMode::SearchLog { buf };
             }
             _ => {
-                self.input = InputMode::SearchLog { target, buf };
+                self.input = InputMode::SearchLog { buf };
             }
         }
     }
@@ -1871,7 +1726,7 @@ impl App {
                         self.input = InputMode::Normal;
                     }
                     PromptSource::Sudo => {
-                        if let Some(tx) = &self.deploy_stdin_tx {
+                        if let Some(tx) = self.deploy.as_ref().and_then(|s| s.stdin_tx.as_ref()) {
                             let _ = tx.try_send(secret.to_string());
                         } else {
                             self.push_log("! no stdin channel available for sudo password", true);
@@ -1952,7 +1807,7 @@ impl App {
     }
 
     fn search_job_log_jump(&mut self, direction: i32) {
-        self.advance_match(SearchTarget::JobLog, direction);
+        self.advance_match(direction);
     }
 
     /// First-jump variant: set the active match to the last occurrence
@@ -1962,19 +1817,19 @@ impl App {
         let Some(query) = self.log_search.as_ref() else {
             return;
         };
-        let total = self.count_all_matches(SearchTarget::JobLog, query);
+        let total = self.count_all_matches(query);
         self.log_search_match_idx = total;
-        self.scroll_to_match(SearchTarget::JobLog);
+        self.scroll_to_match();
     }
 
     /// Increment (direction=+1) or decrement (direction=-1) the active
     /// match index, wrapping at the edges, then scroll so the line
     /// containing the match is visible.
-    fn advance_match(&mut self, target: SearchTarget, direction: i32) {
+    fn advance_match(&mut self, direction: i32) {
         let Some(query) = self.log_search.as_ref() else {
             return;
         };
-        let total = self.count_all_matches(target, query);
+        let total = self.count_all_matches(query);
         if total == 0 {
             return;
         }
@@ -1987,20 +1842,18 @@ impl App {
         } else {
             cur as usize
         };
-        self.scroll_to_match(target);
+        self.scroll_to_match();
     }
 
     /// Scroll the targeted pane so the line containing the current
     /// active match (by `log_search_match_idx`) is visible. Finds the
     /// Nth occurrence by walking filtered entries and counting per-line
     /// hits.
-    fn scroll_to_match(&mut self, target: SearchTarget) {
+    fn scroll_to_match(&mut self) {
         let Some(query) = self.log_search.as_ref() else {
             return;
         };
-        let filtered = match target {
-            SearchTarget::JobLog => self.filtered_log_indices_for_job_log(),
-        };
+        let filtered = self.filtered_log_indices_for_job_log();
         if filtered.is_empty() {
             return;
         }
@@ -2012,9 +1865,7 @@ impl App {
                 // Convert filtered-entry index to scroll offset:
                 // scroll == 0 ↔ tail, scroll == len-1 ↔ top.
                 let scroll = filtered.len().saturating_sub(1).saturating_sub(i);
-                match target {
-                    SearchTarget::JobLog => self.job_log_scroll = scroll,
-                }
+                self.job_log_scroll = scroll;
                 return;
             }
             seen += hits;
@@ -2025,30 +1876,24 @@ impl App {
     /// alone so the user stays where they were when they pressed Esc.
     fn clear_log_search(&mut self) {
         self.log_search = None;
-        self.log_search_target = None;
         self.log_search_match_idx = 0;
     }
 
-    /// Return `(current, total)` for the committed log search on
-    /// `target`. `current` is `log_search_match_idx` (1-based); `total`
+    /// Return `(current, total)` for the committed log search.
+    /// `current` is `log_search_match_idx` (1-based); `total`
     /// is the count of every individual occurrence of the query across
     /// all filtered lines (a single line with two hits counts twice).
-    pub fn log_search_stats(&self, target: SearchTarget) -> (usize, usize) {
+    pub fn log_search_stats(&self) -> (usize, usize) {
         let Some(query) = self.log_search.as_ref() else {
             return (0, 0);
         };
-        if self.log_search_target != Some(target) {
-            return (0, 0);
-        }
-        let total = self.count_all_matches(target, query);
+        let total = self.count_all_matches(query);
         (self.log_search_match_idx, total)
     }
 
-    /// Total number of individual query occurrences in the targeted pane.
-    fn count_all_matches(&self, target: SearchTarget, query: &str) -> usize {
-        let filtered = match target {
-            SearchTarget::JobLog => self.filtered_log_indices_for_job_log(),
-        };
+    /// Total number of individual query occurrences in the job log.
+    fn count_all_matches(&self, query: &str) -> usize {
+        let filtered = self.filtered_log_indices_for_job_log();
         let mut total = 0usize;
         for &idx in &filtered {
             total += self.log[idx].text.matches(query).count();
@@ -2057,23 +1902,14 @@ impl App {
     }
 
     /// Indices into `self.log` that the job-log pane currently shows.
-    /// Mirrors the filter inside `draw_job_log` in `ui.rs`: shows only
-    /// entries for the marked hosts (or the selected host when no marks
-    /// are set).
-    fn filtered_log_indices_for_job_log(&self) -> Vec<usize> {
-        let active: std::collections::HashSet<&str> = if self.marked.is_empty() {
-            self.selected_node()
-                .map(|n| n.name.as_str())
-                .into_iter()
-                .collect()
-        } else {
-            self.marked.iter().map(|s| s.as_str()).collect()
-        };
-        self.log
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| e.host.as_deref().filter(|h| active.contains(*h)).map(|_| i))
-            .collect()
+    /// One implementation, shared with the renderer — see
+    /// [`joblog::filtered_indices`].
+    pub fn filtered_log_indices_for_job_log(&self) -> Vec<usize> {
+        joblog::filtered_indices(
+            &self.log,
+            &self.marked,
+            self.selected_node().map(|n| n.name.as_str()),
+        )
     }
 
     fn log_toggle(&mut self, name: &str, value: bool) {
@@ -2237,15 +2073,16 @@ impl App {
                 }
                 VisualMode::Char => {
                     let chars: Vec<char> = line_text.chars().collect();
-                    let (s, e) = if total == 1 {
-                        (start_col.min(chars.len()), (end_col + 1).min(chars.len()))
-                    } else if i == 0 {
-                        (start_col.min(chars.len()), chars.len())
-                    } else if i == total - 1 {
-                        (0, (end_col + 1).min(chars.len()))
-                    } else {
-                        (0, chars.len())
-                    };
+                    // The same bounds the renderer highlights with, so
+                    // what looked selected is exactly what gets copied.
+                    let (s, e) = joblog::char_selection_bounds(
+                        chars.len(),
+                        start_line + i,
+                        start_line,
+                        start_col,
+                        end_line,
+                        end_col,
+                    );
                     text.push_str(&chars[s..e].iter().collect::<String>());
                     if i < total - 1 {
                         text.push('\n');
@@ -2285,9 +2122,6 @@ impl App {
                 if !self.nodes.is_empty() {
                     self.selected = 0;
                 }
-            }
-            FocusPane::Details => {
-                // Details no longer has a scrollable log; treat as no-op.
             }
             FocusPane::JobLog => {
                 let visible = self.filtered_log_indices_for_job_log().len();
@@ -2329,26 +2163,12 @@ impl App {
                 .or_default()
                 .checking_reachability = true;
         }
-        // Snapshot the (name, hostname) pairs before the spawn loop
-        // so the closure-capturing iteration doesn't hold an
-        // immutable borrow of `self.nodes` while we mutably reborrow
-        // `self.probe_tasks` via `track_probe` inside the body.
-        let targets: Vec<(String, String)> = self
-            .nodes
-            .iter()
-            .map(|n| (n.name.clone(), n.hostname.clone()))
-            .collect();
-        for (name, host) in targets {
-            // Pass the full override so `ssh -G` sees any `-i`/`-o`
-            // args the user set, not just the raw hostname.
-            let override_ = self.override_for(&name).clone();
-            let tx = self.status_tx.clone();
-            let task_name = name.clone();
-            let handle = tokio::spawn(async move {
-                let r = host::check_online(&host, &override_).await;
-                let _ = tx.send(StatusUpdate::Reachability(task_name, r)).await;
-            });
-            self.track_probe(handle);
+        // Snapshot the nodes before the spawn loop so the iteration
+        // doesn't hold an immutable borrow of `self.nodes` while we
+        // mutably reborrow `self.probe_tasks` via `track_probe`.
+        let targets: Vec<Node> = self.nodes.clone();
+        for node in &targets {
+            self.spawn_probe(node, probe::Kind::Reachability);
         }
         // Re-discover nodes from the flake so any newly-added hosts
         // appear in the list without restarting the TUI.
@@ -2370,6 +2190,26 @@ impl App {
     fn track_probe(&mut self, handle: JoinHandle<()>) {
         self.probe_tasks.retain(|h| !h.is_finished());
         self.probe_tasks.push(handle);
+    }
+
+    /// Snapshot the per-node context a probe needs. Everything is
+    /// cloned out of `App`, so a probe in flight is unaffected by
+    /// later state changes (override edits, node refreshes).
+    fn probe_ctx(&self, node: &Node) -> probe::Ctx {
+        probe::Ctx {
+            flake: self.flake.clone(),
+            node: node.clone(),
+            override_: self.override_for(&node.name).clone(),
+            askpass: self.askpass_env.clone(),
+        }
+    }
+
+    /// Spawn one background probe against `node` and track its handle
+    /// so `x` can cancel it. Progress lines and the final result come
+    /// back through the status channel as [`StatusUpdate::Probe`].
+    fn spawn_probe(&mut self, node: &Node, kind: probe::Kind) {
+        let handle = probe::spawn(kind, self.probe_ctx(node), self.status_tx.clone());
+        self.track_probe(handle);
     }
 
     /// Compare local-build vs remote symlink for the selected node's
@@ -2409,39 +2249,14 @@ impl App {
         {
             let entry = self.status.entry(node.name.clone()).or_default();
             for profile in node.profiles.keys() {
-                match profile.as_str() {
-                    "system" => entry.checking_system = true,
-                    "home" => entry.checking_home = true,
-                    _ => {}
-                }
+                entry.profile_mut(profile).checking = true;
             }
             entry.last_error = None;
         }
 
-        let flake = self.flake.clone();
-        let override_ = self.override_for(&node.name).clone();
-        let askpass = self.askpass_env.clone();
-        for profile in node.profiles.keys() {
-            let profile = profile.clone();
-            let node = node.clone();
-            let flake = flake.clone();
-            let override_ = override_.clone();
-            let askpass = askpass.clone();
-            let tx = self.status_tx.clone();
-            let handle = tokio::spawn(async move {
-                let result =
-                    host::check_profile_up_to_date(&flake, &node, &profile, &override_, &askpass)
-                        .await
-                        .map_err(|e| format!("{e:#}"));
-                let _ = tx
-                    .send(StatusUpdate::UpdateProbe {
-                        node: node.name.clone(),
-                        profile,
-                        result,
-                    })
-                    .await;
-            });
-            self.track_probe(handle);
+        let profiles: Vec<String> = node.profiles.keys().cloned().collect();
+        for profile in profiles {
+            self.spawn_probe(node, probe::Kind::Update { profile });
         }
         self.push_log_tagged(
             format!("→ checking updates for {}", node.name).as_str(),
@@ -2483,7 +2298,7 @@ impl App {
                     format!(
                         "! {} has no {} profile — nothing to plan",
                         node.name,
-                        describe_profile(self.profile_sel)
+                        self.profile_sel.label()
                     )
                     .as_str(),
                     true,
@@ -2508,46 +2323,7 @@ impl App {
             );
 
             for profile in profiles {
-                let node_cloned = node.clone();
-                let override_ = self.override_for(&node.name).clone();
-                let tx = self.status_tx.clone();
-                let flake = self.flake.clone();
-                let profile_cloned = profile.clone();
-                let handle = tokio::spawn(async move {
-                    let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
-                    let forwarder_tx = tx.clone();
-                    let forwarder_node = node_cloned.name.clone();
-                    let forwarder = tokio::spawn(async move {
-                        while let Some(line) = prog_rx.recv().await {
-                            let _ = forwarder_tx
-                                .send(StatusUpdate::LogLine {
-                                    node: forwarder_node.clone(),
-                                    text: line,
-                                    is_err: false,
-                                })
-                                .await;
-                        }
-                    });
-                    let result = host::check_build_plan(
-                        &flake,
-                        &node_cloned,
-                        &profile_cloned,
-                        site,
-                        &override_,
-                        prog_tx,
-                    )
-                    .await
-                    .map_err(|e| format!("{e:#}"));
-                    let _ = forwarder.await;
-                    let _ = tx
-                        .send(StatusUpdate::BuildPlanProbe {
-                            node: node_cloned.name.clone(),
-                            profile: profile_cloned,
-                            result,
-                        })
-                        .await;
-                });
-                self.track_probe(handle);
+                self.spawn_probe(node, probe::Kind::BuildPlan { profile, site });
             }
         }
     }
@@ -2572,13 +2348,13 @@ impl App {
         let substituters = drift.added_substituters.clone();
         let keys = drift.added_keys.clone();
         let paths: Vec<String> = status
-            .build_plans
-            .values()
-            .flat_map(|p| p.seedable_paths())
+            .build_plans()
+            .flat_map(|(_, p)| p.seedable_paths())
             .collect();
 
         if paths.is_empty() {
-            let msg = if status.build_plans.is_empty() {
+            let has_plan = status.build_plans().next().is_some();
+            let msg = if !has_plan {
                 format!(
                     "! {node} adds {} cache(s) but no build plan is known — press Shift+P to \
 resolve the paths so they can be seeded",
@@ -2587,7 +2363,7 @@ resolve the paths so they can be seeded",
             } else {
                 format!("• {node}: nothing left to seed — the plan needs no new paths")
             };
-            let is_err = status.build_plans.is_empty();
+            let is_err = !has_plan;
             self.push_log_tagged(&msg, is_err, Some(node.to_string()));
             return None;
         }
@@ -2646,47 +2422,7 @@ resolve the paths so they can be seeded",
                 Some(node.name.clone()),
             );
 
-            let node_cloned = node.clone();
-            let override_ = self.override_for(&node.name).clone();
-            let askpass = self.askpass_env.clone();
-            let tx = self.status_tx.clone();
-            let flake = self.flake.clone();
-            let handle = tokio::spawn(async move {
-                let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
-                let forwarder_tx = tx.clone();
-                let forwarder_node = node_cloned.name.clone();
-                let forwarder = tokio::spawn(async move {
-                    while let Some(line) = prog_rx.recv().await {
-                        let _ = forwarder_tx
-                            .send(StatusUpdate::LogLine {
-                                node: forwarder_node.clone(),
-                                text: line,
-                                is_err: false,
-                            })
-                            .await;
-                    }
-                });
-                let result = host::check_substituter_drift(
-                    &flake,
-                    &node_cloned,
-                    site,
-                    &override_,
-                    &askpass,
-                    prog_tx,
-                )
-                .await
-                .map_err(|e| format!("{e:#}"));
-                // Drain progress lines before the verdict so they read in
-                // order.
-                let _ = forwarder.await;
-                let _ = tx
-                    .send(StatusUpdate::CacheDriftProbe {
-                        node: node_cloned.name.clone(),
-                        result,
-                    })
-                    .await;
-            });
-            self.track_probe(handle);
+            self.spawn_probe(&node, probe::Kind::CacheDrift { site });
         }
     }
 
@@ -2711,11 +2447,7 @@ resolve the paths so they can be seeded",
             .profiles
             .keys()
             .map(|p| {
-                let extra = match p.as_str() {
-                    "system" => &status.system_extra,
-                    "home" => &status.home_extra,
-                    _ => return (p.clone(), None, None),
-                };
+                let extra = &status.profile(p).extra;
                 (
                     p.clone(),
                     extra.local_path.clone(),
@@ -2729,59 +2461,15 @@ resolve the paths so they can be seeded",
             };
             // Flag "in flight" on the extras so the UI can spin.
             let entry = self.status.entry(node.name.clone()).or_default();
-            match profile.as_str() {
-                "system" => entry.system_extra.checking_size = true,
-                "home" => entry.home_extra.checking_size = true,
-                _ => {}
-            }
-            let node_cloned = node.clone();
-            let override_ = self.override_for(&node.name).clone();
-            let askpass = self.askpass_env.clone();
-            let tx = self.status_tx.clone();
-            let profile_cloned = profile.clone();
-            let flake_cloned = self.flake.clone();
-            let handle = tokio::spawn(async move {
-                let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
-                let forwarder_tx = tx.clone();
-                let forwarder_node = node_cloned.name.clone();
-                let forwarder = tokio::spawn(async move {
-                    while let Some(line) = prog_rx.recv().await {
-                        let _ = forwarder_tx
-                            .send(StatusUpdate::LogLine {
-                                node: forwarder_node.clone(),
-                                text: line,
-                                is_err: false,
-                            })
-                            .await;
-                    }
-                });
-                let result = host::check_closure_sizes(
-                    &host::ProfileProbe {
-                        flake: &flake_cloned,
-                        node: &node_cloned,
-                        profile: &profile_cloned,
-                        local_path: &local_path,
-                        remote_path: &remote_path,
-                        override_: &override_,
-                        askpass: &askpass,
-                    },
-                    prog_tx,
-                )
-                .await
-                .map_err(|e| format!("{e:#}"));
-                // Drain the forwarder before publishing the final probe
-                // result so the closing "[size] remote: …" line lands
-                // before the inline sizes snap into place.
-                let _ = forwarder.await;
-                let _ = tx
-                    .send(StatusUpdate::SizeProbe {
-                        node: node_cloned.name.clone(),
-                        profile: profile_cloned,
-                        result,
-                    })
-                    .await;
-            });
-            self.track_probe(handle);
+            entry.profile_mut(&profile).extra.checking_size = true;
+            self.spawn_probe(
+                node,
+                probe::Kind::Size {
+                    profile: profile.clone(),
+                    local_path,
+                    remote_path,
+                },
+            );
             launched += 1;
         }
         if launched == 0 {
@@ -2817,81 +2505,26 @@ resolve the paths so they can be seeded",
         remote_path: String,
     ) {
         let entry = self.status.entry(node.name.clone()).or_default();
-        match profile {
-            "system" => entry.system_extra.checking_pkg = true,
-            "home" => entry.home_extra.checking_pkg = true,
-            _ => return,
-        }
-        let tx = self.status_tx.clone();
-        let node_cloned = node.clone();
-        let profile_cloned = profile.to_string();
-        let override_ = self.override_for(&node.name).clone();
-        let askpass = self.askpass_env.clone();
-        let flake_cloned = self.flake.clone();
-        let handle = tokio::spawn(async move {
-            let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
-            let forwarder_tx = tx.clone();
-            let forwarder_node = node_cloned.name.clone();
-            let forwarder = tokio::spawn(async move {
-                while let Some(line) = prog_rx.recv().await {
-                    let _ = forwarder_tx
-                        .send(StatusUpdate::LogLine {
-                            node: forwarder_node.clone(),
-                            text: line,
-                            is_err: false,
-                        })
-                        .await;
-                }
-            });
-
-            let result = host::check_package_diff(
-                &host::ProfileProbe {
-                    flake: &flake_cloned,
-                    node: &node_cloned,
-                    profile: &profile_cloned,
-                    local_path: &local_path,
-                    remote_path: &remote_path,
-                    override_: &override_,
-                    askpass: &askpass,
-                },
-                prog_tx,
-            )
-            .await
-            .map_err(|e| format!("{e:#}"));
-            // Drain the forwarder before publishing the final probe
-            // result so the closing "[pkg] done" line lands before
-            // the inline diff snaps into place.
-            let _ = forwarder.await;
-            let _ = tx
-                .send(StatusUpdate::PkgDiffProbe {
-                    node: node_cloned.name.clone(),
-                    profile: profile_cloned,
-                    result,
-                })
-                .await;
-        });
-        self.track_probe(handle);
-        self.push_log_tagged(
-            format!("→ computing package diff for {} ({profile})", node.name).as_str(),
+        entry.profile_mut(profile).extra.checking_pkg = true;
+        self.spawn_probe(
+            node,
+            probe::Kind::PkgDiff {
+                profile: profile.to_string(),
+                local_path,
+                remote_path,
+            },
+        );
+        self.push_log_line(
+            format!("→ computing package diff for {} ({profile})", node.name),
             false,
             Some(node.name.clone()),
+            LogKind::Note,
         );
     }
 
     fn apply_status(&mut self, update: StatusUpdate) {
         match update {
-            StatusUpdate::Reachability(name, r) => {
-                let entry = self.status.entry(name).or_default();
-                entry.reachability = r;
-                entry.checking_reachability = false;
-                // Stamp the "last seen up" time on every successful
-                // probe so the details pane can show something freshly
-                // anchored ("up 3s ago") rather than the stale label
-                // from whatever the previous sweep found.
-                if r == Reachability::Online {
-                    entry.last_online = Some(std::time::SystemTime::now());
-                }
-            }
+            StatusUpdate::Probe(report) => self.apply_probe(report),
             StatusUpdate::FlakeDiscover(new_nodes) => {
                 // Merge newly discovered nodes into the running list.
                 // Nodes already present keep all their accumulated
@@ -2904,7 +2537,28 @@ resolve the paths so they can be seeded",
                     }
                 }
             }
-            StatusUpdate::UpdateProbe {
+        }
+    }
+
+    /// Fold one probe report into host state. Probe *policy* lives
+    /// here — which cached extras a result invalidates, and which
+    /// follow-up probes it chains into — while the spawn/progress
+    /// plumbing lives in [`probe::spawn`].
+    fn apply_probe(&mut self, report: probe::Report) {
+        match report {
+            probe::Report::Reachability { node, result } => {
+                let entry = self.status.entry(node).or_default();
+                entry.reachability = result;
+                entry.checking_reachability = false;
+                // Stamp the "last seen up" time on every successful
+                // probe so the details pane can show something freshly
+                // anchored ("up 3s ago") rather than the stale label
+                // from whatever the previous sweep found.
+                if result == Reachability::Online {
+                    entry.last_online = Some(std::time::SystemTime::now());
+                }
+            }
+            probe::Report::Update {
                 node,
                 profile,
                 result,
@@ -2924,64 +2578,50 @@ resolve the paths so they can be seeded",
                 // them without any extra work. An error clears the old
                 // cached values so we never show stale paths alongside
                 // a failed probe.
-                let extra = match profile.as_str() {
-                    "system" => Some(&mut entry.system_extra),
-                    "home" => Some(&mut entry.home_extra),
-                    _ => None,
-                };
-                if let Some(ex) = extra {
-                    match &result {
-                        Ok(c) if c.not_deployed => {
-                            // No remote path exists yet — clear everything
-                            // so we don't show stale data from a previous probe.
-                            ex.local_path = None;
-                            ex.remote_path = None;
-                            ex.activation_time = None;
-                            ex.local_size = None;
-                            ex.remote_size = None;
-                            ex.pkg_diff = None;
-                        }
-                        Ok(c) => {
-                            ex.local_path = Some(c.local_path.clone());
-                            ex.remote_path = Some(c.remote_path.clone());
-                            ex.activation_time = c.activation_time;
-                            // A fresh `u` invalidates the medium/expensive
-                            // tiers — the closure we just resolved may
-                            // not be the one we sized / diffed last
-                            // time. Clear them so the user re-triggers
-                            // Shift+U / p against the new paths instead
-                            // of reading stale numbers as current.
-                            ex.local_size = None;
-                            ex.remote_size = None;
-                            ex.pkg_diff = None;
-                        }
-                        Err(_) => {
-                            ex.local_path = None;
-                            ex.remote_path = None;
-                            ex.activation_time = None;
-                            // The medium/expensive results are scoped
-                            // to the paths we just invalidated — drop
-                            // them so a later `U`/`p` doesn't render
-                            // garbage for the wrong closure.
-                            ex.local_size = None;
-                            ex.remote_size = None;
-                            ex.pkg_diff = None;
-                        }
+                let ps = entry.profile_mut(&profile);
+                let ex = &mut ps.extra;
+                match &result {
+                    Ok(c) if c.not_deployed => {
+                        // No remote path exists yet — clear everything
+                        // so we don't show stale data from a previous probe.
+                        ex.local_path = None;
+                        ex.remote_path = None;
+                        ex.activation_time = None;
+                        ex.local_size = None;
+                        ex.remote_size = None;
+                        ex.pkg_diff = None;
+                    }
+                    Ok(c) => {
+                        ex.local_path = Some(c.local_path.clone());
+                        ex.remote_path = Some(c.remote_path.clone());
+                        ex.activation_time = c.activation_time;
+                        // A fresh `u` invalidates the medium/expensive
+                        // tiers — the closure we just resolved may
+                        // not be the one we sized / diffed last
+                        // time. Clear them so the user re-triggers
+                        // Shift+U / p against the new paths instead
+                        // of reading stale numbers as current.
+                        ex.local_size = None;
+                        ex.remote_size = None;
+                        ex.pkg_diff = None;
+                    }
+                    Err(_) => {
+                        ex.local_path = None;
+                        ex.remote_path = None;
+                        ex.activation_time = None;
+                        // The medium/expensive results are scoped
+                        // to the paths we just invalidated — drop
+                        // them so a later `U`/`p` doesn't render
+                        // garbage for the wrong closure.
+                        ex.local_size = None;
+                        ex.remote_size = None;
+                        ex.pkg_diff = None;
                     }
                 }
-                match profile.as_str() {
-                    "system" => {
-                        entry.checking_system = false;
-                        entry.system_update = state;
-                    }
-                    "home" => {
-                        entry.checking_home = false;
-                        entry.home_update = state;
-                    }
-                    _ => {}
-                }
+                ps.checking = false;
+                ps.update = state;
             }
-            StatusUpdate::SizeProbe {
+            probe::Report::Size {
                 node,
                 profile,
                 result,
@@ -2994,29 +2634,27 @@ resolve the paths so they can be seeded",
                 // user is currently reading.
                 let mut chain_paths: Option<(String, String)> = None;
                 let entry = self.status.entry(node.clone()).or_default();
-                let extra = match profile.as_str() {
-                    "system" => Some(&mut entry.system_extra),
-                    "home" => Some(&mut entry.home_extra),
-                    _ => None,
-                };
-                if let Some(ex) = extra {
-                    ex.checking_size = false;
-                    match result {
-                        Ok((local, remote)) => {
-                            ex.local_size = Some(local);
-                            ex.remote_size = Some(remote);
-                            if let (Some(lp), Some(rp)) =
-                                (ex.local_path.clone(), ex.remote_path.clone())
-                            {
-                                chain_paths = Some((lp, rp));
-                            }
-                        }
-                        Err(e) => {
-                            ex.local_size = None;
-                            ex.remote_size = None;
-                            entry.last_error = Some(e);
+                let ex = &mut entry.profile_mut(&profile).extra;
+                ex.checking_size = false;
+                let mut probe_err = None;
+                match result {
+                    Ok((local, remote)) => {
+                        ex.local_size = Some(local);
+                        ex.remote_size = Some(remote);
+                        if let (Some(lp), Some(rp)) =
+                            (ex.local_path.clone(), ex.remote_path.clone())
+                        {
+                            chain_paths = Some((lp, rp));
                         }
                     }
+                    Err(e) => {
+                        ex.local_size = None;
+                        ex.remote_size = None;
+                        probe_err = Some(e);
+                    }
+                }
+                if let Some(e) = probe_err {
+                    entry.last_error = Some(e);
                 }
                 // Auto-chain the package diff after a successful size
                 // probe — the old `p` keybind is gone; `Shift+U`
@@ -3034,29 +2672,27 @@ resolve the paths so they can be seeded",
                     }
                 }
             }
-            StatusUpdate::PkgDiffProbe {
+            probe::Report::PkgDiff {
                 node,
                 profile,
                 result,
             } => {
                 let entry = self.status.entry(node).or_default();
-                let extra = match profile.as_str() {
-                    "system" => Some(&mut entry.system_extra),
-                    "home" => Some(&mut entry.home_extra),
-                    _ => None,
-                };
-                if let Some(ex) = extra {
-                    ex.checking_pkg = false;
-                    match result {
-                        Ok(diff) => ex.pkg_diff = Some(diff),
-                        Err(e) => {
-                            ex.pkg_diff = None;
-                            entry.last_error = Some(e);
-                        }
+                let ex = &mut entry.profile_mut(&profile).extra;
+                ex.checking_pkg = false;
+                let mut probe_err = None;
+                match result {
+                    Ok(diff) => ex.pkg_diff = Some(diff),
+                    Err(e) => {
+                        ex.pkg_diff = None;
+                        probe_err = Some(e);
                     }
                 }
+                if let Some(e) = probe_err {
+                    entry.last_error = Some(e);
+                }
             }
-            StatusUpdate::BuildPlanProbe {
+            probe::Report::BuildPlan {
                 node,
                 profile,
                 result,
@@ -3069,7 +2705,7 @@ resolve the paths so they can be seeded",
                             self.push_log_tagged(&text, is_err, Some(node.clone()));
                         }
                         let entry = self.status.entry(node).or_default();
-                        entry.build_plans.insert(profile, plan);
+                        entry.profile_mut(&profile).build_plan = Some(plan);
                     }
                     Err(e) => {
                         entry.last_error = Some(e.clone());
@@ -3081,7 +2717,7 @@ resolve the paths so they can be seeded",
                     }
                 }
             }
-            StatusUpdate::CacheDriftProbe { node, result } => {
+            probe::Report::CacheDrift { node, result } => {
                 let entry = self.status.entry(node.clone()).or_default();
                 entry.checking_cache = false;
                 match result {
@@ -3112,8 +2748,8 @@ resolve the paths so they can be seeded",
                     }
                 }
             }
-            StatusUpdate::LogLine { node, text, is_err } => {
-                self.push_log_tagged(&text, is_err, Some(node));
+            probe::Report::Progress { node, line } => {
+                self.push_log_line(line.text, false, Some(node), line.kind);
             }
         }
     }
@@ -3123,7 +2759,7 @@ resolve the paths so they can be seeded",
     /// because that's the more deliberate action: if the user took the
     /// trouble to mark, that's what they want.
     fn request_deploy(&mut self, mode: Mode) {
-        if self.deploy_task.is_some() {
+        if self.deploy.is_some() {
             self.push_log("! a deploy is already running — press x to cancel", true);
             return;
         }
@@ -3166,46 +2802,50 @@ resolve the paths so they can be seeded",
     /// The cache is cleared on deploy exit, failure, and cancel.
     fn run_confirmed(&mut self, hosts: Vec<String>, mode: Mode, profile: ProfileSel) {
         self.mode = mode;
-        self.queue_mode = mode;
-        self.queue_profile = profile;
-        self.queue_total = hosts.len();
-        self.queue_done = 0;
-        self.deploy_queue = hosts.into_iter().collect();
-        // Fresh run wipes the previous outcome and snaps both logs to
-        // auto-tail so the user sees the new output in the details
-        // pane and the job log pane simultaneously.
+        // Fresh run wipes the previous outcome and snaps the job log to
+        // auto-tail so the user sees the new output immediately.
         self.last_deploy = None;
-        self.log_scroll = 0;
         self.job_log_scroll = 0;
         self.visual_sel = None;
-        self.start_next_in_queue();
+        let total = hosts.len();
+        self.start_next_in_queue(hosts.into_iter().collect(), mode, profile, total, 0);
     }
 
-    /// Pop the next host from `deploy_queue` and spawn the deploy. Skips
-    /// hosts that lack the requested profile (logs a warning) so a single
-    /// bad target doesn't poison the whole batch.
-    fn start_next_in_queue(&mut self) {
+    /// Pop the next host from `queue` and spawn the deploy, installing
+    /// a fresh [`DeploySession`] that owns the remaining queue. Skips
+    /// hosts that lack the requested profile (logs a warning) so a
+    /// single bad target doesn't poison the whole batch. When every
+    /// remaining host is a skip, no session is created — the batch is
+    /// simply over.
+    fn start_next_in_queue(
+        &mut self,
+        mut queue: VecDeque<String>,
+        mode: Mode,
+        profile_sel: ProfileSel,
+        total: usize,
+        mut done: usize,
+    ) {
         // Drain hosts that turn out to be impossible up front so the
         // queue progress stays consistent (the user-visible total still
         // includes them — they're just counted as "done" with a skip).
-        while let Some(name) = self.deploy_queue.pop_front() {
+        while let Some(name) = queue.pop_front() {
             let Some(node) = self.nodes.iter().find(|n| n.name == name).cloned() else {
                 self.push_log_tagged(
                     format!("! unknown host {name} — skipped").as_str(),
                     true,
                     Some(name.clone()),
                 );
-                self.queue_done = self.queue_done.saturating_add(1);
+                done = done.saturating_add(1);
                 continue;
             };
-            let profile = match self.queue_profile {
+            let profile = match profile_sel {
                 ProfileSel::Home if !node.has_home() => {
                     self.push_log_tagged(
                         format!("! {name} has no home profile — skipped").as_str(),
                         true,
                         Some(name.clone()),
                     );
-                    self.queue_done = self.queue_done.saturating_add(1);
+                    done = done.saturating_add(1);
                     continue;
                 }
                 ProfileSel::System if !node.has_system() => {
@@ -3214,7 +2854,7 @@ resolve the paths so they can be seeded",
                         true,
                         Some(name.clone()),
                     );
-                    self.queue_done = self.queue_done.saturating_add(1);
+                    done = done.saturating_add(1);
                     continue;
                 }
                 other => other,
@@ -3236,7 +2876,7 @@ resolve the paths so they can be seeded",
                 flake: self.flake.clone(),
                 node: node.name.clone(),
                 profile,
-                mode: self.queue_mode,
+                mode,
                 toggles: self.toggles,
                 ssh_override: self.override_for(&node.name).clone(),
                 askpass: self.askpass_env.clone(),
@@ -3271,11 +2911,11 @@ target's store instead.",
             self.push_log_tagged(
                 format!(
                     "→ deploy [{}/{}] {} ({}, {})",
-                    self.queue_done + 1,
-                    self.queue_total,
+                    done + 1,
+                    total,
                     node.name,
-                    describe_mode(self.queue_mode),
-                    describe_profile(profile),
+                    mode.label(),
+                    profile.label(),
                 )
                 .as_str(),
                 false,
@@ -3293,27 +2933,27 @@ target's store instead.",
                 None
             };
             let handle = deploy::run(req, sudo_pw);
-            self.deploy_rx = Some(handle.rx);
-            self.deploy_task = Some(handle.task);
-            self.deploy_cancel = Some(handle.cancel);
-            self.deploy_stdin_tx = handle.stdin_tx;
-            self.busy_label = if self.queue_total > 1 {
-                Some(format!(
-                    "deploying [{}/{}] {}",
-                    self.queue_done + 1,
-                    self.queue_total,
-                    node.name
-                ))
+            self.busy_label = if total > 1 {
+                Some(format!("deploying [{}/{}] {}", done + 1, total, node.name))
             } else {
                 Some(format!("deploying {}", node.name))
             };
-            self.current_target = Some(node.name);
+            self.deploy = Some(DeploySession {
+                rx: handle.rx,
+                task: handle.task,
+                cancel: Some(handle.cancel),
+                stdin_tx: handle.stdin_tx,
+                current: node.name,
+                queue,
+                mode,
+                profile: profile_sel,
+                total,
+                done,
+            });
             return;
         }
-        // Queue drained without spawning anything (every host was a skip).
-        self.queue_total = 0;
-        self.queue_done = 0;
-        self.current_target = None;
+        // Queue drained without spawning anything (every host was a
+        // skip) — there is no session, so there is nothing to reset.
     }
 
     fn cancel_deploy(&mut self) {
@@ -3326,53 +2966,46 @@ target's store instead.",
         // orphaning them.
         let probes_aborted = self.cancel_probes();
 
-        if let Some(t) = self.deploy_task.take() {
+        if let Some(mut session) = self.deploy.take() {
             // Signal first, then *detach* rather than abort. The deploy
             // task needs to stay alive long enough to SIGTERM its whole
             // process group, wait out the grace period, and SIGKILL
             // whatever is left; aborting here would drop the child
             // mid-sequence and `kill_on_drop` would only reach the group
             // leader, orphaning the `nix` builders underneath it.
-            if let Some(c) = self.deploy_cancel.take() {
+            if let Some(c) = session.cancel.take() {
                 c.cancel();
             } else {
                 // No canceller (shouldn't happen) — fall back to the old
                 // behaviour rather than leaving the task running.
-                t.abort();
+                session.task.abort();
             }
-            drop(t);
-            self.deploy_rx = None;
-            self.deploy_stdin_tx = None;
             self.clear_cached_password();
 
             self.busy_label = None;
             // Cancelling kills the queue too — otherwise pressing `x`
-            // mid-batch would surprise-deploy the next host.
-            let drained = self.deploy_queue.len();
-            self.deploy_queue.clear();
-            let target = self.current_target.clone();
+            // mid-batch would surprise-deploy the next host. The queue
+            // dies with the taken session; we only report its size.
+            let drained = session.queue.len();
             if drained > 0 {
                 self.push_log_tagged(
                     format!("! deploy cancelled — dropped {drained} queued host(s)").as_str(),
                     true,
-                    target.clone(),
+                    Some(session.current.clone()),
                 );
             } else {
-                self.push_log_tagged("! deploy cancelled", true, target);
+                self.push_log_tagged("! deploy cancelled", true, Some(session.current.clone()));
             }
-            if let Some(node_name) = self.current_target.take() {
-                let entry = LastDeploy {
-                    node: node_name.clone(),
-                    mode: self.queue_mode,
-                    profile: self.queue_profile,
-                    exit_code: -1,
-                    ok: false,
-                };
-                self.last_deploys.insert(node_name, entry.clone());
-                self.last_deploy = Some(entry);
-            }
-            self.queue_total = 0;
-            self.queue_done = 0;
+            let entry = LastDeploy {
+                node: session.current.clone(),
+                mode: session.mode,
+                profile: session.profile,
+                exit_code: -1,
+                ok: false,
+            };
+            self.last_deploys
+                .insert(session.current.clone(), entry.clone());
+            self.last_deploy = Some(entry);
         } else if probes_aborted > 0 {
             // No deploy was running but probes were — surface that so
             // the user gets feedback for their `x` press.
@@ -3401,12 +3034,13 @@ target's store instead.",
         // sweep the spinners would spin forever.
         for s in self.status.values_mut() {
             s.checking_reachability = false;
-            s.checking_system = false;
-            s.checking_home = false;
-            s.system_extra.checking_size = false;
-            s.home_extra.checking_size = false;
-            s.system_extra.checking_pkg = false;
-            s.home_extra.checking_pkg = false;
+            for p in s.profiles.values_mut() {
+                p.checking = false;
+                p.extra.checking_size = false;
+                p.extra.checking_pkg = false;
+            }
+            s.checking_cache = false;
+            s.checking_plan = false;
         }
         aborted
     }
@@ -3414,16 +3048,16 @@ target's store instead.",
     fn handle_deploy_line(&mut self, line: LogLine) {
         match line {
             LogLine::Stdout(s) => {
-                let host = self.current_target.clone();
+                let host = self.deploy.as_ref().map(|d| d.current.clone());
                 self.push_log_tagged(&s, false, host);
             }
             LogLine::Stderr(s) => {
-                let host = self.current_target.clone();
+                let host = self.deploy.as_ref().map(|d| d.current.clone());
                 self.push_log_tagged(&s, true, host);
             }
             LogLine::SudoPrompt(prompt) => {
                 if let Some(ref pw) = self.cached_password {
-                    if let Some(tx) = &self.deploy_stdin_tx {
+                    if let Some(tx) = self.deploy.as_ref().and_then(|s| s.stdin_tx.as_ref()) {
                         let _ = tx.try_send(pw.to_string());
                     }
                 } else {
@@ -3441,131 +3075,129 @@ target's store instead.",
                 } else {
                     format!("← deploy failed (exit {code}) — magic-rollback may have reverted")
                 };
-                // Snapshot the host before clearing `current_target` so
-                // every follow-up log line and the per-host last-deploy
-                // entry below can be tagged with it. The post-failure
-                // "batch stopped" notice in particular has to be tagged
-                // — otherwise the job-log pane filters it out and the
-                // last visible line lags behind the details pane.
-                let exit_host = self.current_target.take();
-                self.push_log_tagged(&banner, !ok, exit_host.clone());
-                self.deploy_task = None;
-                self.deploy_rx = None;
-                self.deploy_cancel = None;
-                self.deploy_stdin_tx = None;
+                // Take the whole session: the child is gone, and every
+                // piece of in-flight state goes with it. The follow-ups
+                // (host tag, last-deploy entry, batch continuation) read
+                // what they need off the taken value — one owner, no
+                // field to forget. The post-failure "batch stopped"
+                // notice in particular has to be host-tagged, otherwise
+                // the job-log pane filters it out.
+                let Some(mut session) = self.deploy.take() else {
+                    self.push_log_tagged(&banner, !ok, None);
+                    return;
+                };
+                let exit_host = session.current.clone();
+                self.push_log_tagged(&banner, !ok, Some(exit_host.clone()));
 
                 if matches!(self.input, InputMode::PasswordPrompt { .. }) {
                     self.input = InputMode::Normal;
                 }
                 self.busy_label = None;
-                if let Some(name) = exit_host.clone() {
-                    let entry = LastDeploy {
-                        node: name.clone(),
-                        mode: self.queue_mode,
-                        profile: self.queue_profile,
-                        exit_code: code,
-                        ok,
-                    };
-                    self.last_deploys.insert(name.clone(), entry.clone());
-                    self.last_deploy = Some(entry);
-                    if ok {
-                        // Stale-update marks: a successful push
-                        // invalidates the previously-cached probe.
-                        // Wipe the per-profile extras too — their
-                        // paths, sizes, and package diff were scoped
-                        // to the *previous* closure and would
-                        // otherwise linger in the details pane until
-                        // the user re-ran `u`/`U`/`p`.
-                        if let Some(s) = self.status.get_mut(&name) {
-                            s.system_update = UpdateState::Unknown;
-                            s.home_update = UpdateState::Unknown;
-                            s.system_extra = ProfileExtra::default();
-                            s.home_extra = ProfileExtra::default();
-                            // The plan described the closure we just
-                            // pushed; keeping it would tell the user a
-                            // deploy still has work to do when it
-                            // doesn't. Same reasoning as the extras.
-                            s.build_plans.clear();
-                            // Drift, on the other hand, is now stale in
-                            // the opposite direction: the new nix.conf
-                            // is live, so whatever it reported has been
-                            // resolved by this very deploy.
-                            s.cache_drift = None;
+                let entry = LastDeploy {
+                    node: exit_host.clone(),
+                    mode: session.mode,
+                    profile: session.profile,
+                    exit_code: code,
+                    ok,
+                };
+                self.last_deploys.insert(exit_host.clone(), entry.clone());
+                self.last_deploy = Some(entry);
+                if ok {
+                    // Stale-update marks: a successful push
+                    // invalidates the previously-cached probe.
+                    // Wipe the per-profile extras too — their
+                    // paths, sizes, and package diff were scoped
+                    // to the *previous* closure and would
+                    // otherwise linger in the details pane until
+                    // the user re-ran `u`/`U`/`p`.
+                    if let Some(s) = self.status.get_mut(&exit_host) {
+                        for p in s.profiles.values_mut() {
+                            p.update = UpdateState::Unknown;
+                            p.extra = ProfileExtra::default();
+                            // The plan described the closure we
+                            // just pushed; keeping it would tell
+                            // the user a deploy still has work to
+                            // do when it doesn't.
+                            p.build_plan = None;
                         }
+                        // Drift, on the other hand, is now stale in
+                        // the opposite direction: the new nix.conf
+                        // is live, so whatever it reported has been
+                        // resolved by this very deploy.
+                        s.cache_drift = None;
                     }
                 }
-                self.queue_done = self.queue_done.saturating_add(1);
+                session.done = session.done.saturating_add(1);
                 if ok {
-                    // Drain the next host. If the queue is empty,
-                    // start_next_in_queue resets the queue counters.
-                    if !self.deploy_queue.is_empty() {
-                        self.start_next_in_queue();
+                    if !session.queue.is_empty() {
+                        // Continue the batch: the next session inherits
+                        // the queue and progress of the finished one.
+                        self.start_next_in_queue(
+                            std::mem::take(&mut session.queue),
+                            session.mode,
+                            session.profile,
+                            session.total,
+                            session.done,
+                        );
                     } else {
                         self.clear_cached_password();
-                        self.queue_total = 0;
-                        self.queue_done = 0;
                     }
                 } else {
                     self.clear_cached_password();
                     // Stop the batch on failure — safer than blindly
                     // continuing to push to more hosts after one breaks.
-                    let dropped = self.deploy_queue.len();
+                    let dropped = session.queue.len();
                     if dropped > 0 {
-                        self.deploy_queue.clear();
                         self.push_log_tagged(
                             format!("! batch stopped after failure — {dropped} host(s) skipped")
                                 .as_str(),
                             true,
-                            exit_host,
+                            Some(exit_host),
                         );
                     }
-                    self.queue_total = 0;
-                    self.queue_done = 0;
                 }
             }
             LogLine::Error(e) => {
-                // Same snapshot-before-take pattern as Exit: we need
-                // the host name for the spawn-failure banner, the
-                // per-host last-deploy entry, and the post-failure
-                // batch-stopped notice. All three want the same string.
-                let err_host = self.current_target.take();
+                // Same take-the-session pattern as Exit: the banner,
+                // the per-host last-deploy entry, and the batch-stopped
+                // notice all read off the taken value.
+                let Some(session) = self.deploy.take() else {
+                    self.push_log_tagged(
+                        format!("! deploy spawn failed: {e}").as_str(),
+                        true,
+                        None,
+                    );
+                    return;
+                };
+                let err_host = session.current.clone();
                 self.push_log_tagged(
                     format!("! deploy spawn failed: {e}").as_str(),
                     true,
-                    err_host.clone(),
+                    Some(err_host.clone()),
                 );
-                self.deploy_task = None;
-                self.deploy_rx = None;
-                self.deploy_cancel = None;
-                self.deploy_stdin_tx = None;
                 self.clear_cached_password();
 
                 if matches!(self.input, InputMode::PasswordPrompt { .. }) {
                     self.input = InputMode::Normal;
                 }
                 self.busy_label = None;
-                if let Some(name) = err_host.clone() {
-                    let entry = LastDeploy {
-                        node: name.clone(),
-                        mode: self.queue_mode,
-                        profile: self.queue_profile,
-                        exit_code: -1,
-                        ok: false,
-                    };
-                    self.last_deploys.insert(name, entry.clone());
-                    self.last_deploy = Some(entry);
-                }
-                let dropped = self.deploy_queue.len();
-                self.deploy_queue.clear();
+                let entry = LastDeploy {
+                    node: err_host.clone(),
+                    mode: session.mode,
+                    profile: session.profile,
+                    exit_code: -1,
+                    ok: false,
+                };
+                self.last_deploys.insert(err_host.clone(), entry.clone());
+                self.last_deploy = Some(entry);
+                let dropped = session.queue.len();
                 if dropped > 0 {
                     self.push_log_tagged(
                         format!("! batch stopped — {dropped} host(s) skipped").as_str(),
                         true,
-                        err_host,
+                        Some(err_host),
                     );
                 }
-                self.queue_total = 0;
-                self.queue_done = 0;
             }
         }
     }
@@ -3578,10 +3210,17 @@ target's store instead.",
     /// by the deploy event handler so the batch log pane can colourise
     /// per host. `host = None` is equivalent to `push_log`.
     fn push_log_tagged(&mut self, text: &str, is_err: bool, host: Option<String>) {
+        self.push_log_line(text.to_string(), is_err, host, LogKind::Plain);
+    }
+
+    /// Push a line with an explicit [`LogKind`], so the renderer can
+    /// style it from data instead of parsing the text.
+    fn push_log_line(&mut self, text: String, is_err: bool, host: Option<String>, kind: LogKind) {
         self.log.push(LogEntry {
-            text: text.to_string(),
+            text,
             is_err,
             host,
+            kind,
         });
         // Cap so we don't grow forever during long sessions.
         const MAX: usize = 2000;
@@ -3778,9 +3417,11 @@ const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 
 /// Receive from an `Option<Receiver<T>>`. Returns `None` (i.e. the branch
 /// stays pending) when the option is empty, so `select!` can ignore it.
-async fn recv_optional<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
-    match rx {
-        Some(r) => r.recv().await,
+/// Await the running deploy's next log line, or pend forever when no
+/// deploy is running — so the `select!` arm simply stays quiet.
+async fn recv_deploy(session: &mut Option<DeploySession>) -> Option<LogLine> {
+    match session {
+        Some(s) => s.rx.recv().await,
         None => std::future::pending().await,
     }
 }
@@ -3825,22 +3466,6 @@ fn scan_ssh_keys() -> Vec<PathBuf> {
         .collect();
     out.sort();
     out
-}
-
-fn describe_mode(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Switch => "switch",
-        Mode::Boot => "boot",
-        Mode::DryRun => "dry-run",
-    }
-}
-
-fn describe_profile(p: ProfileSel) -> &'static str {
-    match p {
-        ProfileSel::All => "all",
-        ProfileSel::System => "system",
-        ProfileSel::Home => "home",
-    }
 }
 
 /// Try to write `text` to the system clipboard. Attempts `wl-copy` (Wayland),
@@ -4203,7 +3828,6 @@ mod tests {
         let mut app = App::new(".".into(), sample_nodes());
         app.push_log_tagged("hello", false, Some("alpha".into()));
         app.log_search = Some("hello".into());
-        app.log_search_target = Some(SearchTarget::JobLog);
         app.focus = FocusPane::JobLog;
         app.enter_visual_mode(VisualMode::Line);
         assert!(app.visual_sel.is_some());
@@ -4239,7 +3863,7 @@ mod tests {
         assert_eq!(app.focus, FocusPane::Hosts);
         assert!(!app.show_help);
         assert!(app.log.is_empty());
-        assert!(app.deploy_rx.is_none());
+        assert!(app.deploy.is_none());
         assert!(app.last_deploy.is_none());
     }
 
@@ -4269,7 +3893,7 @@ mod tests {
         let app = App::new(".".into(), sample_nodes());
         let st = app.status_for("nonexistent");
         assert_eq!(st.reachability, Reachability::Unknown);
-        assert_eq!(st.system_update, UpdateState::Unknown);
+        assert_eq!(st.profile("system").update, UpdateState::Unknown);
     }
 
     #[test]
@@ -4320,23 +3944,22 @@ mod tests {
 
     #[test]
     fn describe_mode_labels() {
-        assert_eq!(describe_mode(Mode::Switch), "switch");
-        assert_eq!(describe_mode(Mode::Boot), "boot");
-        assert_eq!(describe_mode(Mode::DryRun), "dry-run");
+        assert_eq!(Mode::Switch.label(), "switch");
+        assert_eq!(Mode::Boot.label(), "boot");
+        assert_eq!(Mode::DryRun.label(), "dry-run");
     }
 
     #[test]
     fn describe_profile_labels() {
-        assert_eq!(describe_profile(ProfileSel::All), "all");
-        assert_eq!(describe_profile(ProfileSel::System), "system");
-        assert_eq!(describe_profile(ProfileSel::Home), "home");
+        assert_eq!(ProfileSel::All.label(), "all");
+        assert_eq!(ProfileSel::System.label(), "system");
+        assert_eq!(ProfileSel::Home.label(), "home");
     }
 
     #[test]
     fn focus_pane_rows() {
         assert_eq!(FocusPane::Toggles.row(), 0);
         assert_eq!(FocusPane::Hosts.row(), 1);
-        assert_eq!(FocusPane::Details.row(), 1);
         assert_eq!(FocusPane::JobLog.row(), 1);
         assert_eq!(FocusPane::Commands.row(), 2);
     }
@@ -4481,7 +4104,6 @@ mod tests {
         app.push_log_tagged("hello test world", false, Some("alpha".to_string()));
         app.push_log_tagged("another test line", false, Some("alpha".to_string()));
         app.log_search = Some("test".to_string());
-        app.log_search_target = Some(SearchTarget::JobLog);
         app.log_search_match_idx = 1;
 
         // n from the Hosts pane should advance the match index.
@@ -4497,7 +4119,6 @@ mod tests {
         let mut app = App::new(".".into(), sample_nodes());
         app.focus = FocusPane::Hosts;
         app.log_search = Some("needle".to_string());
-        app.log_search_target = Some(SearchTarget::JobLog);
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.log_search.is_none());
@@ -4663,5 +4284,100 @@ mod tests {
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.input, InputMode::Normal));
+    }
+
+    // ---- probe report policy (apply_probe) ----
+    //
+    // The probe seam makes the result-handling policy testable without
+    // spawning a single process: construct a `probe::Report`, feed it
+    // in, and assert on the state transitions and chained probes.
+
+    #[test]
+    fn progress_report_lands_in_the_host_log() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.apply_probe(probe::Report::Progress {
+            node: "alpha".into(),
+            line: crate::host::ProgressLine::note("[size] measuring local closure …"),
+        });
+        let entry = app.log.last().expect("progress line pushed");
+        assert_eq!(entry.host.as_deref(), Some("alpha"));
+        assert!(entry.text.contains("[size]"));
+        assert!(!entry.is_err);
+    }
+
+    #[tokio::test]
+    async fn size_probe_ok_chains_into_pkg_diff() {
+        let mut app = App::new(".".into(), sample_nodes());
+        // The cheap tier populated the paths the chain re-uses.
+        {
+            let entry = app.status.entry("alpha".into()).or_default();
+            let ex = &mut entry.profile_mut("system").extra;
+            ex.local_path = Some("/nix/store/aaa-x".into());
+            ex.remote_path = Some("/nix/store/bbb-x".into());
+            ex.checking_size = true;
+        }
+        app.apply_probe(probe::Report::Size {
+            node: "alpha".into(),
+            profile: "system".into(),
+            result: Ok((10, 20)),
+        });
+        let st = app.status_for("alpha");
+        let ex = &st.profile("system").extra;
+        assert_eq!(ex.local_size, Some(10));
+        assert_eq!(ex.remote_size, Some(20));
+        assert!(!ex.checking_size);
+        assert!(
+            ex.checking_pkg,
+            "a successful size probe must chain into the package diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_cache_drift_chains_into_build_plan() {
+        let mut app = App::new(".".into(), sample_nodes());
+        let drift = crate::host::SubstituterDrift {
+            site: BuildSite::Remote,
+            added_substituters: vec!["https://cache.example.org".into()],
+            added_keys: vec![],
+            removed_substituters: vec![],
+            ssh_user: Some("root".into()),
+            ssh_user_trusted: Some(true),
+        };
+        app.apply_probe(probe::Report::CacheDrift {
+            node: "alpha".into(),
+            result: Ok(drift),
+        });
+        let st = app.status_for("alpha");
+        assert!(st.cache_drift.is_some());
+        assert!(
+            st.checking_plan,
+            "remote drift must chain into the build-plan preflight"
+        );
+    }
+
+    #[test]
+    fn update_probe_error_clears_cached_extras() {
+        let mut app = App::new(".".into(), sample_nodes());
+        {
+            let entry = app.status.entry("alpha".into()).or_default();
+            let ps = entry.profile_mut("system");
+            ps.extra.local_path = Some("/nix/store/aaa-x".into());
+            ps.extra.local_size = Some(1);
+            ps.extra.pkg_diff = Some(crate::host::PkgDiff::default());
+            ps.checking = true;
+        }
+        app.apply_probe(probe::Report::Update {
+            node: "alpha".into(),
+            profile: "system".into(),
+            result: Err("host unreachable".into()),
+        });
+        let st = app.status_for("alpha");
+        let ps = st.profile("system");
+        assert_eq!(ps.update, UpdateState::Error);
+        assert!(!ps.checking);
+        assert!(ps.extra.local_path.is_none());
+        assert!(ps.extra.local_size.is_none());
+        assert!(ps.extra.pkg_diff.is_none());
+        assert_eq!(st.last_error.as_deref(), Some("host unreachable"));
     }
 }

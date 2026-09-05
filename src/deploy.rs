@@ -44,7 +44,29 @@ pub enum ProfileSel {
     Home,
 }
 
+impl Mode {
+    /// Human-readable label shared by log lines, the details pane, and
+    /// the confirm popup.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Switch => "switch",
+            Mode::Boot => "boot",
+            Mode::DryRun => "dry-run",
+        }
+    }
+}
+
 impl ProfileSel {
+    /// Human-readable label shared by log lines, the details pane, and
+    /// the confirm popup.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProfileSel::All => "all",
+            ProfileSel::System => "system",
+            ProfileSel::Home => "home",
+        }
+    }
+
     fn target_suffix(self) -> &'static str {
         match self {
             ProfileSel::All => "",
@@ -77,6 +99,86 @@ pub struct Toggles {
     /// controlling terminal and rpassword would fail silently.
     pub interactive_sudo: bool,
 }
+
+/// One row of the toggle table — the single source of truth for the
+/// TUI's toggle strip. `app` flips fields through `toggle` and logs
+/// `name`; `ui` renders `short_label` (and derives the strip's width
+/// from it) plus `help` in the help popup; `TOGGLES.len()` is the
+/// count. Only the CLI flag each field maps to lives elsewhere
+/// (`run_one`), because the only-emit-if-changed rule needs the
+/// deploy-rs defaults for context.
+pub struct ToggleDef {
+    /// Name used in the "toggle flipped" log line.
+    pub name: &'static str,
+    /// Compact label shown in the toggles strip.
+    pub short_label: &'static str,
+    /// Description for the help popup.
+    pub help: &'static str,
+    /// Extra log line pushed when the toggle turns on, for toggles
+    /// whose effect deserves a one-line explanation.
+    pub on_hint: Option<&'static str>,
+    pub get: fn(&Toggles) -> bool,
+    /// Flip the field and return the new value.
+    pub toggle: fn(&mut Toggles) -> bool,
+}
+
+pub const TOGGLES: &[ToggleDef] = &[
+    ToggleDef {
+        name: "skip-checks",
+        short_label: "skip-checks",
+        help: "skip-checks — skip the pre-deploy `nix flake check`",
+        on_hint: None,
+        get: |t| t.skip_checks,
+        toggle: |t| {
+            t.skip_checks = !t.skip_checks;
+            t.skip_checks
+        },
+    },
+    ToggleDef {
+        name: "magic-rollback",
+        short_label: "magic-rb",
+        help: "magic-rollback — wait for confirmation, auto-roll-back on timeout (default ON)",
+        on_hint: None,
+        get: |t| t.magic_rollback,
+        toggle: |t| {
+            t.magic_rollback = !t.magic_rollback;
+            t.magic_rollback
+        },
+    },
+    ToggleDef {
+        name: "auto-rollback",
+        short_label: "auto-rb",
+        help: "auto-rollback — roll back if activation fails (default ON)",
+        on_hint: None,
+        get: |t| t.auto_rollback,
+        toggle: |t| {
+            t.auto_rollback = !t.auto_rollback;
+            t.auto_rollback
+        },
+    },
+    ToggleDef {
+        name: "remote-build",
+        short_label: "remote-build",
+        help: "remote-build — perform the build on the target host",
+        on_hint: None,
+        get: |t| t.remote_build,
+        toggle: |t| {
+            t.remote_build = !t.remote_build;
+            t.remote_build
+        },
+    },
+    ToggleDef {
+        name: "interactive-sudo",
+        short_label: "int-sudo",
+        help: "interactive-sudo — TUI will prompt for the sudo password securely (masked input)",
+        on_hint: Some("  interactive-sudo: TUI will prompt securely when sudo asks for a password"),
+        get: |t| t.interactive_sudo,
+        toggle: |t| {
+            t.interactive_sudo = !t.interactive_sudo;
+            t.interactive_sudo
+        },
+    },
+];
 
 impl Default for Toggles {
     fn default() -> Self {
@@ -487,11 +589,11 @@ async fn run_seed(
     tx: &mpsc::Sender<LogLine>,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let (prog_tx, mut prog_rx) = mpsc::channel::<String>(64);
+    let (prog_tx, mut prog_rx) = mpsc::channel::<crate::host::ProgressLine>(64);
     let forward_tx = tx.clone();
     let forwarder = tokio::spawn(async move {
         while let Some(line) = prog_rx.recv().await {
-            if forward_tx.send(LogLine::Stdout(line)).await.is_err() {
+            if forward_tx.send(LogLine::Stdout(line.text)).await.is_err() {
                 break;
             }
         }

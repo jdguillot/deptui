@@ -49,16 +49,169 @@ pub enum UpdateState {
     Error,
 }
 
+/// Typed classification of one job-log line. Set by the *producer* at
+/// the moment the line is created, so the renderer styles from data
+/// instead of re-parsing prose — the wording of the text is one
+/// module's business, not an interface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum LogKind {
+    /// Ordinary output: deploy stdout/stderr, action banners.
+    #[default]
+    Plain,
+    /// Dim stage note from a probe ("[pkg] listing local closure …").
+    Note,
+    /// "[size] local: N bytes"
+    SizeLocal(u64),
+    /// "[size] remote: N bytes" — pairs with the preceding `SizeLocal`
+    /// for the same host so the renderer can show a delta.
+    SizeRemote(u64),
+    /// One package-diff line.
+    Pkg(PkgChange),
+    /// "[pkg] done (N change(s))"
+    PkgDone(usize),
+}
+
+/// One entry of a package diff between two closures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PkgChange {
+    /// The version set of a package differs between the two sides.
+    Updated {
+        name: String,
+        from: String,
+        to: String,
+    },
+    /// Present in the local closure only.
+    Added {
+        name: String,
+        versions: String,
+    },
+    /// Present in the remote closure only.
+    Removed {
+        name: String,
+        versions: String,
+    },
+    /// Head line of the content-only case: every name+version matches
+    /// but `count` store paths still differ (config-file rebuilds).
+    ContentOnly {
+        count: usize,
+    },
+    /// Sample basename beneath the content-only head.
+    SampleAdded {
+        base: String,
+    },
+    SampleRemoved {
+        base: String,
+    },
+    /// "… and N more path(s)" cap line under the samples.
+    More {
+        count: usize,
+    },
+}
+
+impl PkgChange {
+    /// Canonical one-line rendering, shared by the job log and any
+    /// textual summary. The renderer styles from the variant; this is
+    /// what gets searched and yanked.
+    pub fn render(&self) -> String {
+        match self {
+            PkgChange::Updated { name, from, to } => format!("{name}: {from} → {to}"),
+            PkgChange::Added { name, versions } => format!("{name}: + {versions}"),
+            PkgChange::Removed { name, versions } => format!("{name}: - {versions}"),
+            PkgChange::ContentOnly { count } => format!(
+                "(content-only) {count} path(s) differ — same package versions, different contents"
+            ),
+            PkgChange::SampleAdded { base } => format!("  + {base}"),
+            PkgChange::SampleRemoved { base } => format!("  - {base}"),
+            PkgChange::More { count } => format!("  … and {count} more path(s)"),
+        }
+    }
+}
+
+/// The full result of a package diff, stored on [`ProfileExtra`]. The
+/// details pane branches on the typed shape — no prefix sniffing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PkgDiff {
+    pub changes: Vec<PkgChange>,
+}
+
+impl PkgDiff {
+    /// No differences at all — the closures are identical.
+    pub fn is_identical(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    /// True when nothing changed by name+version but store paths still
+    /// differ. The UI renders a distinct badge for this — a change
+    /// count would contradict the path lines in the job log.
+    pub fn is_content_only(&self) -> bool {
+        matches!(self.changes.first(), Some(PkgChange::ContentOnly { .. }))
+    }
+
+    /// Number of version-level changes (content-only detail lines do
+    /// not count).
+    pub fn change_count(&self) -> usize {
+        self.changes
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    PkgChange::Updated { .. } | PkgChange::Added { .. } | PkgChange::Removed { .. }
+                )
+            })
+            .count()
+    }
+}
+
+/// One line of typed probe progress. `text` is the canonical rendering
+/// (searched, yanked, shown); `kind` carries the data the renderer
+/// styles from. The constructors derive both from the same values, so
+/// the two can never disagree.
+#[derive(Debug, Clone)]
+pub struct ProgressLine {
+    pub text: String,
+    pub kind: LogKind,
+}
+
+impl ProgressLine {
+    pub fn note(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: LogKind::Note,
+        }
+    }
+
+    pub fn size_local(bytes: u64) -> Self {
+        Self {
+            text: format!("[size] local: {bytes} bytes"),
+            kind: LogKind::SizeLocal(bytes),
+        }
+    }
+
+    pub fn size_remote(bytes: u64) -> Self {
+        Self {
+            text: format!("[size] remote: {bytes} bytes"),
+            kind: LogKind::SizeRemote(bytes),
+        }
+    }
+
+    pub fn pkg(change: PkgChange) -> Self {
+        Self {
+            text: format!("[pkg] {}", change.render()),
+            kind: LogKind::Pkg(change),
+        }
+    }
+
+    pub fn pkg_done(count: usize) -> Self {
+        Self {
+            text: format!("[pkg] done ({count} change(s))"),
+            kind: LogKind::PkgDone(count),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HostStatus {
     pub reachability: Reachability,
-    pub system_update: UpdateState,
-    pub home_update: UpdateState,
-    /// True while an update probe for the `system` profile is in flight.
-    /// The previous value of `system_update` is kept around so the badge
-    /// can show "previous result + spinner".
-    pub checking_system: bool,
-    pub checking_home: bool,
     /// True while the reachability TCP probe is in flight. Lets the UI
     /// show the same spinner as the update-check probes.
     pub checking_reachability: bool,
@@ -67,23 +220,62 @@ pub struct HostStatus {
     /// can tell at a glance how fresh the online indicator actually is.
     pub last_online: Option<SystemTime>,
     pub last_error: Option<String>,
-    /// Per-profile extra information harvested during update checks
-    /// (paths, activation time, closure size, package diff). Populated
-    /// lazily — `u` fills in the cheap tier, `U`/`p` fill in the rest.
-    pub system_extra: ProfileExtra,
-    pub home_extra: ProfileExtra,
+    /// Per-profile state, keyed by profile name. One shape for every
+    /// profile a node declares — a profile beyond `system`/`home`
+    /// participates in every check the moment the flake declares it.
+    pub profiles: BTreeMap<String, ProfileStatus>,
     /// Result of the last substituter-drift check (`Shift+C`). `None`
     /// means the check hasn't been run for this host, which is different
     /// from "ran and found no drift" — the UI has to say which.
     pub cache_drift: Option<SubstituterDrift>,
     /// True while a substituter-drift check is in flight.
     pub checking_cache: bool,
-    /// Result of the last build-plan preflight (`Shift+P`), keyed by
-    /// profile name. `None` for a profile means "never run", which the
-    /// UI must not render as "nothing to build".
-    pub build_plans: BTreeMap<String, BuildPlan>,
     /// True while a build-plan preflight is in flight.
     pub checking_plan: bool,
+}
+
+impl HostStatus {
+    /// A profile's state, defaulting to "never probed" for profiles
+    /// that have no entry yet.
+    pub fn profile(&self, name: &str) -> &ProfileStatus {
+        static EMPTY: std::sync::OnceLock<ProfileStatus> = std::sync::OnceLock::new();
+        self.profiles
+            .get(name)
+            .unwrap_or_else(|| EMPTY.get_or_init(ProfileStatus::default))
+    }
+
+    /// Mutable access to a profile's state, creating the entry on
+    /// first touch.
+    pub fn profile_mut(&mut self, name: &str) -> &mut ProfileStatus {
+        self.profiles.entry(name.to_string()).or_default()
+    }
+
+    /// The build plans that have actually run, keyed by profile.
+    pub fn build_plans(&self) -> impl Iterator<Item = (&String, &BuildPlan)> {
+        self.profiles
+            .iter()
+            .filter_map(|(name, p)| p.build_plan.as_ref().map(|plan| (name, plan)))
+    }
+}
+
+/// Everything we know about one profile of one host. One shape for
+/// every profile — `system`, `home`, and anything else a flake
+/// declares — so no code path can silently skip an unfamiliar name.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileStatus {
+    pub update: UpdateState,
+    /// True while an update probe for this profile is in flight. The
+    /// previous value of `update` is kept around so the badge can show
+    /// "previous result + spinner".
+    pub checking: bool,
+    /// Extra information harvested during update checks (paths,
+    /// activation time, closure size, package diff). Populated lazily —
+    /// `u` fills in the cheap tier, `Shift+U` fills in the rest.
+    pub extra: ProfileExtra,
+    /// Result of the last build-plan preflight (`Shift+P`). `None`
+    /// means "never run", which the UI must not render as "nothing to
+    /// build".
+    pub build_plan: Option<BuildPlan>,
 }
 
 /// Rich result of an update probe — always includes the store paths
@@ -117,10 +309,10 @@ pub struct ProfileExtra {
     pub local_size: Option<u64>,
     pub remote_size: Option<u64>,
     pub checking_size: bool,
-    /// Raw output of `nix store diff-closures remote local` — rendered
-    /// inline in the details pane so the user can see the full package
-    /// delta. May be empty when the closures are identical.
-    pub pkg_diff: Option<String>,
+    /// Typed result of the package diff. `None` means the expensive
+    /// tier hasn't run; `Some` with no changes means the closures are
+    /// identical — the UI renders those differently.
+    pub pkg_diff: Option<PkgDiff>,
     pub checking_pkg: bool,
 }
 
@@ -406,7 +598,7 @@ pub struct ProfileProbe<'a> {
 
 pub async fn check_closure_sizes(
     probe: &ProfileProbe<'_>,
-    progress: mpsc::Sender<String>,
+    progress: mpsc::Sender<ProgressLine>,
 ) -> Result<(u64, u64)> {
     let &ProfileProbe {
         flake,
@@ -425,20 +617,20 @@ pub async fn check_closure_sizes(
     // target. See `resolve_local_toplevel` for the rationale.
     let resolved_local = resolve_local_toplevel(local_path, remote_path, &progress, "size").await?;
     let _ = progress
-        .send("[size] measuring local closure …".to_string())
+        .send(ProgressLine::note("[size] measuring local closure …"))
         .await;
     let local_size = nix_closure_size(&resolved_local)
         .await
         .context("local `nix path-info --closure-size`")?;
-    let _ = progress
-        .send(format!("[size] local: {} bytes", local_size))
-        .await;
+    let _ = progress.send(ProgressLine::size_local(local_size)).await;
     let target = build_ssh_target(node, profile, override_);
     // Shell-quote the path defensively even though nix store paths are
     // ascii — if the user ever points at something weird we don't want
     // to explode the remote command.
     let _ = progress
-        .send(format!("[size] measuring remote closure on {target} …"))
+        .send(ProgressLine::note(format!(
+            "[size] measuring remote closure on {target} …"
+        )))
         .await;
     let remote_cmd = format!("nix path-info --closure-size '{remote_path}'");
     let remote = ssh_capture(&target, &remote_cmd, override_, askpass)
@@ -446,9 +638,7 @@ pub async fn check_closure_sizes(
         .context("remote `nix path-info --closure-size`")?;
     let remote_size = parse_closure_size(&remote)
         .ok_or_else(|| anyhow!("unparseable remote closure size: `{}`", remote.trim()))?;
-    let _ = progress
-        .send(format!("[size] remote: {} bytes", remote_size))
-        .await;
+    let _ = progress.send(ProgressLine::size_remote(remote_size)).await;
     Ok((local_size, remote_size))
 }
 
@@ -484,8 +674,8 @@ pub async fn check_closure_sizes(
 /// channel is best-effort: a closed receiver is ignored.
 pub async fn check_package_diff(
     probe: &ProfileProbe<'_>,
-    progress: mpsc::Sender<String>,
-) -> Result<String> {
+    progress: mpsc::Sender<ProgressLine>,
+) -> Result<PkgDiff> {
     let &ProfileProbe {
         flake,
         node,
@@ -505,20 +695,25 @@ pub async fn check_package_diff(
     // Stage 1: list the local closure. This is a pure metadata query
     // against the local store and is essentially instantaneous.
     let _ = progress
-        .send("[pkg] listing local closure …".to_string())
+        .send(ProgressLine::note("[pkg] listing local closure …"))
         .await;
     let local_paths = nix_requisites(&resolved_local)
         .await
         .with_context(|| format!("local `nix-store --query --requisites {resolved_local}`"))?;
     let _ = progress
-        .send(format!("[pkg] local closure: {} paths", local_paths.len()))
+        .send(ProgressLine::note(format!(
+            "[pkg] local closure: {} paths",
+            local_paths.len()
+        )))
         .await;
 
     // Stage 2: list the remote closure over SSH. One short ssh
     // round-trip; the response is a flat newline-separated list of
     // store paths. No actual store contents move across the wire.
     let _ = progress
-        .send(format!("[pkg] listing remote closure on {target} …"))
+        .send(ProgressLine::note(format!(
+            "[pkg] listing remote closure on {target} …"
+        )))
         .await;
     let remote_cmd = format!("nix-store --query --requisites '{remote_path}'");
     let remote_out = ssh_capture(&target, &remote_cmd, override_, askpass)
@@ -530,32 +725,31 @@ pub async fn check_package_diff(
         .filter(|s| !s.is_empty())
         .collect();
     let _ = progress
-        .send(format!(
+        .send(ProgressLine::note(format!(
             "[pkg] remote closure: {} paths",
             remote_paths.len()
-        ))
+        )))
         .await;
 
     let _ = progress
-        .send("[pkg] computing version diff …".to_string())
+        .send(ProgressLine::note("[pkg] computing version diff …"))
         .await;
-    let lines = compute_version_diff(&local_paths, &remote_paths);
-    for line in &lines {
-        let _ = progress.send(format!("[pkg] {line}")).await;
+    let changes = compute_version_diff(&local_paths, &remote_paths);
+    for change in &changes {
+        let _ = progress.send(ProgressLine::pkg(change.clone())).await;
     }
-    let _ = progress
-        .send(format!("[pkg] done ({} change(s))", lines.len()))
-        .await;
-    Ok(lines.join("\n"))
+    let _ = progress.send(ProgressLine::pkg_done(changes.len())).await;
+    Ok(PkgDiff { changes })
 }
 
 /// Pure-logic version + content diff between two closure path lists.
 ///
 /// Buckets each side by parsed `<name, version>`, walks the union, and
-/// emits one line per name whose version set differs. When no version
-/// changes exist but the store-path sets still diverge (config-file
-/// rebuilds), emits a `(content-only)` summary with sample basenames.
-fn compute_version_diff(local_paths: &[String], remote_paths: &[String]) -> Vec<String> {
+/// emits one [`PkgChange`] per name whose version set differs. When no
+/// version changes exist but the store-path sets still diverge
+/// (config-file rebuilds), emits a `ContentOnly` head followed by
+/// sample basenames.
+fn compute_version_diff(local_paths: &[String], remote_paths: &[String]) -> Vec<PkgChange> {
     let local_by_name = bucket_paths_by_name(local_paths);
     let remote_by_name = bucket_paths_by_name(remote_paths);
 
@@ -567,49 +761,60 @@ fn compute_version_diff(local_paths: &[String], remote_paths: &[String]) -> Vec<
         all_names.insert(k.as_str());
     }
 
-    let mut lines = Vec::<String>::new();
+    let mut changes = Vec::<PkgChange>::new();
     for name in &all_names {
         let l = local_by_name.get(*name);
         let r = remote_by_name.get(*name);
-        let line = match (l, r) {
+        let change = match (l, r) {
             (Some(lv), Some(rv)) if lv == rv => continue,
-            (Some(lv), Some(rv)) => {
-                format!("{name}: {} → {}", join_versions(rv), join_versions(lv))
-            }
-            (Some(lv), None) => format!("{name}: + {}", join_versions(lv)),
-            (None, Some(rv)) => format!("{name}: - {}", join_versions(rv)),
+            (Some(lv), Some(rv)) => PkgChange::Updated {
+                name: name.to_string(),
+                from: join_versions(rv),
+                to: join_versions(lv),
+            },
+            (Some(lv), None) => PkgChange::Added {
+                name: name.to_string(),
+                versions: join_versions(lv),
+            },
+            (None, Some(rv)) => PkgChange::Removed {
+                name: name.to_string(),
+                versions: join_versions(rv),
+            },
             (None, None) => continue,
         };
-        lines.push(line);
+        changes.push(change);
     }
 
     // Content-only diff: every package name+version matches but the
     // actual store-path sets still differ (config-file rebuilds).
-    if lines.is_empty() {
+    if changes.is_empty() {
         let local_set: BTreeSet<&str> = local_paths.iter().map(|s| s.as_str()).collect();
         let remote_set: BTreeSet<&str> = remote_paths.iter().map(|s| s.as_str()).collect();
         let only_local: Vec<&str> = local_set.difference(&remote_set).copied().collect();
         let only_remote: Vec<&str> = remote_set.difference(&local_set).copied().collect();
         if !only_local.is_empty() || !only_remote.is_empty() {
-            lines.push(format!(
-                "(content-only) {} path(s) differ — same package versions, different contents",
-                only_local.len().max(only_remote.len())
-            ));
+            changes.push(PkgChange::ContentOnly {
+                count: only_local.len().max(only_remote.len()),
+            });
             for p in only_local.iter().take(8) {
                 let base = p.rsplit('/').next().unwrap_or(p);
-                lines.push(format!("  + {base}"));
+                changes.push(PkgChange::SampleAdded {
+                    base: base.to_string(),
+                });
             }
             for p in only_remote.iter().take(8) {
                 let base = p.rsplit('/').next().unwrap_or(p);
-                lines.push(format!("  - {base}"));
+                changes.push(PkgChange::SampleRemoved {
+                    base: base.to_string(),
+                });
             }
             let extra = only_local.len().saturating_sub(8) + only_remote.len().saturating_sub(8);
             if extra > 0 {
-                lines.push(format!("  … and {extra} more path(s)"));
+                changes.push(PkgChange::More { count: extra });
             }
         }
     }
-    lines
+    changes
 }
 
 /// Run `nix-store --query --requisites <path>` against the local
@@ -773,7 +978,7 @@ async fn nix_closure_size(path: &str) -> Result<u64> {
 async fn resolve_local_toplevel(
     wrapper_path: &str,
     remote_path: &str,
-    progress: &mpsc::Sender<String>,
+    progress: &mpsc::Sender<ProgressLine>,
     tag: &str,
 ) -> Result<String> {
     let remote_base = remote_path.rsplit('/').next().unwrap_or(remote_path);
@@ -790,9 +995,9 @@ async fn resolve_local_toplevel(
         .context("spawning `nix-store --query --references`")?;
     if !out.status.success() {
         let _ = progress
-            .send(format!(
+            .send(ProgressLine::note(format!(
                 "[{tag}] couldn't list wrapper references, diffing against wrapper"
-            ))
+            )))
             .await;
         return Ok(wrapper_path.to_string());
     }
@@ -805,15 +1010,17 @@ async fn resolve_local_toplevel(
         let (name, _) = split_name_version(base);
         if name == remote_name {
             let _ = progress
-                .send(format!("[{tag}] resolved local toplevel: {p}"))
+                .send(ProgressLine::note(format!(
+                    "[{tag}] resolved local toplevel: {p}"
+                )))
                 .await;
             return Ok(p.to_string());
         }
     }
     let _ = progress
-        .send(format!(
+        .send(ProgressLine::note(format!(
             "[{tag}] no wrapper reference matched `{remote_name}`, diffing against wrapper"
-        ))
+        )))
         .await;
     Ok(wrapper_path.to_string())
 }
@@ -844,7 +1051,7 @@ async fn ensure_local_closure(
     node: &str,
     profile: &str,
     path: &str,
-    progress: &mpsc::Sender<String>,
+    progress: &mpsc::Sender<ProgressLine>,
     tag: &str,
 ) -> Result<()> {
     if std::path::Path::new(path).exists() {
@@ -852,7 +1059,9 @@ async fn ensure_local_closure(
     }
     let attr = format!("{flake}#deploy.nodes.{node}.profiles.{profile}.path");
     let _ = progress
-        .send(format!("[{tag}] local closure missing, building {attr} …"))
+        .send(ProgressLine::note(format!(
+            "[{tag}] local closure missing, building {attr} …"
+        )))
         .await;
     // --no-link avoids dropping a `result` symlink in the user's cwd;
     // --print-out-paths gives us the store path nix actually settled
@@ -894,11 +1103,11 @@ async fn ensure_local_closure(
         .filter(|s| !s.is_empty())
         .collect();
     let _ = progress
-        .send(format!(
+        .send(ProgressLine::note(format!(
             "[{tag}] built {} path(s): {}",
             built.len(),
             built.join(" ")
-        ))
+        )))
         .await;
     // After nix build, the original path should exist. If it still
     // doesn't, something upstream has a mismatched `.path` attribute
@@ -1371,20 +1580,22 @@ pub async fn check_substituter_drift(
     site: BuildSite,
     override_: &SshOverride,
     askpass: &AskpassEnv,
-    progress: mpsc::Sender<String>,
+    progress: mpsc::Sender<ProgressLine>,
 ) -> Result<SubstituterDrift> {
     let _ = progress
-        .send(format!(
+        .send(ProgressLine::note(format!(
             "[cache] evaluating nix.settings for {} …",
             node.name
-        ))
+        )))
         .await;
     let declared = declared_substituter_config(flake, &node.name).await?;
 
     match site {
         BuildSite::Local => {
             let _ = progress
-                .send("[cache] reading this machine's nix config …".to_string())
+                .send(ProgressLine::note(
+                    "[cache] reading this machine's nix config …",
+                ))
                 .await;
             let current = local_nix_config().await?;
             Ok(compute_substituter_drift(site, &declared, &current))
@@ -1392,7 +1603,9 @@ pub async fn check_substituter_drift(
         BuildSite::Remote => {
             let target = build_ssh_target(node, "system", override_);
             let _ = progress
-                .send(format!("[cache] reading nix config on {target} …"))
+                .send(ProgressLine::note(format!(
+                    "[cache] reading nix config on {target} …"
+                )))
                 .await;
             let probe = remote_nix_probe(&target, override_, askpass).await?;
             let mut drift = compute_substituter_drift(site, &declared, &probe.config);
@@ -1718,7 +1931,7 @@ pub async fn seed_substituters(
     substituters: &[String],
     keys: &[String],
     paths: &[String],
-    progress: mpsc::Sender<String>,
+    progress: mpsc::Sender<ProgressLine>,
 ) -> Result<SeedOutcome> {
     if substituters.is_empty() || paths.is_empty() {
         return Ok(SeedOutcome::default());
@@ -1757,11 +1970,11 @@ done; done"
     );
 
     let _ = progress
-        .send(format!(
+        .send(ProgressLine::note(format!(
             "[seed] offering {} path(s) from {} cache(s) to {target} …",
             attempt.len(),
             substituters.len()
-        ))
+        )))
         .await;
 
     let out = ssh_capture(&target, &script, override_, askpass)
@@ -1801,13 +2014,15 @@ pub async fn check_build_plan(
     profile: &str,
     site: BuildSite,
     override_: &SshOverride,
-    progress: mpsc::Sender<String>,
+    progress: mpsc::Sender<ProgressLine>,
 ) -> Result<BuildPlan> {
     match site {
         BuildSite::Local => {
             let attr = format!("{flake}#deploy.nodes.{}.profiles.{profile}.path", node.name);
             let _ = progress
-                .send(format!("[plan] dry-run (local store) for {profile} …"))
+                .send(ProgressLine::note(format!(
+                    "[plan] dry-run (local store) for {profile} …"
+                )))
                 .await;
             let text = nix_dry_run(&[attr]).await?;
             let mut plan = parse_dry_run(&text);
@@ -1818,7 +2033,9 @@ pub async fn check_build_plan(
             let target = build_ssh_target(node, profile, override_);
             let store = format!("ssh-ng://{target}");
             let _ = progress
-                .send(format!("[plan] resolving derivation for {profile} …"))
+                .send(ProgressLine::note(format!(
+                    "[plan] resolving derivation for {profile} …"
+                )))
                 .await;
             let drv = profile_drv_path(flake, &node.name, profile).await?;
 
@@ -1826,7 +2043,9 @@ pub async fn check_build_plan(
             // has. deploy-rs copies it too, so this doesn't add a step
             // the real deploy wouldn't take.
             let _ = progress
-                .send(format!("[plan] copying derivation to {target} …"))
+                .send(ProgressLine::note(format!(
+                    "[plan] copying derivation to {target} …"
+                )))
                 .await;
             let copy = Command::new("nix")
                 .args(["copy", "--derivation", "--to", &store, &drv])
@@ -1843,7 +2062,9 @@ pub async fn check_build_plan(
             }
 
             let _ = progress
-                .send(format!("[plan] dry-run against {store} …"))
+                .send(ProgressLine::note(format!(
+                    "[plan] dry-run against {store} …"
+                )))
                 .await;
             let text = nix_dry_run(&[
                 format!("{drv}^out"),
@@ -2026,19 +2247,25 @@ mod tests {
             "/nix/store/aaa-openssl-3.5.1".to_string(),
             "/nix/store/bbb-bash-5.2".to_string(),
         ];
-        let lines = compute_version_diff(&paths, &paths);
-        assert!(lines.is_empty(), "identical closures should have no diff");
+        let changes = compute_version_diff(&paths, &paths);
+        assert!(changes.is_empty(), "identical closures should have no diff");
     }
 
     #[test]
     fn diff_version_update() {
         let local = vec!["/nix/store/aaa-openssl-3.5.2".to_string()];
         let remote = vec!["/nix/store/bbb-openssl-3.5.1".to_string()];
-        let lines = compute_version_diff(&local, &remote);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("openssl"), "{}", lines[0]);
-        assert!(lines[0].contains("3.5.1"), "{}", lines[0]);
-        assert!(lines[0].contains("3.5.2"), "{}", lines[0]);
+        let changes = compute_version_diff(&local, &remote);
+        assert_eq!(changes.len(), 1);
+        match &changes[0] {
+            PkgChange::Updated { name, from, to } => {
+                assert_eq!(name, "openssl");
+                assert_eq!(from, "3.5.1");
+                assert_eq!(to, "3.5.2");
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+        assert_eq!(changes[0].render(), "openssl: 3.5.1 → 3.5.2");
     }
 
     #[test]
@@ -2048,10 +2275,14 @@ mod tests {
             "/nix/store/bbb-curl-8.0".to_string(),
         ];
         let remote = vec!["/nix/store/ccc-openssl-3.5.1".to_string()];
-        let lines = compute_version_diff(&local, &remote);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("curl"), "{}", lines[0]);
-        assert!(lines[0].starts_with("curl: +"), "{}", lines[0]);
+        let changes = compute_version_diff(&local, &remote);
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(&changes[0], PkgChange::Added { name, .. } if name == "curl"),
+            "{:?}",
+            changes[0]
+        );
+        assert!(changes[0].render().starts_with("curl: +"));
     }
 
     #[test]
@@ -2061,10 +2292,14 @@ mod tests {
             "/nix/store/bbb-openssl-3.5.1".to_string(),
             "/nix/store/ccc-curl-8.0".to_string(),
         ];
-        let lines = compute_version_diff(&local, &remote);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("curl"), "{}", lines[0]);
-        assert!(lines[0].starts_with("curl: -"), "{}", lines[0]);
+        let changes = compute_version_diff(&local, &remote);
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(&changes[0], PkgChange::Removed { name, .. } if name == "curl"),
+            "{:?}",
+            changes[0]
+        );
+        assert!(changes[0].render().starts_with("curl: -"));
     }
 
     #[test]
@@ -2072,13 +2307,17 @@ mod tests {
         // Same name+version but different store hashes → content-only.
         let local = vec!["/nix/store/aaa-openssl-3.5.1".to_string()];
         let remote = vec!["/nix/store/bbb-openssl-3.5.1".to_string()];
-        let lines = compute_version_diff(&local, &remote);
-        assert!(!lines.is_empty());
+        let changes = compute_version_diff(&local, &remote);
+        assert!(!changes.is_empty());
         assert!(
-            lines[0].contains("(content-only)"),
-            "expected content-only marker, got: {}",
-            lines[0]
+            matches!(&changes[0], PkgChange::ContentOnly { count: 1 }),
+            "expected ContentOnly head, got: {:?}",
+            changes[0]
         );
+        assert!(changes[0].render().contains("(content-only)"));
+        let diff = PkgDiff { changes };
+        assert!(diff.is_content_only());
+        assert_eq!(diff.change_count(), 0);
     }
 
     // ---- build_ssh_target ----

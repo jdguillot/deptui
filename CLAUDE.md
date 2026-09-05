@@ -37,17 +37,24 @@ blocks in the source modules:
 - `ssh.rs` — `SshOverride` accessors, `ssh_args`, `deploy_ssh_opts`,
   `summary`.
 - `host.rs` — `split_name_version`, `parsed_paths_equivalent`,
-  `compute_version_diff`, `bucket_paths_by_name`, `join_versions`,
-  `parse_closure_size`, `build_ssh_target`.
+  `compute_version_diff` (typed `PkgChange`s + their `render()`),
+  `bucket_paths_by_name`, `join_versions`, `parse_closure_size`,
+  `build_ssh_target`.
 - `deploy.rs` — `strip_ansi`, `ProfileSel::target_suffix`,
   `DeployRequest::target`, `Toggles::default`.
 - `flake.rs` — `Node::has_system`, `Node::has_home`, JSON deserialisation.
+- `joblog.rs` — the job-log host filter and the char-selection column
+  bounds shared by highlight + yank.
 - `theme.rs` — the `NO_COLOR` / `TERM=dumb` decision as a pure function,
   and the `Monochrome` pass (colour cleared, filled cells reversed).
 - `app.rs` — `App::new` defaults, key handling (quit confirmation,
   navigation, toggles, mode selection, help popup, global search
   navigation), `push_log` cap, override management, `FocusPane`
-  layout rows.
+  layout rows, and probe-report policy (`apply_probe`): the
+  size → pkg-diff and drift → build-plan chains, error invalidation,
+  progress lines landing host-tagged.
+- `ui.rs` — `style_entry` round-trips a `host::ProgressLine` (the
+  styled text equals the canonical text the producer formatted).
 
 **Integration tests** (`tests/`) exercise the process-spawning and
 rendering paths:
@@ -99,10 +106,19 @@ The flow is `flake → nodes → status → user action → deploy`.
         ┌──────────┘   │   └───────────────┐
         ▼              ▼                   ▼
    ┌─────────┐   ┌──────────┐         ┌──────────┐
-   │event.rs │   │ host.rs  │         │deploy.rs │
-   │keys+tick│   │ tcp +    │         │spawns    │
-   │         │   │ ssh+nix  │         │`deploy`  │
-   └─────────┘   └────┬─────┘         └────┬─────┘
+   │event.rs │   │ probe.rs │         │deploy.rs │
+   │keys+tick│   │ one spawn│         │spawns    │
+   │         │   │ + report │         │`deploy`  │
+   └─────────┘   │ path for │         └────┬─────┘
+                 │ every    │              │
+                 │ probe    │              │
+                 └────┬─────┘              │
+                      ▼                    │
+                 ┌──────────┐              │
+                 │ host.rs  │              │
+                 │ tcp+ssh+ │              │
+                 │ nix      │              │
+                 └────┬─────┘              │
                       └──────┬──────┬──────┘
                              ▼      ▼
                           ┌──────────┐
@@ -111,9 +127,10 @@ The flow is `flake → nodes → status → user action → deploy`.
                           └──────────┘
         │
         ▼
-   ┌─────────┐
-   │  ui.rs  │  ratatui rendering (incl. modal + popup)
-   └────┬────┘
+   ┌─────────┐   ┌──────────┐
+   │  ui.rs  │◄──│joblog.rs │  log entry type + window rules shared
+   │ratatui  │   │          │  by app.rs (keys/yank) and ui.rs (paint)
+   └────┬────┘   └──────────┘
         ▼
    ┌─────────┐
    │theme.rs │  semantic colour slots + NO_COLOR pass
@@ -127,6 +144,16 @@ Key invariants worth knowing before touching the code:
   every NixOS module just to draw the host list. If you add a field to
   `Node`/`Profile`, also add it to the `--apply` expression in
   `flake.rs`.
+- **Every background probe goes through `probe::spawn`.** `probe.rs`
+  owns the plumbing all probes share: the typed progress channel, the
+  forwarder that relays `host::ProgressLine`s into the status channel,
+  drain-before-verdict ordering, and error stringification. `app.rs`
+  decides *when* to probe (`spawn_probe`) and folds results in
+  `apply_probe` — which is where probe *policy* lives: which cached
+  extras a result invalidates, and which follow-ups it chains into
+  (size → pkg diff, remote drift → build plan). Reports are plain
+  values, so that policy has unit tests: construct a `probe::Report`,
+  call `apply_probe`, assert on the state.
 - **`host::check_online` is the only "always-on" background work.** It
   runs once at startup and again on every `r` keypress. The `r` keypress
   also re-runs `flake::discover` so newly-added nodes in the flake appear
@@ -144,9 +171,9 @@ Key invariants worth knowing before touching the code:
   `<name, version>` pairs when the wrapper isn't in the local store.
 - **`app::App::run` is one `tokio::select!`** over three sources: term
   events, background status updates, and live deploy log lines. The
-  optional deploy receiver is handled with `recv_optional`, which yields
-  a never-resolving future when the receiver is `None` so the `select!`
-  arm just stays pending. Tick events skip the draw pass when
+  deploy arm is handled with `recv_deploy`, which yields a
+  never-resolving future when no `DeploySession` is running so the
+  `select!` arm just stays pending. Tick events skip the draw pass when
   `has_inflight_work()` is false (no spinners to animate), so idle CPU
   is near zero.
 - **The deploy log is the only mutable buffer that grows.** It's capped
@@ -166,8 +193,19 @@ Key invariants worth knowing before touching the code:
   windows `tagged` to the last `job_log_scroll + viewport + 2` entries.
   The two pieces of state that accumulate across the whole pane —
   `size_locals` and the search `match_counter` — are caught up with a
-  cheap prefix scan over the skipped entries. Anything else that
-  accumulates left-to-right must be added to that pre-scan too.
+  cheap prefix scan over the skipped entries (driven by
+  `LogEntry.kind`, not text parsing). Anything else that accumulates
+  left-to-right must be added to that pre-scan too. Inside the window,
+  the per-entry accumulator update is hoisted *above* the
+  visual-selection branches; keep it there — a branch that returns
+  early without it desyncs the size deltas of every later line.
+- **Job-log lines are typed at the producer.** `LogEntry.kind:
+  host::LogKind` is set when the line is created — the
+  `host::ProgressLine` constructors format the canonical text and the
+  kind from the same values — and `ui::style_entry` styles from the
+  kind. The renderer never re-parses prose. New probe output that
+  needs styling gets a `LogKind` variant and a `ProgressLine`
+  constructor, not a parser.
 - **Child output is read byte-wise, never via `lines()`.**
   `deploy::forward_lines` decodes lossily and treats both `\n` and `\r`
   as terminators. `AsyncBufReadExt::lines()` returns `Err` on the first
@@ -183,11 +221,15 @@ Key invariants worth knowing before touching the code:
   default.** This is on purpose: the flake's `deploy.nodes` settings
   stay authoritative until the user actively flips a switch. If you add
   a toggle, decide its default to match deploy-rs and follow the same
-  "only-emit-if-changed" rule in `deploy::run_inner`.
+  "only-emit-if-changed" rule in `deploy::run_inner`. The TUI side of a
+  toggle lives in one table: `deploy::TOGGLES` holds the name, strip
+  label, help text, on-hint, and accessors — `TOGGLE_COUNT`, the strip
+  rendering, its width maths, and the help popup all derive from it.
 - **`SshOverride` is the single source of truth** for both status
   checks (`host::ssh_capture`) and the deploy runner. If you add a new
-  field, update *both* `ssh_args()` (per-token argv for ssh) and
-  `deploy_ssh_opts()` (joined string for `--ssh-opts`).
+  field, update `ssh_args()` (per-token argv for ssh);
+  `deploy_ssh_opts()` (the joined string for `--ssh-opts`) derives
+  from it.
 - **The host-list `[ssh]` marker is driven by `SshOverride::is_active`.**
   When clearing the last field of an override, also remove the entry
   from `App.overrides` so the marker disappears — this is what
@@ -278,10 +320,11 @@ Key invariants worth knowing before touching the code:
   at all.
 - **Content-only change detection.** When `check_package_diff` finds no
   name+version differences but the store-path sets still diverge, it
-  emits a `(content-only) N path(s) differ` summary line plus sample
-  basenames. The UI detects the `(content-only)` prefix and renders a
-  yellow "packages identical, content differs" badge instead of the
-  misleading green "packages identical".
+  returns a typed `PkgDiff` whose first change is
+  `PkgChange::ContentOnly` (plus sample basenames). The details pane
+  branches on `PkgDiff::is_content_only()` — no prefix sniffing — and
+  renders a yellow "packages identical, content differs" badge instead
+  of the misleading green "packages identical".
 - **Scroll clamping happens before the title chip reads it.** `draw_job_log`
   computes inner dimensions and runs `compute_tail_scroll_offset` (which
   clamps in place) before constructing the `[↑N]` chip. This prevents a
@@ -299,18 +342,34 @@ Key invariants worth knowing before touching the code:
   dispatch in `handle_key_normal` catches `/` (open search), `n`/`N`
   (next/prev match), and `Esc` (clear search) before pane-specific arms
   fire, so search works identically regardless of which pane has focus.
-  `SearchTarget::JobLog` is the only remaining search target (the details
-  pane no longer has a scrollable log section).
+  Search always targets the job log — it is the only searchable pane,
+  so there is no target indirection.
 - **Job log is filtered to the active host set.** When any hosts are
   marked (space bar), the job log shows only their entries. With no marks,
-  it shows only the selected host's entries. Both `draw_job_log` (ui.rs)
-  and `filtered_log_indices_for_job_log` (app.rs) implement the same
-  filter — keep them in sync.
+  it shows only the selected host's entries. The filter is implemented
+  once — `joblog::filtered_indices` — and both key handling and
+  `draw_job_log` call it. The char-selection column slice is likewise
+  shared (`joblog::char_selection_bounds`), so the highlight and the
+  yank cannot disagree about what is selected.
 - **Layout is 2-column.** Left column (35%) is vertically split: hosts on
   top, details on bottom. Right column (65%) is the job log. The details
-  pane holds only the summary + extras; it no longer has a log section.
-  Commands/info row is below both columns: commands left (60%), info right
-  (40%).
+  pane holds only the summary + extras; it is display-only and not a
+  focus stop — Tab cycles toggles → hosts → job log → commands, and the
+  pane-jump keys are `f`/`p`/`t`/`c`. Commands/info row is below both
+  columns: commands left (60%), info right (40%).
+- **Per-profile state is a map, not field pairs.**
+  `HostStatus.profiles: BTreeMap<String, ProfileStatus>` holds the
+  update state, extras, and build plan for every profile a node
+  declares. Use `profile()`/`profile_mut()`; there are no
+  `system_*`/`home_*` field pairs and no `match profile.as_str()`
+  with a silent `_` arm — a profile name beyond `system`/`home`
+  participates everywhere automatically.
+- **A running deploy batch is one `Option<DeploySession>`.** The
+  child's channel/task/canceller/stdin, the current host, and the
+  queue with its mode/profile/progress live in one struct on `App`.
+  Every teardown path (exit, spawn error, cancel, quit) *takes* the
+  session and reads what it needs off the taken value. New in-flight
+  deploy state belongs in the session, so teardown can't forget it.
 - **The askpass server must always be answered.** `AskpassServer::serve`
   handles one dialog at a time and blocks on `password_rx.recv()`.
   Dismissing a `PromptSource::Askpass` prompt therefore sends an *empty*

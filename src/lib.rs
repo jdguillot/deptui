@@ -8,6 +8,8 @@ pub mod deploy;
 pub mod event;
 pub mod flake;
 pub mod host;
+pub mod joblog;
+pub mod probe;
 pub mod ssh;
 pub mod theme;
 pub mod ui;

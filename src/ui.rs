@@ -26,10 +26,9 @@ use ratatui::{
 
 use crate::app::{
     App, FocusPane, InputMode, LastDeploy, OverrideField, PromptSource, VisualMode, COMMANDS,
-    TOGGLE_COUNT,
 };
-use crate::deploy::{Mode, ProfileSel};
-use crate::host::{Reachability, UpdateState};
+use crate::deploy::{Mode, ProfileSel, TOGGLES};
+use crate::host::{LogKind, PkgChange, Reachability, UpdateState};
 use crate::theme;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -353,8 +352,8 @@ fn deploy_outcome_chip(last: &LastDeploy) -> Span<'static> {
         format!(
             " {icon} {label}  {} ({} / {})  exit {} ",
             last.node,
-            describe_mode(last.mode),
-            describe_profile(last.profile),
+            last.mode.label(),
+            last.profile.label(),
             last.exit_code,
         ),
         Style::default()
@@ -382,19 +381,17 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
         use crate::host::UpdateState;
         let node = app.selected_node();
         let status = node.map(|n| app.status_for(&n.name));
-        let has_system = node.map(|n| n.has_system()).unwrap_or(false);
-        let has_home = node.map(|n| n.has_home()).unwrap_or(false);
-        let sys_ok = status
-            .as_ref()
-            .map(|s| {
-                s.system_extra.local_path.is_some() && s.system_update != UpdateState::NotDeployed
-            })
-            .unwrap_or(false);
-        let home_ok = status
-            .as_ref()
-            .map(|s| s.home_extra.local_path.is_some() && s.home_update != UpdateState::NotDeployed)
-            .unwrap_or(false);
-        let n = if has_system && sys_ok { 1 } else { 0 } + if has_home && home_ok { 1 } else { 0 };
+        let n = match (node, status.as_ref()) {
+            (Some(node), Some(status)) => node
+                .profiles
+                .keys()
+                .filter(|p| {
+                    let ps = status.profile(p);
+                    ps.extra.local_path.is_some() && ps.update != UpdateState::NotDeployed
+                })
+                .count(),
+            _ => 0,
+        };
         n as u16 * 3 // rough estimate: each profile section is ~3 lines
     };
     // border (top+bottom) = 2; summary = 11; extras; minimum hosts = 3
@@ -430,15 +427,15 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
             let sys = badge(
                 "sys",
                 node.has_system(),
-                status.system_update,
-                status.checking_system,
+                status.profile("system").update,
+                status.profile("system").checking,
                 app.tick_counter,
             );
             let home = badge(
                 "home",
                 node.has_home(),
-                status.home_update,
-                status.checking_home,
+                status.profile("home").update,
+                status.profile("home").checking,
                 app.tick_counter,
             );
             let selected = i == app.selected;
@@ -527,12 +524,25 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
 /// the same character. The `sys:`/`home:` badges next to it already work
 /// this way; this column was the last colour-only signal in the UI.
 fn reachability_dot(reach: Reachability) -> Span<'static> {
-    let (glyph, color) = match reach {
-        Reachability::Online => ("●", theme::SUCCESS),
-        Reachability::Offline => ("○", theme::ERROR),
-        Reachability::Unknown => ("·", theme::MUTED),
-    };
+    let (glyph, _, color) = reachability_cue(reach);
     Span::styled(glyph, Style::default().fg(color))
+}
+
+/// The word form of the same cue, for the details pane's status row.
+fn reachability_word(reach: Reachability) -> Span<'static> {
+    let (_, word, color) = reachability_cue(reach);
+    Span::styled(word, Style::default().fg(color))
+}
+
+/// `(glyph, word, colour)` for a reachability state — the single home
+/// for the user-facing reachability contract (see README), so the host
+/// row's dot and the details pane's word can't drift apart.
+fn reachability_cue(reach: Reachability) -> (&'static str, &'static str, ratatui::style::Color) {
+    match reach {
+        Reachability::Online => ("●", "online", theme::SUCCESS),
+        Reachability::Offline => ("○", "offline", theme::ERROR),
+        Reachability::Unknown => ("·", "unknown", theme::MUTED),
+    }
 }
 
 /// Border colour for a pane that can hold focus: [`theme::FOCUS`] when
@@ -655,8 +665,6 @@ fn badge(
 }
 
 fn draw_details(frame: &mut Frame, area: Rect, app: &mut App) {
-    let focused = app.focus == FocusPane::Details;
-
     let inner = Block::default().borders(Borders::ALL).inner(area);
 
     let extras_lines = build_profile_extras_lines(app);
@@ -671,11 +679,17 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &mut App) {
         (inner, None)
     };
 
-    let title_spans = pane_title_spans("details", 'i', focused);
+    // The details pane is display-only — it takes no keys, so it is
+    // not a focus stop and its title carries no jump letter.
+    let title_spans = vec![
+        Span::raw(" "),
+        Span::styled("details", focus_title_style(false)),
+        Span::raw(" "),
+    ];
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(focus_border_style(focused))
+        .border_style(focus_border_style(false))
         .title(Line::from(title_spans));
     frame.render_widget(block, area);
 
@@ -693,8 +707,10 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
         return Vec::new();
     };
     let status = app.status_for(&node.name);
-    let has_any = (node.has_system() && status.system_extra.local_path.is_some())
-        || (node.has_home() && status.home_extra.local_path.is_some());
+    let has_any = node
+        .ordered_profiles()
+        .into_iter()
+        .any(|p| status.profile(&p).extra.local_path.is_some());
     if !has_any {
         return Vec::new();
     }
@@ -706,11 +722,9 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
             .fg(theme::ACCENT)
             .add_modifier(Modifier::BOLD),
     )));
-    for (label, has, extra) in [
-        ("system", node.has_system(), &status.system_extra),
-        ("home", node.has_home(), &status.home_extra),
-    ] {
-        if !has || extra.local_path.is_none() {
+    for label in node.ordered_profiles() {
+        let extra = &status.profile(&label).extra;
+        if extra.local_path.is_none() {
             continue;
         }
         lines.push(Line::from(vec![
@@ -775,21 +789,18 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
                     Style::default().fg(theme::ACCENT),
                 ),
             ]));
-        } else if let Some(diff) = extra.pkg_diff.as_deref() {
-            if diff.is_empty() {
+        } else if let Some(diff) = extra.pkg_diff.as_ref() {
+            if diff.is_identical() {
                 lines.push(Line::from(vec![
                     Span::raw("       "),
                     Span::styled("packages identical", Style::default().fg(theme::SUCCESS)),
                 ]));
-            } else if diff.trim_start().starts_with("(content-only)") {
+            } else if diff.is_content_only() {
                 // Content-only case: every package name+version
                 // matches on both sides but the actual store paths
-                // still differ. `check_package_diff` tags the
-                // leading line with `(content-only)` so we can
-                // recognise it here and render a distinct badge
-                // instead of the "N changes" version — otherwise
-                // the user sees a package count that doesn't match
-                // what the job log is showing (all path lines, no
+                // still differ. The diff is typed, so this is a
+                // variant check — a change-count badge here would
+                // contradict the job log (all path lines, no
                 // version changes).
                 lines.push(Line::from(vec![
                     Span::raw("       "),
@@ -802,7 +813,7 @@ fn build_profile_extras_lines(app: &App) -> Vec<Line<'static>> {
                     Span::styled("  see job log for paths", Style::default().fg(theme::MUTED)),
                 ]));
             } else {
-                let total = diff.trim().lines().count();
+                let total = diff.change_count();
                 lines.push(Line::from(vec![
                     Span::raw("       "),
                     Span::styled(
@@ -952,17 +963,7 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
             if status.checking_reachability {
                 Span::styled("checking…", Style::default().fg(theme::ACCENT))
             } else {
-                match status.reachability {
-                    Reachability::Online => {
-                        Span::styled("online", Style::default().fg(theme::SUCCESS))
-                    }
-                    Reachability::Offline => {
-                        Span::styled("offline", Style::default().fg(theme::ERROR))
-                    }
-                    Reachability::Unknown => {
-                        Span::styled("unknown", Style::default().fg(theme::MUTED))
-                    }
-                }
+                reachability_word(status.reachability)
             },
         ]),
         // "last up" row: anchor the reachability badge to a wall-clock
@@ -981,8 +982,8 @@ fn draw_node_summary(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("mode     ", Style::default().fg(theme::MUTED)),
             Span::raw(format!(
                 "{} / {}",
-                describe_mode(app.mode),
-                describe_profile(app.profile_sel)
+                app.mode.label(),
+                app.profile_sel.label()
             )),
         ]),
         Line::from(vec![
@@ -1049,18 +1050,17 @@ fn build_plan_summary_line(status: &crate::host::HostStatus, tick: u64) -> Line<
             ),
         ]);
     }
-    if status.build_plans.is_empty() {
+    if status.build_plans().next().is_none() {
         return Line::from(vec![
             label,
             Span::styled("not checked (Shift+P)", Style::default().fg(theme::MUTED)),
         ]);
     }
-    let builds: usize = status.build_plans.values().map(|p| p.to_build.len()).sum();
-    let fetches: usize = status.build_plans.values().map(|p| p.to_fetch.len()).sum();
+    let builds: usize = status.build_plans().map(|(_, p)| p.to_build.len()).sum();
+    let fetches: usize = status.build_plans().map(|(_, p)| p.to_fetch.len()).sum();
     let download: u64 = status
-        .build_plans
-        .values()
-        .filter_map(|p| p.download_bytes)
+        .build_plans()
+        .filter_map(|(_, p)| p.download_bytes)
         .sum();
     if builds == 0 && fetches == 0 {
         return Line::from(vec![
@@ -1208,129 +1208,108 @@ fn plain_segments(text: &str, style: Style) -> Vec<StyledSegment> {
     vec![styled_segment(text, style)]
 }
 
-fn parse_size_bytes(text: &str, label: &str) -> Option<u64> {
-    text.strip_prefix(label)?
-        .strip_suffix(" bytes")?
-        .trim()
-        .parse::<u64>()
-        .ok()
-}
-
-fn style_pkg_probe_line(text: &str, base: Style) -> Vec<StyledSegment> {
-    let Some(body) = text.strip_prefix("[pkg] ") else {
-        return plain_segments(text, base);
-    };
+/// Style one job-log entry from its typed [`LogKind`]. The text is
+/// never re-parsed — the producer attached the data when the line was
+/// created (see `host::ProgressLine`).
+fn style_entry(
+    entry: &crate::app::LogEntry,
+    base: Style,
+    local_size_hint: Option<u64>,
+) -> Vec<StyledSegment> {
     let tag = dim_style(base);
-
-    if let Some(rest) = body.strip_prefix("done (") {
-        if let Some(count) = rest.strip_suffix(" change(s))") {
-            let changes = count.parse::<usize>().ok().unwrap_or(0);
-            let emphasis = if changes == 0 {
+    match &entry.kind {
+        LogKind::Plain => plain_segments(&entry.text, base),
+        LogKind::Note => plain_segments(&entry.text, dim_style(base)),
+        LogKind::SizeLocal(bytes) => vec![
+            styled_segment("[size] ", tag),
+            styled_segment("local: ", tag),
+            styled_segment(humanise_bytes(*bytes), dim_style(base)),
+            styled_segment(format!(" ({bytes} bytes)"), dim_style(base)),
+        ],
+        LogKind::SizeRemote(bytes) => {
+            let remote = *bytes;
+            let mut spans = vec![
+                styled_segment("[size] ", tag),
+                styled_segment("remote: ", tag),
+                styled_segment(humanise_bytes(remote), dim_style(base)),
+                styled_segment(format!(" ({remote} bytes)"), dim_style(base)),
+            ];
+            if let Some(local) = local_size_hint {
+                let (delta_abs, sign) = if local >= remote {
+                    (local - remote, '+')
+                } else {
+                    (remote - local, '-')
+                };
+                spans.push(styled_segment("  delta ", tag));
+                spans.push(styled_segment(
+                    format!("{sign}{}", humanise_bytes(delta_abs)),
+                    accent_style(base, theme::WARNING),
+                ));
+            }
+            spans
+        }
+        LogKind::PkgDone(changes) => {
+            let emphasis = if *changes == 0 {
                 accent_style(base, theme::SUCCESS)
             } else {
                 accent_style(base, theme::WARNING)
             };
-            return vec![
+            vec![
                 styled_segment("[pkg] ", tag),
                 styled_segment("done ", emphasis),
                 styled_segment(format!("({changes} change(s))"), emphasis),
-            ];
+            ]
         }
+        LogKind::Pkg(change) => style_pkg_change(change, base),
     }
-
-    if let Some(summary) = body.strip_prefix("(content-only)") {
-        return vec![
-            styled_segment("[pkg] ", tag),
-            styled_segment("(content-only)", accent_style(base, theme::WARNING)),
-            styled_segment(summary, dim_style(base)),
-        ];
-    }
-
-    if let Some((name, delta)) = body.split_once(": ") {
-        if let Some((old, new)) = delta.split_once(" → ") {
-            return vec![
-                styled_segment("[pkg] ", tag),
-                styled_segment(name, accent_style(base, theme::WARNING)),
-                styled_segment(": ", tag),
-                styled_segment(old, dim_style(base)),
-                styled_segment(" → ", tag),
-                styled_segment(new, accent_style(base, theme::SUCCESS)),
-            ];
-        }
-        if let Some(added) = delta.strip_prefix("+ ") {
-            return vec![
-                styled_segment("[pkg] ", tag),
-                styled_segment(name, accent_style(base, theme::WARNING)),
-                styled_segment(": ", tag),
-                styled_segment("+ ", accent_style(base, theme::SUCCESS)),
-                styled_segment(added, accent_style(base, theme::SUCCESS)),
-            ];
-        }
-        if let Some(removed) = delta.strip_prefix("- ") {
-            return vec![
-                styled_segment("[pkg] ", tag),
-                styled_segment(name, accent_style(base, theme::WARNING)),
-                styled_segment(": ", tag),
-                styled_segment("- ", accent_style(base, theme::ERROR)),
-                styled_segment(removed, accent_style(base, theme::ERROR)),
-            ];
-        }
-    }
-
-    plain_segments(text, dim_style(base))
 }
 
-fn style_size_probe_line(text: &str, base: Style, local_size: Option<u64>) -> Vec<StyledSegment> {
-    let Some(_body) = text.strip_prefix("[size] ") else {
-        return plain_segments(text, base);
-    };
+/// Segment styling for one package-diff line. Colours come from the
+/// variant, text from [`PkgChange::render`] — so what's shown always
+/// matches what a yank copies.
+fn style_pkg_change(change: &PkgChange, base: Style) -> Vec<StyledSegment> {
     let tag = dim_style(base);
-
-    if let Some(local) = parse_size_bytes(text, "[size] local: ") {
-        return vec![
-            styled_segment("[size] ", tag),
-            styled_segment("local: ", tag),
-            styled_segment(humanise_bytes(local), dim_style(base)),
-            styled_segment(format!(" ({local} bytes)"), dim_style(base)),
-        ];
-    }
-
-    if let Some(remote) = parse_size_bytes(text, "[size] remote: ") {
-        let mut spans = vec![
-            styled_segment("[size] ", tag),
-            styled_segment("remote: ", tag),
-            styled_segment(humanise_bytes(remote), dim_style(base)),
-            styled_segment(format!(" ({remote} bytes)"), dim_style(base)),
-        ];
-        if let Some(local) = local_size {
-            let (delta_abs, sign, color) = if local >= remote {
-                (local - remote, '+', theme::WARNING)
-            } else {
-                (remote - local, '-', theme::WARNING)
-            };
-            spans.push(styled_segment("  delta ", tag));
-            spans.push(styled_segment(
-                format!("{sign}{}", humanise_bytes(delta_abs)),
-                accent_style(base, color),
-            ));
+    match change {
+        PkgChange::Updated { name, from, to } => vec![
+            styled_segment("[pkg] ", tag),
+            styled_segment(name.clone(), accent_style(base, theme::WARNING)),
+            styled_segment(": ", tag),
+            styled_segment(from.clone(), dim_style(base)),
+            styled_segment(" → ", tag),
+            styled_segment(to.clone(), accent_style(base, theme::SUCCESS)),
+        ],
+        PkgChange::Added { name, versions } => vec![
+            styled_segment("[pkg] ", tag),
+            styled_segment(name.clone(), accent_style(base, theme::WARNING)),
+            styled_segment(": ", tag),
+            styled_segment("+ ", accent_style(base, theme::SUCCESS)),
+            styled_segment(versions.clone(), accent_style(base, theme::SUCCESS)),
+        ],
+        PkgChange::Removed { name, versions } => vec![
+            styled_segment("[pkg] ", tag),
+            styled_segment(name.clone(), accent_style(base, theme::WARNING)),
+            styled_segment(": ", tag),
+            styled_segment("- ", accent_style(base, theme::ERROR)),
+            styled_segment(versions.clone(), accent_style(base, theme::ERROR)),
+        ],
+        PkgChange::ContentOnly { .. } => {
+            let summary = change.render();
+            let rest = summary
+                .strip_prefix("(content-only)")
+                .unwrap_or("")
+                .to_string();
+            vec![
+                styled_segment("[pkg] ", tag),
+                styled_segment("(content-only)", accent_style(base, theme::WARNING)),
+                styled_segment(rest, dim_style(base)),
+            ]
         }
-        return spans;
+        PkgChange::SampleAdded { .. }
+        | PkgChange::SampleRemoved { .. }
+        | PkgChange::More { .. } => {
+            plain_segments(&format!("[pkg] {}", change.render()), dim_style(base))
+        }
     }
-
-    plain_segments(text, dim_style(base))
-}
-
-fn style_job_log_segments(text: &str, base: Style, local_size: Option<u64>) -> Vec<StyledSegment> {
-    if text.starts_with("[pkg] ") {
-        return style_pkg_probe_line(text, base);
-    }
-    if text.starts_with("[size] ") {
-        return style_size_probe_line(text, base, local_size);
-    }
-    if text.starts_with("→ computing package diff for ") {
-        return plain_segments(text, dim_style(base));
-    }
-    plain_segments(text, base)
 }
 
 fn highlight_segments(
@@ -1447,40 +1426,21 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner = Block::default().borders(Borders::ALL).inner(area);
 
     let width = job_log_prefix_width(app);
-    // Show only entries for the active host set: marked nodes if any
-    // are marked, otherwise the currently selected node.
-    let active_hosts: std::collections::HashSet<&str> = if app.marked.is_empty() {
-        app.selected_node()
-            .map(|n| n.name.as_str())
-            .into_iter()
-            .collect()
-    } else {
-        app.marked.iter().map(|s| s.as_str()).collect()
-    };
+    // The same filter the key handling, search, and yank use — one
+    // implementation, so what the pane shows and what those operate on
+    // can't drift apart.
     let tagged: Vec<&crate::app::LogEntry> = app
-        .log
-        .iter()
-        .filter(|e| {
-            e.host
-                .as_deref()
-                .map(|h| active_hosts.contains(h))
-                .unwrap_or(false)
-        })
+        .filtered_log_indices_for_job_log()
+        .into_iter()
+        .map(|i| &app.log[i])
         .collect();
 
-    let query = if matches!(
-        app.log_search_target,
-        Some(crate::app::SearchTarget::JobLog)
-    ) {
-        app.log_search.as_deref()
-    } else {
-        None
-    };
+    let query = app.log_search.as_deref();
 
     // The "current match" index (1-based) so the active search result
     // gets a distinct cyan highlight.
     let current_match = if query.is_some() {
-        let (cur, _) = app.log_search_stats(crate::app::SearchTarget::JobLog);
+        let (cur, _) = app.log_search_stats();
         if cur > 0 {
             Some(cur)
         } else {
@@ -1521,11 +1481,14 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut match_counter = 0usize;
     for entry in &tagged[..window_start] {
         let host = entry.host.as_deref().unwrap_or("");
-        if let Some(local) = parse_size_bytes(&entry.text, "[size] local: ") {
-            size_locals.insert(host.to_string(), local);
-        }
-        if parse_size_bytes(&entry.text, "[size] remote: ").is_some() {
-            size_locals.remove(host);
+        match entry.kind {
+            LogKind::SizeLocal(bytes) => {
+                size_locals.insert(host.to_string(), bytes);
+            }
+            LogKind::SizeRemote(_) => {
+                size_locals.remove(host);
+            }
+            _ => {}
         }
         if let Some(q) = query {
             if !q.is_empty() {
@@ -1553,7 +1516,18 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             );
             let local_size_hint = size_locals.get(host).copied();
-            let styled_body = style_job_log_segments(&entry.text, body_style, local_size_hint);
+            // Catch the accumulator up on *every* path — the visual
+            // branches return early below, and skipping the update
+            // there desyncs the size deltas of every later line.
+            match entry.kind {
+                LogKind::SizeLocal(bytes) => {
+                    size_locals.insert(host.to_string(), bytes);
+                }
+                LogKind::SizeRemote(_) => {
+                    size_locals.remove(host);
+                }
+                _ => {}
+            }
 
             if let Some((vmode, start_line, start_col, end_line, end_col)) = visual_range {
                 let in_sel = line_idx >= start_line && line_idx <= end_line;
@@ -1569,37 +1543,26 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
                                     .bg(theme::SURFACE_SEL),
                             )];
                             spans.extend(highlight_segments(
-                                style_job_log_segments(
-                                    &entry.text,
-                                    body_style.patch(sel_bg),
-                                    local_size_hint,
-                                ),
+                                style_entry(entry, body_style.patch(sel_bg), local_size_hint),
                                 query,
                                 current_match,
                                 &mut match_counter,
                             ));
-                            if let Some(local) = parse_size_bytes(&entry.text, "[size] local: ") {
-                                size_locals.insert(host.to_string(), local);
-                            }
-                            if parse_size_bytes(&entry.text, "[size] remote: ").is_some() {
-                                size_locals.remove(host);
-                            }
                             return Line::from(spans);
                         }
                         VisualMode::Char => {
-                            // Partial selection — split body text at column boundaries.
+                            // Partial selection — split the body text at
+                            // the same column bounds the yank path
+                            // slices with.
                             let chars: Vec<char> = entry.text.chars().collect();
-                            let len = chars.len();
-                            let (s, e) = if start_line == end_line {
-                                // Single-line selection.
-                                (start_col.min(len), (end_col + 1).min(len))
-                            } else if line_idx == start_line {
-                                (start_col.min(len), len)
-                            } else if line_idx == end_line {
-                                (0, (end_col + 1).min(len))
-                            } else {
-                                (0, len)
-                            };
+                            let (s, e) = crate::joblog::char_selection_bounds(
+                                chars.len(),
+                                line_idx,
+                                start_line,
+                                start_col,
+                                end_line,
+                                end_col,
+                            );
                             let before: String = chars[..s].iter().collect();
                             let selected: String = chars[s..e].iter().collect();
                             let after: String = chars[e..].iter().collect();
@@ -1622,17 +1585,11 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
             // Default path — search highlighting, no visual selection.
             let mut spans = vec![prefix_span];
             spans.extend(highlight_segments(
-                styled_body,
+                style_entry(entry, body_style, local_size_hint),
                 query,
                 current_match,
                 &mut match_counter,
             ));
-            if let Some(local) = parse_size_bytes(&entry.text, "[size] local: ") {
-                size_locals.insert(host.to_string(), local);
-            }
-            if parse_size_bytes(&entry.text, "[size] remote: ").is_some() {
-                size_locals.remove(host);
-            }
             Line::from(spans)
         })
         .collect();
@@ -1670,10 +1627,8 @@ fn draw_job_log(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         pane_title_spans("job log", 'p', focused)
     };
-    if let (Some(q), Some(crate::app::SearchTarget::JobLog)) =
-        (app.log_search.as_ref(), app.log_search_target)
-    {
-        let (cur, total) = app.log_search_stats(crate::app::SearchTarget::JobLog);
+    if let Some(q) = app.log_search.as_ref() {
+        let (cur, total) = app.log_search_stats();
         title_spans.push(search_chip(q, cur, total));
     }
     if app.job_log_scroll > 0 {
@@ -1846,21 +1801,19 @@ fn build_toggles_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
     } else {
         None
     };
-    let values = [
-        ("1", "skip-checks", t.skip_checks),
-        ("2", "magic-rb", t.magic_rollback),
-        ("3", "auto-rb", t.auto_rollback),
-        ("4", "remote-build", t.remote_build),
-        ("5", "int-sudo", t.interactive_sudo),
-    ];
-    debug_assert_eq!(values.len(), TOGGLE_COUNT);
-    let mut spans = Vec::with_capacity(values.len() * 2 + 1);
+    let mut spans = Vec::with_capacity(TOGGLES.len() * 2 + 1);
     spans.push(Span::raw(" "));
-    for (i, (key, label, on)) in values.iter().enumerate() {
+    for (i, def) in TOGGLES.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(toggle_span(key, label, *on, sub == Some(i)));
+        let key = (i + 1).to_string();
+        spans.push(toggle_span(
+            &key,
+            def.short_label,
+            (def.get)(&t),
+            sub == Some(i),
+        ));
     }
     spans
 }
@@ -1869,20 +1822,12 @@ fn build_toggles_spans(app: &App, focused: bool) -> Vec<Span<'static>> {
 /// We ignore focus-dependent styling because the widths are the same
 /// with or without focus — only the colours change.
 fn toggles_content_width() -> usize {
-    // Values deliberately match `build_toggles_spans`'s label list;
-    // if a label ever grows here, bump it there too.
-    let labels = [
-        "skip-checks",
-        "magic-rb",
-        "auto-rb",
-        "remote-build",
-        "int-sudo",
-    ];
     // Each toggle renders as ` <key>:<icon> <label> ` = 6 fixed chars
     // + label; plus a 2-char separator between toggles and a leading
-    // space.
-    let per_toggle: usize = labels.iter().map(|l| 6 + l.len()).sum();
-    let separators = 2 * (labels.len() - 1);
+    // space. The labels come from the same table the renderer walks,
+    // so a longer label can't fall out of sync with this width.
+    let per_toggle: usize = TOGGLES.iter().map(|d| 6 + d.short_label.len()).sum();
+    let separators = 2 * (TOGGLES.len() - 1);
     1 + per_toggle + separators
 }
 
@@ -1982,25 +1927,12 @@ fn build_info_spans(app: &App) -> Vec<Span<'static>> {
 /// Pulled out of `build_info_spans` so both the renderer and the
 /// width-measurer walk the exact same list.
 fn info_hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
-    let search_active_here = matches!(
-        (app.focus, app.log_search_target, &app.log_search),
-        (
-            FocusPane::JobLog,
-            Some(crate::app::SearchTarget::JobLog),
-            Some(_)
-        )
-    );
+    let search_active_here = matches!((app.focus, &app.log_search), (FocusPane::JobLog, Some(_)));
     match app.focus {
         FocusPane::Hosts => vec![
             ("j/k", "move"),
             ("Space", "mark"),
             ("g/G", "top/bottom"),
-            ("/", "search log"),
-            ("Tab", "focus"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        FocusPane::Details => vec![
             ("/", "search log"),
             ("Tab", "focus"),
             ("?", "help"),
@@ -2227,10 +2159,8 @@ fn draw_input_strip(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("Esc", Style::default().fg(theme::KEY)),
             Span::raw(" back"),
         ]),
-        InputMode::SearchLog { target, buf } => {
-            let label = match target {
-                crate::app::SearchTarget::JobLog => " /search job log ▸ ",
-            };
+        InputMode::SearchLog { buf } => {
+            let label = " /search job log ▸ ";
             Line::from(vec![
                 Span::styled(
                     label,
@@ -2325,21 +2255,21 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
     // misaligned.
     let all_lines: Vec<Line> = vec![
         section("navigation"),
-        key_line("↑/↓ j/k", "within pane: hosts = selection, details/joblog = scroll"),
+        key_line("↑/↓ j/k", "within pane: hosts = selection, joblog = scroll"),
         key_line("←/→ h/l", "toggles/commands = sub-cursor (vim-style hjkl)"),
-        key_line("Shift+H/L", "horizontal pane move (hosts/details ↔ job log)"),
+        key_line("Shift+H/L", "horizontal pane move (hosts ↔ job log)"),
         key_line("Shift+←/→", "same as Shift+H/L"),
-        key_line("Shift+J/K", "vertical pane move (toggles ↔ hosts ↔ details / job log ↔ commands)"),
+        key_line("Shift+J/K", "vertical pane move (toggles ↔ hosts / job log ↔ commands)"),
         key_line("Shift+↑/↓", "same as Shift+J/K"),
-        key_line("Tab", "cycle focus forward (toggles → hosts → details → joblog → commands)"),
+        key_line("Tab", "cycle focus forward (toggles → hosts → joblog → commands)"),
         key_line("Shift+Tab", "cycle focus backward"),
-        key_line("f/i/p/t/c", "btop-style jump: (f)ocus hosts, (i)nfo details, (p)ipeline log, (t)oggles, (c)ommands"),
+        key_line("f/p/t/c", "btop-style jump: (f)ocus hosts, (p)ipeline log, (t)oggles, (c)ommands"),
         key_line("Enter", "activate the focused toggle or command button"),
         key_line(
             "g",
             "vim-style 'go to top' — hosts=first host, details/joblog=oldest line, help=top",
         ),
-        key_line("Shift+G", "vim-style 'go to bottom' — details/joblog snap to tail, help=bottom"),
+        key_line("Shift+G", "vim-style 'go to bottom' — joblog snaps to tail, help=bottom"),
         key_line("q", "quit (Esc closes popups/edits but never quits)"),
         key_line("Ctrl-C", "quit and kill any running deploy"),
         Line::raw(""),
@@ -2439,17 +2369,11 @@ fn draw_help_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         Line::raw(""),
 
         section("toggles (number keys)"),
-        key_line("1", "skip-checks — skip the pre-deploy `nix flake check`"),
-        key_line(
-            "2",
-            "magic-rollback — wait for confirmation, auto-roll-back on timeout (default ON)",
-        ),
-        key_line("3", "auto-rollback — roll back if activation fails (default ON)"),
-        key_line("4", "remote-build — perform the build on the target host"),
-        key_line(
-            "5",
-            "interactive-sudo — TUI will prompt for the sudo password securely (masked input)",
-        ),
+        key_line("1", TOGGLES[0].help),
+        key_line("2", TOGGLES[1].help),
+        key_line("3", TOGGLES[2].help),
+        key_line("4", TOGGLES[3].help),
+        key_line("5", TOGGLES[4].help),
         Line::raw(""),
 
         section("ssh overrides (per host)"),
@@ -2630,7 +2554,7 @@ fn draw_confirm_popup(
     lines.push(Line::from(vec![
         Span::styled("mode    ", Style::default().fg(theme::MUTED)),
         Span::styled(
-            describe_mode(mode),
+            mode.label(),
             Style::default()
                 .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
@@ -2639,7 +2563,7 @@ fn draw_confirm_popup(
     lines.push(Line::from(vec![
         Span::styled("profile ", Style::default().fg(theme::MUTED)),
         Span::styled(
-            describe_profile(profile),
+            profile.label(),
             Style::default()
                 .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
@@ -2708,21 +2632,16 @@ fn build_plan_warning_lines(app: &App, hosts: &[String]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for name in hosts {
         let status = app.status_for(name);
-        if status.build_plans.is_empty() {
-            continue;
-        }
         let builds: Vec<String> = status
-            .build_plans
-            .values()
-            .flat_map(|p| p.build_labels())
+            .build_plans()
+            .flat_map(|(_, p)| p.build_labels())
             .collect();
         if builds.is_empty() {
             continue;
         }
         let download: u64 = status
-            .build_plans
-            .values()
-            .filter_map(|p| p.download_bytes)
+            .build_plans()
+            .filter_map(|(_, p)| p.download_bytes)
             .sum();
         let suffix = if download > 0 {
             format!(", {} to fetch", humanise_bytes(download))
@@ -3050,53 +2969,51 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn describe_mode(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Switch => "switch",
-        Mode::Boot => "boot",
-        Mode::DryRun => "dry-run",
-    }
-}
-
-fn describe_profile(p: ProfileSel) -> &'static str {
-    match p {
-        ProfileSel::All => "all profiles",
-        ProfileSel::System => "system only",
-        ProfileSel::Home => "home only",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::ProgressLine;
 
     fn joined_text(segments: &[StyledSegment]) -> String {
         segments.iter().map(|seg| seg.text.as_str()).collect()
     }
 
-    #[test]
-    fn styles_pkg_done_line_without_changing_text() {
-        let segments = style_pkg_probe_line("[pkg] done (0 change(s))", Style::default());
-        assert_eq!(joined_text(&segments), "[pkg] done (0 change(s))");
+    /// Build a log entry the way the app does when a probe's typed
+    /// progress line arrives, so the tests exercise the same
+    /// producer→renderer pair the running TUI uses.
+    fn entry_from(line: ProgressLine) -> crate::app::LogEntry {
+        crate::app::LogEntry {
+            text: line.text,
+            is_err: false,
+            host: Some("h".into()),
+            kind: line.kind,
+        }
     }
 
     #[test]
-    fn styles_pkg_version_update_without_changing_text() {
-        let segments =
-            style_pkg_probe_line("[pkg] usbutils: 018 → 018, 019, 019-man", Style::default());
-        assert_eq!(
-            joined_text(&segments),
-            "[pkg] usbutils: 018 → 018, 019, 019-man"
-        );
+    fn styled_pkg_done_text_matches_the_canonical_line() {
+        let entry = entry_from(ProgressLine::pkg_done(0));
+        let segments = style_entry(&entry, Style::default(), None);
+        assert_eq!(joined_text(&segments), entry.text);
+        assert_eq!(entry.text, "[pkg] done (0 change(s))");
+    }
+
+    #[test]
+    fn styled_pkg_update_text_matches_the_canonical_line() {
+        let entry = entry_from(ProgressLine::pkg(PkgChange::Updated {
+            name: "usbutils".into(),
+            from: "018".into(),
+            to: "018, 019, 019-man".into(),
+        }));
+        let segments = style_entry(&entry, Style::default(), None);
+        assert_eq!(joined_text(&segments), entry.text);
+        assert_eq!(entry.text, "[pkg] usbutils: 018 → 018, 019, 019-man");
     }
 
     #[test]
     fn size_remote_line_shows_human_size_and_delta() {
-        let segments = style_size_probe_line(
-            "[size] remote: 13886547224 bytes",
-            Style::default(),
-            Some(13886874912),
-        );
+        let entry = entry_from(ProgressLine::size_remote(13886547224));
+        let segments = style_entry(&entry, Style::default(), Some(13886874912));
         let text = joined_text(&segments);
         assert!(text.contains("12.9 GiB"));
         assert!(text.contains("delta +320.0 KiB"));
