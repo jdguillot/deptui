@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-05
+
 ### Fixed
 
 - Agent discovery found nothing even with an agent running: the NixOS
