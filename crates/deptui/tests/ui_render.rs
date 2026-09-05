@@ -515,3 +515,22 @@ fn confirm_popup_warns_about_agent_managed_hosts() {
         "p hint missing: {out}"
     );
 }
+
+/// Unconfigured is the first-run state: `a` must show setup guidance,
+/// not a dead screen — and a settings parse error must be visible.
+#[test]
+fn agent_view_explains_missing_and_broken_settings() {
+    let mut app = App::new(".".into(), nodes());
+    app.agent.open = true;
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("no agents configured"), "{out}");
+    assert!(
+        out.contains("[agents.homelab]"),
+        "example snippet missing: {out}"
+    );
+
+    app.agent.settings_error = Some("config.toml: unknown field `agnets`".into());
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("could not be loaded"), "{out}");
+    assert!(out.contains("agnets"), "parse error text missing: {out}");
+}

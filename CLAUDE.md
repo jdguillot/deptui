@@ -375,7 +375,10 @@ Key invariants worth knowing before touching the code:
   so there is no target indirection.
 - **Job log is filtered to the active host set.** When any hosts are
   marked (space bar), the job log shows only their entries. With no marks,
-  it shows only the selected host's entries. The filter is implemented
+  it shows only the selected host's entries. Untagged entries (host:
+  None — key hints, cancellations, agent acks) always show: this pane
+  is the only place they can appear, and hiding them made `a` look
+  like a dead key when no agent was configured. The filter is implemented
   once — `joblog::filtered_indices` — and both key handling and
   `draw_job_log` call it. The char-selection column slice is likewise
   shared (`joblog::char_selection_bounds`), so the highlight and the

@@ -24,6 +24,11 @@ pub struct Settings {
     pub default_agent: Option<String>,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentEntry>,
+    /// Why the file failed to load, when it existed but didn't parse.
+    /// Carried into the agent view so a typo'd config produces an
+    /// on-screen explanation instead of a silently empty agent list.
+    #[serde(skip)]
+    pub load_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,14 +62,20 @@ impl Settings {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
             Err(e) => {
                 tracing::warn!("reading {}: {e}", path.display());
-                return Self::default();
+                return Self {
+                    load_error: Some(format!("{}: {e}", path.display())),
+                    ..Self::default()
+                };
             }
         };
         match toml::from_str(&text) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("parsing {}: {e}", path.display());
-                Self::default()
+                Self {
+                    load_error: Some(format!("{}: {e}", path.display())),
+                    ..Self::default()
+                }
             }
         }
     }
@@ -106,6 +117,13 @@ ssh = "z@z"
         let list = s.agent_list();
         assert_eq!(list[0].0, "zeta");
         assert_eq!(list[1].0, "alpha");
+    }
+
+    #[test]
+    fn parse_error_is_carried_not_swallowed() {
+        // load() itself needs a file; the parse path is what matters.
+        let s: Result<Settings, _> = toml::from_str("agents = 5");
+        assert!(s.is_err());
     }
 
     #[test]

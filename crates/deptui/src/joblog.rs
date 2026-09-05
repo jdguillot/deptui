@@ -59,10 +59,12 @@ impl VisualSel {
     }
 }
 
-/// Indices into `log` that the job-log pane currently shows: only
-/// entries for the marked hosts, or for the selected host when no
-/// marks are set. Untagged entries (app-level status messages) never
-/// show in this pane.
+/// Indices into `log` that the job-log pane currently shows: entries
+/// for the marked hosts (or the selected host when no marks are set),
+/// plus every untagged entry. Untagged lines are app-level messages —
+/// key hints, cancellations, agent acks — and this pane is the only
+/// place they can appear, so hiding them meant the user never saw
+/// them at all (the "press `a` and nothing happens" bug).
 pub fn filtered_indices(log: &[LogEntry], marked: &[String], selected: Option<&str>) -> Vec<usize> {
     let active: std::collections::HashSet<&str> = if marked.is_empty() {
         selected.into_iter().collect()
@@ -71,7 +73,10 @@ pub fn filtered_indices(log: &[LogEntry], marked: &[String], selected: Option<&s
     };
     log.iter()
         .enumerate()
-        .filter_map(|(i, e)| e.host.as_deref().filter(|h| active.contains(*h)).map(|_| i))
+        .filter_map(|(i, e)| match e.host.as_deref() {
+            Some(h) => active.contains(h).then_some(i),
+            None => Some(i),
+        })
         .collect()
 }
 
@@ -116,11 +121,12 @@ mod tests {
     }
 
     #[test]
-    fn filter_shows_selected_host_when_nothing_is_marked() {
+    fn filter_shows_selected_host_plus_untagged_lines() {
         let log = vec![entry(Some("a")), entry(None), entry(Some("b"))];
-        assert_eq!(filtered_indices(&log, &[], Some("a")), vec![0]);
-        assert_eq!(filtered_indices(&log, &[], Some("b")), vec![2]);
-        assert!(filtered_indices(&log, &[], None).is_empty());
+        assert_eq!(filtered_indices(&log, &[], Some("a")), vec![0, 1]);
+        assert_eq!(filtered_indices(&log, &[], Some("b")), vec![1, 2]);
+        // No selection at all: app-level messages still show.
+        assert_eq!(filtered_indices(&log, &[], None), vec![1]);
     }
 
     #[test]
@@ -128,6 +134,13 @@ mod tests {
         let log = vec![entry(Some("a")), entry(Some("b")), entry(Some("c"))];
         let marked = vec!["a".to_string(), "c".to_string()];
         assert_eq!(filtered_indices(&log, &marked, Some("b")), vec![0, 2]);
+    }
+
+    #[test]
+    fn filter_keeps_untagged_lines_under_marks_too() {
+        let log = vec![entry(Some("a")), entry(None), entry(Some("b"))];
+        let marked = vec!["b".to_string()];
+        assert_eq!(filtered_indices(&log, &marked, Some("a")), vec![1, 2]);
     }
 
     #[test]

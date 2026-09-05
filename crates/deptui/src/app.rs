@@ -347,6 +347,8 @@ pub struct AgentUi {
     tail_task: Option<JoinHandle<()>>,
     /// Last op ack, shown in the view's footer.
     pub last_op: Option<String>,
+    /// Settings-file load error, surfaced in the view's empty state.
+    pub settings_error: Option<String>,
 }
 
 impl AgentUi {
@@ -362,6 +364,7 @@ impl AgentUi {
             tail: VecDeque::new(),
             tail_task: None,
             last_op: None,
+            settings_error: settings.load_error.clone(),
         }
     }
 
@@ -2961,22 +2964,16 @@ resolve the paths so they can be seeded",
         hosts.iter().any(|h| self.agent_managed.contains_key(h))
     }
 
-    /// `a` — open the full-screen agent view.
+    /// `a` — open the full-screen agent view. Always opens: with no
+    /// agents configured the view renders setup instructions (and any
+    /// settings parse error) instead of being a dead key.
     fn open_agent_view(&mut self) {
-        if self.agent.agents.is_empty() {
-            self.push_log(
-                &format!(
-                    "! no agents configured — add [agents.NAME] ssh = \"user@host\" to {}",
-                    Settings::config_path().display()
-                ),
-                true,
-            );
-            return;
-        }
         self.agent.open = true;
         self.agent.sel = 0;
-        self.fetch_agent_status();
-        self.start_agent_tail();
+        if !self.agent.agents.is_empty() {
+            self.fetch_agent_status();
+            self.start_agent_tail();
+        }
     }
 
     fn close_agent_view(&mut self) {
@@ -4451,14 +4448,13 @@ mod tests {
     // (which fails fast against the fake ssh target and is dropped).
     #[tokio::test]
     async fn agent_view_opens_only_when_configured() {
-        // No agents configured: `a` logs a hint instead of opening.
+        // No agents configured: `a` still opens the view — it renders
+        // setup instructions instead of being a dead key.
         let mut app = App::new(".".into(), sample_nodes());
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert!(!app.agent.open);
-        assert!(app
-            .log
-            .iter()
-            .any(|l| l.text.contains("no agents configured")));
+        assert!(app.agent.open);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!app.agent.open, "a toggles the view closed again");
 
         // Configured: the view opens, q closes it, `a` toggles too.
         let settings: crate::settings::Settings =

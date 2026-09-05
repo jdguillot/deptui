@@ -3181,7 +3181,50 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(err) = &app.agent.error {
+    if app.agent.agents.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no agents configured",
+            Style::default()
+                .fg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::raw(""));
+        if let Some(err) = &app.agent.settings_error {
+            lines.push(Line::from(Span::styled(
+                "the settings file exists but could not be loaded:",
+                Style::default().fg(theme::ERROR),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  {err}"),
+                Style::default().fg(theme::ERROR),
+            )));
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!(
+                "add an agent to {}:",
+                crate::settings::Settings::config_path().display()
+            ),
+            Style::default().fg(theme::MUTED),
+        )));
+        lines.push(Line::raw(""));
+        for l in [
+            r#"  default_agent = "homelab""#,
+            "",
+            "  [agents.homelab]",
+            r#"  ssh = "me@deploy-box"   # any ssh destination"#,
+        ] {
+            lines.push(Line::from(Span::styled(
+                l,
+                Style::default().fg(theme::ACCENT),
+            )));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "the agent itself runs on that host — see the README's agent section",
+            Style::default().fg(theme::MUTED),
+        )));
+    } else if let Some(err) = &app.agent.error {
         lines.push(Line::from(Span::styled(
             format!("! {err}"),
             Style::default().fg(theme::ERROR),
