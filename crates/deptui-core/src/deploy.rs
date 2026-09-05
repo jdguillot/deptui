@@ -911,7 +911,16 @@ async fn run_one(
             // Catches anything that ignored SIGTERM or was forked after
             // it. A no-op (ESRCH) once the group is already empty.
             signal_group(pgid, libc::SIGKILL);
-            child.wait().await.context("waiting for `deploy`")?
+            let status = child.wait().await.context("waiting for `deploy`")?;
+            // Say so once the group is actually gone — "did the cancel
+            // really kill nix?" should be answerable from the log, not
+            // from watching htop.
+            let _ = tx
+                .send(LogLine::Stderr(
+                    "✓ deploy process group terminated".to_string(),
+                ))
+                .await;
+            status
         }
     };
 

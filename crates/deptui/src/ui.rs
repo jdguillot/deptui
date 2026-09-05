@@ -1805,20 +1805,21 @@ fn compute_tail_scroll_offset(
         *scroll = 0;
         return (0, 0);
     }
-    let w = width as usize;
-    // Cheap row-count estimate: use Line::width() instead of
-    // constructing a full Paragraph per line. This is O(n) in span
-    // count rather than O(n * layout-engine) and gives the same
-    // result for non-CJK text (which is all deploy-rs outputs).
+    // Exact per-entry row counts from ratatui's own word-wrapper
+    // (`Paragraph::line_count`). The old `Line::width()/width` estimate
+    // undercounted whenever the wrapper moved a too-long-for-the-
+    // remainder token (any /nix/store/… path) wholly onto the next
+    // row; each undercount clipped one row of the tail below the
+    // viewport, so the newest lines — where Shift+V anchors — weren't
+    // on screen at all. Only the window's lines reach here, so the
+    // per-line Paragraph cost is bounded by the pane height.
     let per_entry_rows: Vec<usize> = all_lines
         .iter()
         .map(|line| {
-            let lw = line.width();
-            if lw <= w {
-                1
-            } else {
-                lw.div_ceil(w)
-            }
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .max(1)
         })
         .collect();
     let total_rows: usize = per_entry_rows.iter().sum();

@@ -712,3 +712,54 @@ fn draw_captures_copy_panes_and_highlights_the_drag() {
         .iter()
         .any(|(p, _, _)| *p == CopyPane::JobLog));
 }
+
+/// The tail must stay pinned to the bottom even when lines wrap the
+/// way nix output does: a long unbroken /nix/store/… token gets moved
+/// wholly onto its own rows by the word-wrapper, which a width/w
+/// row estimate undercounts — each such line used to push the newest
+/// rows (where Shift+V anchors) below the viewport.
+#[test]
+fn job_log_tail_survives_word_wrapped_store_paths() {
+    let mut app = App::new(".".into(), nodes());
+    for i in 0..8 {
+        log_line(
+            &mut app,
+            &format!("copying path /nix/store/{}-{i}", "x".repeat(100)),
+            "alpha",
+        );
+    }
+    log_line(&mut app, "TAIL-MARK the newest line", "alpha");
+
+    let out = render(&mut app, 100, 30);
+    assert!(
+        out.contains("TAIL-MARK"),
+        "newest line clipped below the viewport: {out}"
+    );
+
+    // Shift+V anchors on that same newest line (filtered index 8 = the
+    // 9th entry) — the selection must be visible immediately, not
+    // after scrolling up.
+    app.visual_sel = Some(VisualSel {
+        mode: VisualMode::Line,
+        anchor: (8, 0),
+        cursor: (8, 0),
+    });
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+    terminal.draw(|f| ui::draw(f, &mut app)).expect("draw");
+    let buf = terminal.backend().buffer().clone();
+    let mut marked_row_has_bg = false;
+    for y in 0..30u16 {
+        let row: String = (0..100u16)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        if row.contains("TAIL-MARK") {
+            marked_row_has_bg = (0..100u16).any(|x| {
+                buf[(x, y)].bg != ratatui::style::Color::Reset && buf[(x, y)].symbol() != " "
+            });
+        }
+    }
+    assert!(
+        marked_row_has_bg,
+        "Shift+V anchor line is not visibly selected"
+    );
+}
