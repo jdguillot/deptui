@@ -387,6 +387,9 @@ pub struct AgentUi {
     /// History backfill has been requested for the current agent.
     pub backfilled: bool,
     tail_task: Option<JoinHandle<()>>,
+    /// When the tail was last (re)started — throttles the automatic
+    /// reconnect so a down agent isn't hammered with ssh attempts.
+    last_tail_start: Option<std::time::Instant>,
     /// Last op ack, shown in the view's footer.
     pub last_op: Option<String>,
     /// Two-step approval confirm: the (watch, host) awaiting the
@@ -422,6 +425,7 @@ impl AgentUi {
             log_focused: false,
             backfilled: false,
             tail_task: None,
+            last_tail_start: None,
             last_op: None,
             pending_approve: None,
             settings_error: settings.load_error.clone(),
@@ -1077,6 +1081,9 @@ impl App {
                     })
                 {
                     self.fetch_agent_status();
+                }
+                if self.agent.open {
+                    self.ensure_agent_tail();
                 }
             }
             AppEvent::Term(CtEvent::Key(key)) => self.handle_key(key),
@@ -3663,14 +3670,42 @@ resolve the paths so they can be seeded",
         });
     }
 
+    /// Restart the tail when its ssh stream has ended. The agent
+    /// restarts itself on updates (by design), which kills the SSE
+    /// stream and with it the one-shot tail — without this, the view
+    /// showed backfilled history and a running spinner while the
+    /// current run's lines silently went nowhere. Throttled to the
+    /// status heartbeat's cadence (20s while the agent is
+    /// unreachable), which is what calls it.
+    fn ensure_agent_tail(&mut self) {
+        let dead = match &self.agent.tail_task {
+            Some(task) => task.is_finished(),
+            None => false, // never started (no agents): nothing to revive
+        };
+        if !dead {
+            return;
+        }
+        let interval = if self.agent.error.is_some() { 20 } else { 5 };
+        if self
+            .agent
+            .last_tail_start
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(interval))
+        {
+            return;
+        }
+        self.start_agent_tail();
+    }
+
     fn start_agent_tail(&mut self) {
         self.stop_agent_tail();
         let Some((_, ssh)) = self.agent.current_agent() else {
             return;
         };
+        let ssh = ssh.to_string();
+        self.agent.last_tail_start = Some(std::time::Instant::now());
         let tx = self.status_tx.clone();
         let handle =
-            agentclient::spawn_tail(ssh.to_string(), self.askpass_env.clone(), move |line| {
+            agentclient::spawn_tail(ssh, self.askpass_env.clone(), move |line| {
                 // Best-effort: a full channel drops tail lines rather than
                 // blocking the reader (the history endpoint has the truth).
                 let _ = tx.try_send(StatusUpdate::AgentTail(line));
@@ -5690,6 +5725,40 @@ mod tests {
             !app.filtered_log_indices_for_job_log().contains(&idx),
             "marks still filter"
         );
+    }
+
+    /// A dead tail (the agent restarted itself — by design, on every
+    /// update) must be revived by the heartbeat, not stay silently
+    /// dead while the spinner shows a run the log never receives.
+    #[tokio::test]
+    async fn dead_agent_tail_is_restarted_by_the_heartbeat() {
+        let settings: crate::settings::Settings =
+            toml::from_str("[agents.box]\nssh = \"me@box\"\n").unwrap();
+        let mut app = App::with_settings(".".into(), sample_nodes(), settings);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        // Simulate the ssh stream ending: a finished task in the slot,
+        // last start far enough in the past to clear the throttle.
+        let done = tokio::spawn(async {});
+        while !done.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        app.agent.tail_task = Some(done);
+        app.agent.last_tail_start =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+
+        app.ensure_agent_tail();
+        let restarted_at = app.agent.last_tail_start.expect("tail restarted");
+        assert!(
+            restarted_at.elapsed() < std::time::Duration::from_secs(5),
+            "heartbeat must restart a finished tail"
+        );
+        assert!(app.agent.tail_task.is_some());
+
+        // A live tail is left alone.
+        let before = app.agent.last_tail_start;
+        app.ensure_agent_tail();
+        assert_eq!(before, app.agent.last_tail_start, "live tail untouched");
     }
 
     /// Each confirmed batch opens with a separator header, so a

@@ -10,6 +10,18 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.15.1] — 2026-09-06
+
+### Fixed
+
+- Agent view: the log tail reconnects when its ssh stream ends. The
+  agent restarts itself on updates (by design since 0.14.0), which
+  killed the one-shot tail — after any agent update the view showed
+  backfilled history and a live spinner while the current run's lines
+  went nowhere until the view was reopened. The status heartbeat now
+  revives a dead tail (throttled to 20s while the agent is
+  unreachable).
+
 ## [0.15.0] — 2026-09-06
 
 ### Added
