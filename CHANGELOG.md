@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.14.1] — 2026-09-06
+
 ### Fixed
 
 - The self-restart-on-update check restarted the agent once a minute,
