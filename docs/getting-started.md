@@ -123,7 +123,7 @@ name (that is what `nix build` *is*), so the deploy user could build
 their own "activate-rs" that execs a shell and sudo it. Pinning the
 exact hash instead is a chicken-and-egg: the deploy that would
 install next generation's rule needs the permission before it runs.
-So the honest choices are:
+So an agent-managed host has exactly two configurations:
 
 - **NOPASSWD `ALL` for a dedicated deploy user** — root-equivalent,
   but visible, auditable, and independently revocable (its own key,
@@ -132,20 +132,22 @@ So the honest choices are:
 - **`sshUser = "root"`** (with `PermitRootLogin prohibit-password`) —
   the same trust stated more plainly: one credential that *says* it
   is root, no sudo indirection at all.
-- **Keep sudo passworded and type it**: deploy-rs's
-  `--interactive-sudo` (the TUI's toggle `5`) prompts you per deploy
-  batch and feeds the password over a PTY. Fine for humans at the
-  TUI; the *agent* cannot use it — a headless daemon would have to
-  store that password in a file, and a stored reusable human
-  password is strictly *more* sensitive than a dedicated ssh key,
-  not less. deptui therefore rejects `interactive_sudo` in agent
-  config on purpose.
 
-Whichever you pick, the root-equivalence is inherent to unattended
-deployment — the design goal is keeping it visible, not pretending a
-wildcard contains it. deptui ships no option to write this rule
-because it belongs to the *target's* config (a different machine than
-the agent module manages).
+If neither is acceptable for some host, the consequence is simply
+that **that host cannot be agent-managed** — leave it out of the
+watches and deploy it from the TUI instead, where `--interactive-sudo`
+(toggle `5`) lets you keep passworded sudo and type it per deploy.
+(There is deliberately no "agent reads the sudo password from a
+file" mode: a stored, reusable human password is strictly more
+sensitive than a dedicated ssh key, so it would weaken your setup
+while pretending to harden it — agent config rejects
+`interactive_sudo` outright.)
+
+Either way, root-equivalence is inherent to unattended deployment —
+the design goal is keeping it visible, not pretending a wildcard
+contains it. deptui ships no option to write this rule because it
+belongs to the *target's* config (a different machine than the agent
+module manages).
 
 ### Check the chain
 

@@ -17,8 +17,9 @@ release is tagged `vX.Y.Z`.
   (they must match `deploy.nodes` names), and the sudo section now
   *explains* why store-path-scoped NOPASSWD is root anyway (any user
   can materialize a matching store path) and lays out the three
-  honest alternatives, including why `--interactive-sudo` is
-  human-only.
+  two real configurations — interactive sudo is framed as the
+  consequence of rejecting both (that host stays TUI-only), not as a
+  third agent option.
 
 ## [0.12.0] — 2026-09-06
 
