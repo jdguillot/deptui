@@ -51,6 +51,37 @@ nodes — self-deploys are safe) and needs three things: the module
 enabled with a watch, its ssh key authorized on the targets, and
 passwordless activation on the targets.
 
+How the pieces talk — you keep deploying directly whenever you want,
+and the agent deploys on its schedule; pressing `a` in the TUI
+remote-controls the agent over ssh:
+
+```mermaid
+flowchart LR
+    repo[("git repo<br/>watched branch")]
+
+    subgraph ws["your workstation"]
+        tui["deptui TUI"]
+    end
+
+    subgraph ah["agent-host (always on)"]
+        agent["deptui-agent daemon"]
+    end
+
+    subgraph fleet["fleet — deploy.nodes"]
+        web["web"]
+        db["db"]
+        more["..."]
+    end
+
+    tui -- "direct deploys<br/>(your ssh key)" --> web & db & more
+    tui -- "agent mode (a):<br/>ssh agent-host deptui-agent ..." --> agent
+    agent -- "polls on schedule<br/>(or kick / catch-up)" --> repo
+    agent -- "scheduled deploys<br/>(its own generated key)" --> web & db & more
+```
+
+(agent-host may itself be one of the fleet nodes — the module makes
+self-deploys survive their own activation.)
+
 ### Enable it
 
 ```nix
@@ -78,9 +109,20 @@ services.deptui-agent = {
 };
 ```
 
-Deploy the agent host. On first start the agent **generates its own
-ssh identity** — no secrets management; the private key never leaves
-the machine.
+Deploy the agent host:
+
+```bash
+# from your workstation:
+nixos-rebuild switch --flake .#<agent-host> \
+  --target-host <you>@<agent-host> --use-remote-sudo
+# …or on the agent host itself:
+sudo nixos-rebuild switch --flake .#<agent-host>
+# …or, once it's in deploy.nodes, the same way as everything else:
+deploy .#<agent-host>
+```
+
+On first start the agent **generates its own ssh identity** — no
+secrets management; the private key never leaves the machine.
 
 ### Authorize its key
 
@@ -174,6 +216,23 @@ whatever was deployed outside the repo). Approval is consumed by the
 next scheduled poll, kick, or catch-up — the agent never deploys the
 moment you approve. Pure-GitOps hosts can opt out with
 `bootstrap = "deploy"`.
+
+What one poll does per host:
+
+```mermaid
+flowchart TD
+    poll["poll fires<br/>(schedule / kick / offline catch-up)"] --> new{"host needs this<br/>revision?"}
+    new -- "no" --> idle["nothing to do"]
+    new -- "yes" --> first{"ever successfully deployed<br/>by this agent?"}
+    first -- "yes" --> up{"host answers ssh?"}
+    first -- "no — first encounter" --> probe{"already running the<br/>watched revision?"}
+    probe -- "yes" --> adopted["ADOPTED<br/>recorded, nothing pushed"]
+    probe -- "no" --> held["HELD + notify<br/>Enter / approve to hand over"]
+    held -. "approval is consumed<br/>by the NEXT round" .-> deploy
+    up -- "no" --> offline["OFFLINE: pending —<br/>re-probed until it returns"]
+    up -- "yes" --> deploy["deploy via deploy-rs"]
+    deploy --> outcome["ok — or failed:<br/>parked until a new revision"]
+```
 
 Also good to know: a host that is *down* when an update arrives is
 pending, not failed — the agent re-probes it and deploys when it

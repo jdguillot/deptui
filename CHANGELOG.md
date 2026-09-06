@@ -19,7 +19,9 @@ release is tagged `vX.Y.Z`.
   can materialize a matching store path) and lays out the three
   two real configurations — interactive sudo is framed as the
   consequence of rejecting both (that host stays TUI-only), not as a
-  third agent option.
+  third agent option. Mermaid diagrams for the topology (direct
+  deploys vs agent mode) and the per-host poll decision flow, plus
+  copy-paste nixos-rebuild/deploy commands for the agent host.
 
 ## [0.12.0] — 2026-09-06
 
