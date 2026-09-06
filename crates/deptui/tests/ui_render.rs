@@ -373,6 +373,7 @@ fn agent_status() -> deptui_core::agentwire::AgentStatus {
     AgentStatus {
         version: "0.1.0".into(),
         paused: false,
+        pubkey: None,
         watches: vec![WatchStatus {
             name: "infra".into(),
             repo: "git@example.com:me/infra.git".into(),

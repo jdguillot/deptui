@@ -10,6 +10,26 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-09-06
+
+### Fixed
+
+- `deptui-agent pubkey` over ssh reported the *invoking user's*
+  identity (or an error), not the agent's: the daemon now serves its
+  public key in `/status` and the verb asks it first, falling back to
+  local files only when no daemon answers — and tells you to restart
+  the service once if the running daemon predates key generation.
+
+### Added
+
+- Getting-started hardening from a real fresh-workflow walk:
+  a Prerequisites section (deploy-rs `deploy.nodes`, flakes, ssh),
+  the restart-once note for agents that were already running before
+  the update (activation deliberately doesn't restart them), and the
+  nixos-rebuild `--ask-elevate-password` caveat — including that the
+  hint also fires on any non-zero remote exit, with the two commands
+  that show whether the switch actually landed.
+
 ### Added
 
 - Getting-started: TUI-only flake install example, the agent

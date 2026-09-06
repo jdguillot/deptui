@@ -302,8 +302,26 @@ async fn main() -> Result<()> {
         }
         Command::Cancel => simple_post(&cli, "/cancel", &[]).await,
         Command::Pubkey { ref key } => {
-            let path = key.clone().unwrap_or_else(default_identity_path);
-            println!("{}", read_public_key(&path)?);
+            if let Some(path) = key {
+                println!("{}", read_public_key(path)?);
+                return Ok(());
+            }
+            // Ask the daemon first: over `ssh host deptui-agent pubkey`
+            // the invoking user's $HOME is NOT the agent's, so only the
+            // daemon can answer for its own identity.
+            let socket = socket_path(&cli);
+            if let Ok(status) = client::get_json::<wire::AgentStatus>(&socket, "/status").await {
+                if let Some(k) = status.pubkey {
+                    println!("{k}");
+                    return Ok(());
+                }
+                bail!(
+                    "the running agent has no default identity yet — restart it once \
+                     (the module generates the key at service start), or pass --key"
+                );
+            }
+            // No daemon: fall back to this user's own default identity.
+            println!("{}", read_public_key(&default_identity_path())?);
             Ok(())
         }
         Command::Tail => {

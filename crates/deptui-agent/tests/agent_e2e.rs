@@ -556,11 +556,21 @@ fn daemon_runs_and_answers_with_zero_watches() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no watches"));
 
-    // The daemon serves.
+    // The daemon serves — with its own HOME and identity, distinct
+    // from the invoking test process's.
+    let home = TempDir::new().unwrap();
+    fs::create_dir_all(home.path().join(".ssh")).unwrap();
+    let ok = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+        .arg(home.path().join(".ssh/id_ed25519"))
+        .status()
+        .unwrap();
+    assert!(ok.success());
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
         .arg("--config")
         .arg(&config_path)
         .arg("run")
+        .env("HOME", home.path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -581,6 +591,28 @@ fn daemon_runs_and_answers_with_zero_watches() {
     );
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(status["watches"].as_array().map(Vec::len), Some(0));
+
+    // `pubkey` must answer with the DAEMON's identity, not the
+    // invoking user's — over ssh those differ, which is the whole
+    // point of serving it through the socket.
+    let out = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("pubkey")
+        .env("HOME", "/nonexistent-caller-home")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let expected = fs::read_to_string(home.path().join(".ssh/id_ed25519.pub")).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        expected.trim(),
+        "pubkey must be the daemon's key"
+    );
 
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();

@@ -99,6 +99,8 @@ pub struct Daemon {
     pub log_tx: broadcast::Sender<String>,
     cmd_tx: mpsc::Sender<Cmd>,
     cmd_rx: mpsc::Receiver<Cmd>,
+    /// Our default identity's public half, read once at startup.
+    pubkey: Option<String>,
 }
 
 impl Daemon {
@@ -129,6 +131,11 @@ impl Daemon {
         }
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (log_tx, _) = broadcast::channel(1024);
+        let pubkey = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|h| h.join(".ssh/id_ed25519.pub"))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.trim().to_string());
         Ok(Self {
             cfg,
             state,
@@ -140,6 +147,7 @@ impl Daemon {
             log_tx,
             cmd_tx,
             cmd_rx,
+            pubkey,
         })
     }
 
@@ -399,6 +407,7 @@ impl Daemon {
         wire::AgentStatus {
             version: wire::AGENT_VERSION.to_string(),
             paused: self.state.paused,
+            pubkey: self.pubkey.clone(),
             watches,
         }
     }

@@ -5341,6 +5341,7 @@ mod tests {
         app.agent.status = Some(agentwire::AgentStatus {
             version: "0".into(),
             paused: false,
+            pubkey: None,
             watches: vec![agentwire::WatchStatus {
                 name: "w".into(),
                 repo: "r".into(),
@@ -5619,6 +5620,7 @@ mod tests {
         app.agent.status = Some(agentwire::AgentStatus {
             version: "0".into(),
             paused: false,
+            pubkey: None,
             watches: vec![agentwire::WatchStatus {
                 name: "w".into(),
                 repo: "r".into(),
@@ -5728,6 +5730,7 @@ mod tests {
         app.agent.status = Some(agentwire::AgentStatus {
             version: "0".into(),
             paused: false,
+            pubkey: None,
             watches: vec![agentwire::WatchStatus {
                 name: "infra".into(),
                 repo: "r".into(),

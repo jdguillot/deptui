@@ -11,6 +11,12 @@ pub struct AgentStatus {
     pub version: String,
     /// Global pause flag.
     pub paused: bool,
+    /// The agent's ssh public key (its default identity), when it has
+    /// one — what you authorize on the targets. Serving it over the
+    /// API means `deptui-agent pubkey` (and the TUI) report the
+    /// DAEMON's identity, not the invoking user's.
+    #[serde(default)]
+    pub pubkey: Option<String>,
     pub watches: Vec<WatchStatus>,
 }
 

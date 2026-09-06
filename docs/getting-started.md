@@ -3,6 +3,17 @@
 (Anything in `<angle-brackets>` below is yours to replace — e.g.
 `<agent-host>` is the hostname/IP of the machine running the agent.)
 
+## Prerequisites
+
+- **A flake with `deploy.nodes`** — deptui drives
+  [deploy-rs](https://github.com/serokell/deploy-rs); if your flake
+  doesn't define deploy-rs nodes yet, set that up first (deploy-rs's
+  README covers it). deptui does not need deploy-rs installed —
+  its packages wrap `deploy`, `nix`, and `ssh` themselves.
+- **Nix with flakes enabled** on your workstation (and NixOS on the
+  agent host if you want the agent module).
+- **SSH access** to your hosts as the `sshUser` your nodes declare.
+
 Two pieces — the TUI stands alone; the agent is optional on top:
 
 - **`deptui`** — a terminal UI for [deploy-rs](https://github.com/serokell/deploy-rs):
@@ -122,7 +133,13 @@ deptui .
 # …or plain nixos-rebuild from your workstation:
 nixos-rebuild switch --flake .#<agent-host> \
   --target-host <you>@<agent-host> --use-remote-sudo
-#   (newer nixos-rebuild spells the last flag --elevate=sudo)
+#   (newer nixos-rebuild spells the last flag --elevate=sudo; if the
+#    target's sudo asks for a password, add --ask-elevate-password.
+#    Caveat: nixos-rebuild also prints the --ask-elevate-password hint
+#    whenever the remote command exits non-zero for ANY reason — if you
+#    got a wall of activation output first, the switch likely landed:
+#    check `readlink /run/current-system` and `systemctl --failed`
+#    on the target before re-running.)
 # …or on the agent host itself:
 sudo nixos-rebuild switch --flake .#<agent-host>
 # …or raw deploy-rs:
@@ -131,6 +148,13 @@ deploy .#<agent-host>
 
 On first start the agent **generates its own ssh identity** — no
 secrets management; the private key never leaves the machine.
+
+> Already had the agent running before this update? Its service
+> deliberately isn't restarted by activation (`restartOnUpdate =
+> false`, the self-deploy protection), so run
+> `sudo systemctl restart deptui-agent` once to let first-start
+> generation happen — `deptui-agent pubkey` will tell you exactly
+> this if the key is missing.
 
 ### Authorize its key
 
