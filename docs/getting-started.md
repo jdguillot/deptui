@@ -112,9 +112,14 @@ services.deptui-agent = {
 Deploy the agent host:
 
 ```bash
+# All of these run against YOUR infra flake (the one with
+# nixosConfigurations) — cd there first, or spell the path instead
+# of `.` (e.g. --flake ~/infra#<agent-host>).
+
 # from your workstation:
 nixos-rebuild switch --flake .#<agent-host> \
   --target-host <you>@<agent-host> --use-remote-sudo
+#   (newer nixos-rebuild spells the last flag --elevate=sudo)
 # …or on the agent host itself:
 sudo nixos-rebuild switch --flake .#<agent-host>
 # …or, once it's in deploy.nodes, the same way as everything else:
