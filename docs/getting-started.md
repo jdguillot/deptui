@@ -299,25 +299,103 @@ services.deptui-agent.settings.notify = {
 Failures (and holds) always notify; start/success are opt-in via
 `events`.
 
-### Kick from CI (optional)
+### The kick listener (optional)
+
+By default the agent only *polls* — a push can wait up to a full
+`interval` before anything happens. A **kick** collapses that
+latency: something tells the agent "check now" the moment a push
+lands, so you can keep `interval` long (a slow safety net) and still
+get near-instant deploys. Kicks are deliberately boring: they name no
+refs and deploy nothing that polling wouldn't — worst case, a leaked
+credential triggers a check of a repo you already trust.
+
+Two transports, pick per caller:
+
+- **ssh** — no token, no open port. Right answer whenever the caller
+  can hold an ssh key (your shell, a self-hosted runner):
+
+  ```bash
+  ssh <agent-host> deptui-agent kick --watch infra
+  ```
+
+- **the TCP listener** — for callers that can only speak HTTP (e.g.
+  GitHub-hosted Actions with no ssh path into your network). It
+  serves *only* `POST /kick` and `GET /status`, behind a bearer
+  token; the full control surface never leaves the Unix socket.
+
+#### Enabling the listener
+
+Generate a token (any long random string):
+
+```bash
+openssl rand -hex 32
+```
+
+The token reaches the agent **by file path only** — never write it
+inline in your Nix config; anything in the config lands
+world-readable in `/nix/store`.
+
+**With sops-nix (recommended)** — add the token to your secrets file
+(`sops secrets/secrets.yaml`, new key `deptui-agent-listen-token`),
+then:
 
 ```nix
+sops.secrets."deptui-agent-listen-token" = {
+  # the service user must be able to read it:
+  owner = config.services.deptui-agent.user;
+  mode = "0400";
+  restartUnits = [ "deptui-agent.service" ];
+};
+
 services.deptui-agent = {
-  listen = { enable = true; port = 7337; tokenFile = "/run/secrets/kick-token"; };
-  openFirewall = true;
+  listen = {
+    enable = true;
+    port = 7337;
+    tokenFile = config.sops.secrets."deptui-agent-listen-token".path;
+  };
+  openFirewall = true;   # or route it through your reverse proxy
 };
 ```
 
+**Without sops** — put the file on the agent host by hand and point
+at it:
+
+```bash
+ssh <agent-host> "sudo install -o deptui-agent -g deptui-agent -m 400 \
+  <(openssl rand -hex 32) /var/lib/deptui-agent/listen-token"
+```
+
+```nix
+services.deptui-agent.listen = {
+  enable = true;
+  port = 7337;
+  tokenFile = "/var/lib/deptui-agent/listen-token";
+};
+```
+
+Either way: the token is read at service start, so after *rotating*
+it, restart the unit (the idle self-restart won't notice — the
+binary didn't change).
+
+#### Calling it
+
 ```yaml
-# GitHub Actions, after push
+# GitHub Actions, after push. Store the token as a repo secret
+# (Settings → Secrets); with sops you can read it out for pasting:
+#   sops -d --extract '["deptui-agent-listen-token"]' secrets/secrets.yaml
 - run: |
     curl -fsS -X POST \
       -H "Authorization: Bearer ${{ secrets.DEPTUI_KICK_TOKEN }}" \
-      "https://<agent-host>:7337/kick?watch=infra"
+      "http://<agent-host>:7337/kick?watch=infra"
 ```
 
-The TCP listener serves *only* kick + status; the full control
-surface never leaves the group-gated Unix socket. (`ssh <agent-host> deptui-agent kick` works too, with no open port at all.)
+> [!WARNING]
+> The listener speaks **plain HTTP** — on a trusted LAN or over a
+> VPN/tailnet that's fine, but across the internet the bearer token
+> would travel in cleartext. Put a TLS-terminating reverse proxy or
+> tunnel in front (traefik, caddy, cloudflared) and point CI at the
+> `https://` name it provides; keep `openFirewall = false` in that
+> case so only the proxy reaches the port.
 
 ## Troubleshooting one-liners
 

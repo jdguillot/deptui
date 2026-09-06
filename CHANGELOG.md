@@ -10,6 +10,16 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- Getting-started: the kick listener has a real section — why kicks
+  (long interval + instant deploys), ssh vs TCP transport choice,
+  token generation, storage with and without sops (full sops-nix
+  snippet incl. owner/restartUnits), rotation needing a unit restart,
+  and a warning that the listener is plain HTTP (put TLS in front
+  across the internet — the old example's `https://` was aspirational
+  and has been corrected).
+
 ## [0.14.0] — 2026-09-06
 
 ### Added
