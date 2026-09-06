@@ -838,11 +838,49 @@ impl Daemon {
             });
         }
         if hosts.is_empty() {
+            let short = &rev[..rev.len().min(12)];
             if changed {
-                tracing::info!(
-                    "watch {watch}: {} needs no deploys",
-                    &rev[..rev.len().min(12)]
-                );
+                tracing::info!("watch {watch}: {short} needs no deploys");
+            }
+            // A kick that ends in "nothing to do" must say so in the
+            // tail — an ack in the footer plus a silent log reads as a
+            // dead button in the TUI. Scheduled polls stay quiet
+            // unless the head actually moved.
+            if trigger != "poll" || changed {
+                let ws = self.state.watches.get(watch);
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(wcfg) = self.watch_cfg(watch) {
+                    for name in wcfg.hosts.keys() {
+                        let Some(hs) = ws.and_then(|w| w.hosts.get(name)) else {
+                            continue;
+                        };
+                        let at = |s: &Option<crate::state::Stamp>| {
+                            s.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str())
+                        };
+                        let why = if hs.paused {
+                            "paused"
+                        } else if at(&hs.deployed) {
+                            "already deployed"
+                        } else if hs.failed.as_ref().map(|s| s.rev.as_str())
+                            == Some(rev.as_str())
+                        {
+                            "parked at this revision (approve, or push a new commit)"
+                        } else if at(&hs.held) {
+                            "held (approve to let the next round deploy)"
+                        } else {
+                            continue;
+                        };
+                        parts.push(format!("{name}: {why}"));
+                    }
+                }
+                let detail = if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", parts.join("; "))
+                };
+                let _ = self
+                    .log_tx
+                    .send(format!("[{watch}] {trigger}: {short} needs no deploys{detail}"));
             }
             self.save_state();
             return;

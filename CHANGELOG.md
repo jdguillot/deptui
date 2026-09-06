@@ -10,6 +10,18 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.14.4] — 2026-09-06
+
+### Fixed
+
+- A kick (or any non-scheduled trigger) that ends in "nothing to do"
+  now says so in the log tail, with the per-host reason — "parked at
+  this revision (approve, or push a new commit)", "held", "already
+  deployed", "paused". Before, the decision went only to the journal:
+  the TUI acked the kick and then showed nothing at all, which read
+  as a dead button exactly when a host was parked. Quiet scheduled
+  polls stay quiet.
+
 ## [0.14.3] — 2026-09-06
 
 ### Fixed
