@@ -390,6 +390,16 @@ binary didn't change).
       "http://<agent-host>:7337/kick?watch=infra"
 ```
 
+With a **self-hosted runner** inside your network, skip the listener
+entirely and use the ssh transport — no token, no open port:
+
+```yaml
+# The runner's user needs: an ssh key authorized on <agent-host> for
+# a user in services.deptui-agent.users (that grants socket access),
+# and the host key trusted (pin it, or accept-new on first use).
+- run: ssh -o BatchMode=yes <you>@<agent-host> deptui-agent kick --watch infra
+```
+
 > [!WARNING]
 > The listener speaks **plain HTTP** — on a trusted LAN or over a
 > VPN/tailnet that's fine, but across the internet the bearer token
