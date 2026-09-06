@@ -288,7 +288,7 @@ pub async fn execute(
                 log(
                     &mut record,
                     format!(
-                        "[{}] {host}: HELD — {message} (deptui-agent deploy {host} adopts it)",
+                        "[{}] {host}: HELD — {message} (deptui-agent approve {host} lets the next round deploy it)",
                         watch.name
                     ),
                 );

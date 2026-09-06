@@ -521,6 +521,43 @@ fn cancel_stops_a_running_deploy_and_parks_the_host() {
         "same-revision kick after cancel must not redeploy"
     );
 
+    // Approval lifts the park: it buys exactly one more round at this
+    // revision (there is no separate force-deploy). Swap the shim for
+    // a fast success first — the hanging one served its purpose.
+    fs::write(
+        &deploy,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}\nexit 0\n",
+            env.deploy_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&deploy, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = agent(&env, &["approve", "web", "--watch", "infra"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = agent(&env, &["kick"]);
+    assert!(out.status.success());
+    {
+        let env = &env;
+        wait_for(
+            "approved redeploy after cancel",
+            Box::new(move || {
+                let out = agent(env, &["status", "--json"]);
+                let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                status["watches"][0]["hosts"][0]["deployed_rev"].is_string()
+            }),
+        );
+    }
+    assert_eq!(
+        deploy_calls(&env).len(),
+        calls_before + 1,
+        "the approved round redeploys exactly once"
+    );
+
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();
 }

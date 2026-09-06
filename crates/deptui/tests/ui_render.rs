@@ -462,6 +462,59 @@ fn agent_view_renders_status_and_tail() {
     );
 }
 
+/// The footer hint strip must stack at hint boundaries on narrow
+/// windows — a fixed 3-row footer clipped everything past the first
+/// wrapped row, so the later hints (q:close included) went off screen.
+#[test]
+fn agent_footer_hints_stack_on_narrow_windows() {
+    let mut app = app_with_agent();
+    app.agent.open = true;
+    app.agent.status = Some(agent_status());
+    for (w, h) in [(120u16, 40u16), (80, 24)] {
+        let out = render(&mut app, w, h);
+        for hint in ["Tab:log/watches", "Enter:approve", "r:refresh", "q:close"] {
+            assert!(out.contains(hint), "hint `{hint}` clipped at {w}x{h}: {out}");
+        }
+    }
+}
+
+/// The approval warning wraps on narrow windows; both keys of the
+/// two-step confirm must stay visible.
+#[test]
+fn agent_approval_warning_survives_narrow_windows() {
+    let mut app = app_with_agent();
+    app.agent.open = true;
+    app.agent.status = Some(agent_status());
+    app.agent.pending_approve = Some(("infra".into(), "beta".into()));
+    let out = render(&mut app, 80, 24);
+    assert!(out.contains("confirms"), "Enter hint clipped: {out}");
+    assert!(out.contains("cancels"), "Esc hint clipped: {out}");
+}
+
+/// An approved host must *look* approved even while a failed/cancelled
+/// stamp is present — the `!` glyph outranking `↑` made approving a
+/// cancelled host look like a dead key.
+#[test]
+fn agent_approved_cancelled_host_shows_the_approval() {
+    let mut app = app_with_agent();
+    app.agent.open = true;
+    let mut status = agent_status();
+    {
+        let beta = &mut status.watches[0].hosts[1];
+        beta.failed_message = Some("cancelled by user".into());
+        beta.held_rev = Some("abcdef1234567890".into());
+        beta.approved = true;
+    }
+    app.agent.status = Some(status);
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("↑ beta"), "approved glyph missing: {out}");
+    // The row can wrap mid-phrase; the word itself must be visible.
+    assert!(
+        out.contains("approved"),
+        "approved state text missing: {out}"
+    );
+}
+
 #[test]
 fn agent_view_survives_empty_status_and_errors() {
     let mut app = app_with_agent();

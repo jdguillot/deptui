@@ -3305,13 +3305,113 @@ fn short_rev(rev: &str) -> &str {
 /// The full-screen agent view: connection header, watch/host listing
 /// with runtime controls, and the live run-log tail. Replaces the main
 /// layout while [`App::agent`] is open; popups still draw on top.
+/// The agent footer's key hints, in display order. Cycling agents
+/// means nothing with a single one configured — advertising a dead
+/// key was its own bug report.
+fn agent_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut hints = vec![
+        ("Tab", "log/watches"),
+        ("j/k", "select/scroll"),
+        ("Space", "mark filter"),
+        ("u", "kick"),
+        ("x", "cancel run"),
+        ("p", "pause host"),
+        ("P", "pause agent"),
+        ("Enter", "approve"),
+        ("/", "search"),
+        ("v/V", "select text"),
+        ("r", "refresh"),
+    ];
+    if app.agent.agents.len() > 1 {
+        hints.push(("[/]", "agent"));
+    }
+    hints.push(("q", "close"));
+    hints
+}
+
+/// Pack the hints onto rows at hint boundaries — the agent-view
+/// analogue of `layout_commands`. A single wrapped `Line` was clipped
+/// by the footer's fixed 3-row height on narrow windows, pushing the
+/// later hints off screen; the strip must grow instead.
+fn layout_agent_hints(
+    hints: &[(&'static str, &'static str)],
+    inner_w: usize,
+) -> Vec<Vec<(&'static str, &'static str)>> {
+    let mut rows: Vec<Vec<(&'static str, &'static str)>> = vec![Vec::new()];
+    let mut pos = 1usize; // leading pad
+    for &(key, label) in hints {
+        let visible = key.len() + 1 + label.len(); // "key:label"
+        let row_full = {
+            let row = rows.last().expect("starts non-empty");
+            !row.is_empty() && pos + visible > inner_w
+        };
+        if row_full {
+            rows.push(Vec::new());
+            pos = 1;
+        }
+        rows.last_mut().expect("just ensured").push((key, label));
+        pos += visible + 2; // two-space separator
+    }
+    rows
+}
+
+/// Rows a word-wrapped paragraph needs at `width` — the same greedy
+/// break ratatui's `Wrap` makes, measured *before* the layout split so
+/// the approval warning gets rows instead of being clipped. Callers
+/// pass a slightly narrower width than the render: the estimate and
+/// the real wrapper can disagree by a column or two around preserved
+/// whitespace, and a spare blank row beats a clipped word.
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        let mut w = word.chars().count();
+        let sep = usize::from(col > 0);
+        if col + sep + w <= width {
+            col += sep + w;
+            continue;
+        }
+        rows += 1;
+        while w > width {
+            rows += 1;
+            w -= width;
+        }
+        col = w;
+    }
+    rows
+}
+
 fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
+    // Footer height first: the hint strip stacks at hint boundaries
+    // and the approval warning wraps — both need real rows.
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let hint_rows = layout_agent_hints(&agent_hints(app), inner_w);
+    let mut op_own_row = false;
+    let footer_rows = if let Some((watch, host)) = &app.agent.pending_approve {
+        let warn = approve_warning_line(watch, host);
+        let text: String = warn.spans.iter().map(|s| s.content.as_ref()).collect();
+        wrapped_rows(&text, inner_w.saturating_sub(4))
+    } else {
+        let mut rows = hint_rows.len();
+        if let Some(op) = &app.agent.last_op {
+            let last_w = 1 + hint_rows
+                .last()
+                .map(|r| r.iter().map(|(k, l)| k.len() + 1 + l.len() + 2).sum::<usize>())
+                .unwrap_or(0);
+            if last_w + 2 + op.chars().count() > inner_w {
+                op_own_row = true;
+                rows += 1;
+            }
+        }
+        rows
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(footer_rows as u16 + 2),
         ])
         .split(area);
 
@@ -3394,34 +3494,7 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
         // The approval warning owns the footer until confirmed or
         // dismissed — this is the moment the user accepts moving the
         // host off its out-of-band generation.
-        let warn = Line::from(vec![
-            Span::styled(
-                " ⚠ approve ",
-                Style::default()
-                    .fg(theme::ON_ACCENT)
-                    .bg(theme::WARNING)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    " next round moves {host} ({watch}) off its current generation — the \
-                     one made outside the watched repo. ",
-                    host = host,
-                    watch = watch
-                ),
-                Style::default().fg(theme::WARNING),
-            ),
-            Span::styled(
-                "Enter",
-                Style::default().fg(theme::KEY).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" confirms  ", Style::default().fg(theme::MUTED)),
-            Span::styled(
-                "Esc",
-                Style::default().fg(theme::KEY).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" cancels", Style::default().fg(theme::MUTED)),
-        ]);
+        let warn = approve_warning_line(watch, host);
         let foot_block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::WARNING));
@@ -3431,46 +3504,65 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let mut foot: Vec<Span> = vec![Span::raw(" ")];
-    let mut hint = |key: &'static str, label: &'static str| {
-        foot.push(Span::styled(key, Style::default().fg(theme::KEY)));
-        foot.push(Span::styled(
-            format!(":{label}  "),
-            Style::default().fg(theme::MUTED),
-        ));
-    };
-    hint("Tab", "log/watches");
-    hint("j/k", "select/scroll");
-    hint("Space", "mark filter");
-    hint("u", "kick");
-    hint("x", "cancel run");
-    hint("p", "pause host");
-    hint("P", "pause agent");
-    hint("Enter", "approve");
-    hint("/", "search");
-    hint("v/V", "select text");
-    hint("r", "refresh");
-    // Cycling agents means nothing with a single one configured —
-    // advertising a dead key was its own bug report.
-    if app.agent.agents.len() > 1 {
-        hint("[/]", "agent");
-    }
-    hint("q", "close");
+    let mut foot_lines: Vec<Line> = hint_rows
+        .iter()
+        .map(|row| {
+            let mut spans: Vec<Span> = vec![Span::raw(" ")];
+            for (key, label) in row {
+                spans.push(Span::styled(*key, Style::default().fg(theme::KEY)));
+                spans.push(Span::styled(
+                    format!(":{label}  "),
+                    Style::default().fg(theme::MUTED),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
     if let Some(op) = &app.agent.last_op {
-        foot.push(Span::styled(
-            format!("│ {op}"),
-            Style::default().fg(theme::ACCENT),
-        ));
+        let op_span = Span::styled(format!("│ {op}"), Style::default().fg(theme::ACCENT));
+        if op_own_row {
+            foot_lines.push(Line::from(vec![Span::raw(" "), op_span]));
+        } else if let Some(last) = foot_lines.last_mut() {
+            last.spans.push(op_span);
+        }
     }
     let foot_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::MUTED));
     let foot_inner = foot_block.inner(chunks[2]);
     frame.render_widget(foot_block, chunks[2]);
-    frame.render_widget(
-        Paragraph::new(Line::from(foot)).wrap(Wrap { trim: false }),
-        foot_inner,
-    );
+    frame.render_widget(Paragraph::new(foot_lines), foot_inner);
+}
+
+/// The two-step approval confirmation. One builder for both the
+/// pre-split height measurement and the render, so they can't drift.
+fn approve_warning_line(watch: &str, host: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            " ⚠ approve ",
+            Style::default()
+                .fg(theme::ON_ACCENT)
+                .bg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                " next round moves {host} ({watch}) off its current generation — the \
+                 one made outside the watched repo. "
+            ),
+            Style::default().fg(theme::WARNING),
+        ),
+        Span::styled(
+            "Enter",
+            Style::default().fg(theme::KEY).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" confirms  ", Style::default().fg(theme::MUTED)),
+        Span::styled(
+            "Esc",
+            Style::default().fg(theme::KEY).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cancels", Style::default().fg(theme::MUTED)),
+    ])
 }
 
 fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
@@ -3671,10 +3763,13 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 row_idx += 1;
 
                 // Glyph carries the state (colour reinforces).
-                let (glyph, style) = if h.failed_rev.is_some() {
-                    ("!", Style::default().fg(theme::ERROR))
-                } else if h.approved && h.deployed_rev.is_none() {
+                // The standing approval outranks the parked states it
+                // unlocks — approving a cancelled host otherwise left
+                // `!` in place with no sign the approval registered.
+                let (glyph, style) = if h.approved && h.deployed_rev.is_none() {
                     ("↑", Style::default().fg(theme::ACCENT))
+                } else if h.failed_rev.is_some() {
+                    ("!", Style::default().fg(theme::ERROR))
                 } else if h.held_rev.is_some() {
                     ("≠", Style::default().fg(theme::WARNING))
                 } else if h.offline_rev.is_some() {
@@ -3750,7 +3845,7 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 if let Some(rev) = &h.held_rev {
                     seg(
                         format!(
-                            "HELD {} — target differs from repo; d adopts",
+                            "HELD {} — target differs from repo; Enter approves",
                             short_rev(rev)
                         ),
                         Style::default()
@@ -3774,6 +3869,15 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                     seg(
                         format!("unreachable: {u}"),
                         Style::default().fg(theme::ERROR),
+                        &mut state,
+                    );
+                }
+                // Text, not just the glyph: colour is never the only
+                // signal, and neither is a single symbol.
+                if h.approved && h.deployed_rev.is_none() {
+                    seg(
+                        "approved — takes the next round".into(),
+                        Style::default().fg(theme::ACCENT),
                         &mut state,
                     );
                 }
@@ -3926,5 +4030,38 @@ mod tests {
         let text = joined_text(&segments);
         assert!(text.contains("12.9 GiB"));
         assert!(text.contains("delta +320.0 KiB"));
+    }
+
+    #[test]
+    fn agent_hints_pack_at_hint_boundaries() {
+        let hints = [("Tab", "log/watches"), ("j/k", "scroll"), ("q", "close")];
+        // Wide: everything on one row.
+        let rows = layout_agent_hints(&hints, 80);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 3);
+        // Narrow: no hint is split mid-text, every hint survives.
+        let rows = layout_agent_hints(&hints, 18);
+        assert!(rows.len() > 1);
+        let total: usize = rows.iter().map(Vec::len).sum();
+        assert_eq!(total, 3, "packing must not drop hints: {rows:?}");
+        for row in &rows {
+            let w: usize = row
+                .iter()
+                .map(|(k, l)| k.len() + 1 + l.len() + 2)
+                .sum::<usize>()
+                + 1;
+            // Trailing separator spaces may hang past the edge; the
+            // visible text must not.
+            assert!(w - 2 <= 18, "row overflows: {row:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_rows_measures_greedy_word_wrap() {
+        assert_eq!(wrapped_rows("one two", 20), 1);
+        assert_eq!(wrapped_rows("one two three", 7), 2);
+        // A word longer than the width spills across rows, never 0.
+        assert!(wrapped_rows("abcdefghijklmnop", 4) >= 4);
+        assert_eq!(wrapped_rows("", 10), 1);
     }
 }

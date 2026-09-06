@@ -539,16 +539,18 @@ Key invariants worth knowing before touching the code:
   Don't hand `&mut` state to a spawned task.
 - **Offline ≠ failed.** A host down at deploy time gets outcome
   `offline` (pending, re-probed at `offline_recheck`, deployed on
-  return); a real deploy failure parks the host until a new revision.
-  Keep the two paths distinct — collapsing them re-introduces either
-  retry storms or missed catch-ups.
+  return); a real deploy failure parks the host until a new revision
+  or an approval. Keep the two paths distinct — collapsing them
+  re-introduces either retry storms or missed catch-ups.
 - **First encounter = adopt, not deploy.** A host with no recorded
   deploy history is probed (`check_profile_up_to_date` per selected
   profile): identical → outcome `adopted` (recorded as deployed);
   different or unprobeable → outcome `held` (notify fires; parked at
   that rev; a *new* rev re-probes). Only an approval (`approve` verb /
-  `y` in the view — consumed by the NEXT round, never an immediate
-  deploy; the agent has no force-deploy) or `bootstrap = "deploy"`
+  Enter in the view — consumed by the NEXT round it unlocks, success
+  or failure, never an immediate deploy; approval is also the only
+  way past a failed/cancelled park at the same rev — the agent has no
+  separate force-deploy) or `bootstrap = "deploy"`
   deploys a first-encounter host — this is the guard
   against a fresh agent rolling hosts back to a stale repo. The
   daemon's first poll also waits for the cadence: starting the agent

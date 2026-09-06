@@ -520,7 +520,11 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                 if hs.paused
                     || same(&hs.deployed)
                     || (!hs.approved && same(&hs.held))
-                    || hs.failed.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str())
+                    // Approval buys one round past a failed/cancelled
+                    // park too (consumed by that round's outcome) —
+                    // same rule as the daemon.
+                    || (!hs.approved
+                        && hs.failed.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str()))
                 {
                     return None;
                 }
@@ -579,6 +583,8 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                         message: hr.message.clone().unwrap_or_default(),
                     });
                     hs.offline = None;
+                    // The approval bought this round, success or not.
+                    hs.approved = false;
                 }
                 "offline" => {
                     hs.offline = Some(state::OfflineStamp {
@@ -594,6 +600,7 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                         message: hr.message.clone().unwrap_or_else(|| "cancelled".into()),
                     });
                     hs.offline = None;
+                    hs.approved = false;
                 }
                 _ => {}
             }

@@ -10,6 +10,26 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Agent view: the footer key hints now stack onto extra rows on
+  narrow windows instead of being clipped by the fixed 3-row footer
+  (the later hints, `q:close` included, went off screen). The
+  approval warning footer grows with its wrapped text the same way.
+- Agent view: a host parked by a cancel/failure that you then approve
+  now *shows* the approval — the `↑` glyph and an "approved — takes
+  the next round" segment — instead of an unchanging `!`.
+- Approving a host parked by a failed or cancelled deploy at the tip
+  revision actually works now: the approval buys exactly one more
+  round at that revision (consumed by that round's outcome, success
+  or failure, so a persistent failure cannot retry-storm). Before,
+  the failed-at-this-revision skip ran unconditionally, and such a
+  host was stuck until a new commit — the "force-deploy" the cancel
+  message referred to did not exist.
+- The HELD hint named a `d` key (TUI) and a `deptui-agent deploy`
+  verb (run log) that don't exist; both now point at the real
+  gesture: Enter / `deptui-agent approve`.
+
 ## [0.14.1] — 2026-09-06
 
 ### Fixed

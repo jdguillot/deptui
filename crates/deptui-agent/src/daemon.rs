@@ -812,8 +812,12 @@ impl Daemon {
                 continue;
             }
             // No same-commit retry: a host that failed at this revision
-            // waits for a new one (or a force-deploy).
-            if hs.failed.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str()) {
+            // waits for a new one — unless the human approved, which
+            // buys exactly one more round (consumed by that round's
+            // outcome, so a persistent failure can't retry-storm).
+            // Without this, a host cancelled at the tip revision was
+            // stuck: approve did nothing and no force-deploy exists.
+            if !hs.approved && hs.failed.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str()) {
                 continue;
             }
             // Held at this revision: the human hasn't blessed the agent
@@ -924,6 +928,7 @@ impl Daemon {
                         hs.failed = None;
                         hs.offline = None;
                         hs.held = None;
+                        hs.approved = false;
                     }
                     "held" => {
                         hs.held = Some(Stamp {
@@ -938,6 +943,9 @@ impl Daemon {
                             message: hr.message.clone().unwrap_or_default(),
                         });
                         hs.offline = None;
+                        // The approval bought this round; a standing ok
+                        // surviving a failure would retry every poll.
+                        hs.approved = false;
                     }
                     "offline" => {
                         hs.offline = Some(crate::state::OfflineStamp {
@@ -956,6 +964,7 @@ impl Daemon {
                             message: hr.message.clone().unwrap_or_else(|| "cancelled".into()),
                         });
                         hs.offline = None;
+                        hs.approved = false;
                     }
                     _ => {}
                 }
