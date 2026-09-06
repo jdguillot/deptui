@@ -18,7 +18,7 @@ mod runner;
 mod state;
 mod wire;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -120,6 +120,13 @@ enum Command {
     /// whole process group; the run's hosts stay parked at that
     /// revision until a new one, a kick after it, or a force-deploy).
     Cancel,
+    /// Print the agent's public ssh key — the half you authorize on
+    /// the targets. Reads the generated identity by default.
+    Pubkey {
+        /// Private (or .pub) key path. Defaults to ~/.ssh/id_ed25519.
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
     /// Stream the daemon's live run log (NDJSON-ish plain lines).
     Tail,
 }
@@ -294,6 +301,11 @@ async fn main() -> Result<()> {
             simple_post(&cli, "/approve", &params).await
         }
         Command::Cancel => simple_post(&cli, "/cancel", &[]).await,
+        Command::Pubkey { ref key } => {
+            let path = key.clone().unwrap_or_else(default_identity_path);
+            println!("{}", read_public_key(&path)?);
+            Ok(())
+        }
         Command::Tail => {
             let socket = socket_path(&cli);
             client::tail(&socket, |line| println!("{line}")).await
@@ -580,12 +592,76 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
     Ok(())
 }
 
+fn default_identity_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/deptui-agent"));
+    home.join(".ssh/id_ed25519")
+}
+
+/// The public half of `path` (which may name the private key or its
+/// `.pub`), with the failure modes that bite headless agents named:
+/// missing, unreadable, passphrase-protected.
+fn read_public_key(path: &Path) -> Result<String> {
+    let pub_path = if path.extension().is_some_and(|e| e == "pub") {
+        path.to_path_buf()
+    } else {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".pub");
+        PathBuf::from(p)
+    };
+    if let Ok(text) = std::fs::read_to_string(&pub_path) {
+        return Ok(text.trim().to_string());
+    }
+    // No .pub alongside — derive from the private key, which also
+    // detects the passphrase trap.
+    let out = std::process::Command::new("ssh-keygen")
+        .args(["-y", "-P", "", "-f"])
+        .arg(path)
+        .output()
+        .context("running ssh-keygen")?;
+    if !out.status.success() {
+        if !path.exists() {
+            bail!(
+                "no key at {} — the NixOS module generates one at first start \
+                 (generateSshKey), or point --key at your identity",
+                path.display()
+            );
+        }
+        bail!(
+            "cannot derive the public key from {} — it is passphrase-protected \
+             or unreadable. A headless agent cannot use a passphrase-protected \
+             key; strip it with: ssh-keygen -p -N \"\" -f {}",
+            path.display(),
+            path.display()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// `validate`: resolve each watch's current revision, discover its
 /// nodes, and probe every configured host non-interactively.
 async fn validate(cli: &Cli, state_dir: Option<PathBuf>) -> Result<()> {
     let cfg = load_config(cli, state_dir)?;
     require_watches(cli, &cfg)?;
     let mut failures = 0u32;
+    // Local identity first: a broken key fails every probe below with
+    // an unhelpful "Permission denied" — name the real problem here.
+    let id_path = default_identity_path();
+    match read_public_key(&id_path) {
+        Ok(key) => println!(
+            "identity {}: ok — authorize this on targets:\n  {key}",
+            id_path.display()
+        ),
+        Err(e) if id_path.exists() => {
+            eprintln!("identity {}: {e:#}", id_path.display());
+            failures += 1;
+        }
+        Err(_) => println!(
+            "identity: none at {} (fine if sshKeyFile or your ssh config provides one)",
+            id_path.display()
+        ),
+    }
     for w in &cfg.watches {
         let rev = match gitwatch::ls_remote(&w.repo, &w.refspec()).await {
             Ok(Some(rev)) => rev,

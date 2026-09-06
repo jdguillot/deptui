@@ -10,6 +10,26 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-09-05
+
+### Added
+
+- Zero-secret agent identity: with no `sshKeyFile`, the NixOS module
+  generates an ed25519 keypair in the agent's state dir on first
+  start (`generateSshKey`, default on, dedicated user only) — the
+  private half never leaves the machine, so no sops plumbing at all.
+  `deptui-agent pubkey` prints the half you authorize on targets (and
+  names the passphrase trap when pointed at a locked key).
+- `hostKeyChecking` module option, default `accept-new`: targets are
+  trusted on first contact and pinned thereafter — no manual
+  known_hosts step; changed keys are still rejected. `strict`
+  restores require-pre-pinning for fleets that pin declaratively.
+- `validate` now diagnoses the local identity first (missing /
+  passphrase-protected / ok, printing the public key to authorize),
+  so a broken key names itself instead of failing every probe with
+  "Permission denied".
+- README: the three-step identity quickstart.
+
 ## [0.10.2] — 2026-09-05
 
 ### Fixed

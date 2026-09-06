@@ -66,8 +66,10 @@
             nativeBuildInputs = [
               pkgs.pkg-config
               pkgs.makeWrapper
-              # The agent's tests drive real `git` repositories.
+              # The agent's tests drive real `git` repositories and
+              # generate real ssh keys.
               pkgs.git
+              pkgs.openssh
             ];
             buildInputs = [ pkgs.openssl ];
 

@@ -219,6 +219,28 @@ url = "https://ntfy.sh/my-topic"   # built-in webhook (kind = "ntfy" | "json")
 kind = "ntfy"
 ```
 
+### Identity in three steps (no secrets management)
+
+The agent generates its own ed25519 keypair on first start (like SSH
+host keys — the private half never leaves the machine, so there is
+nothing to put in sops unless you want to). Host keys are trusted on
+first contact and pinned from then on (`hostKeyChecking =
+"accept-new"`, the default; set `"strict"` to require pre-pinning).
+So the whole trust setup is:
+
+```bash
+# 1. enable the agent and deploy its host — it generates its key
+# 2. read the public half:
+ssh agent-host deptui-agent pubkey
+# 3. add that line to your targets' authorized_keys (declaratively!)
+#    and deploy them once
+```
+
+`deptui-agent validate` checks the identity first (naming the
+passphrase trap outright if you brought your own key) and then probes
+every target, so a broken link in the chain tells you which link it
+is.
+
 Rules the agent lives by:
 
 - **Headless means non-interactive.** Targets must accept

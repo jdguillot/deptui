@@ -123,6 +123,34 @@ in
       description = "Open the kick/status listener's port.";
     };
 
+    generateSshKey = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        When no `sshKeyFile` is set (and the dedicated system user is
+        in use), generate an ed25519 keypair in the agent's state
+        directory on first start — like SSH host keys, the private
+        half never leaves the machine, so no secret management is
+        needed at all. Read the public half with `deptui-agent pubkey`
+        (or from the service log) and authorize it on the targets.
+      '';
+    };
+
+    hostKeyChecking = lib.mkOption {
+      type = lib.types.enum [
+        "accept-new"
+        "strict"
+      ];
+      default = "accept-new";
+      description = ''
+        Host-key policy for the agent's ssh (dedicated user only).
+        `accept-new` trusts a host on first contact and pins it from
+        then on — no manual known_hosts step; a *changed* key is still
+        rejected. `strict` requires every host key pre-pinned (e.g.
+        via programs.ssh.knownHosts).
+      '';
+    };
+
     sshKeyFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
@@ -204,30 +232,52 @@ in
     ];
     users.groups = lib.mkIf (cfg.group == defaultUser) { ${defaultUser} = { }; };
 
-    # $HOME/.ssh/config for the service user, so both git and the
-    # deploys pick the key up without per-host repetition.
-    systemd.tmpfiles.rules = lib.mkIf (cfg.sshKeyFile != null) [
+    # $HOME/.ssh/config for the dedicated service user: host-key policy
+    # plus the identity, so git and the deploys pick both up without
+    # per-host repetition. A custom `user` brings their own ~/.ssh —
+    # none of this applies there.
+    systemd.tmpfiles.rules = lib.mkIf (cfg.user == defaultUser) [
       "d /var/lib/deptui-agent/.ssh 0700 ${cfg.user} ${cfg.group} -"
-      "L+ /var/lib/deptui-agent/.ssh/config - - - - ${pkgs.writeText "deptui-agent-ssh-config" ''
-        IdentityFile ${cfg.sshKeyFile}
-      ''}"
+      "L+ /var/lib/deptui-agent/.ssh/config - - - - ${pkgs.writeText "deptui-agent-ssh-config" (
+        ''
+          Host *
+            StrictHostKeyChecking ${if cfg.hostKeyChecking == "strict" then "yes" else "accept-new"}
+        ''
+        + lib.optionalString (cfg.sshKeyFile != null) ''
+          IdentityFile ${cfg.sshKeyFile}
+        ''
+      )}"
     ];
 
     systemd.services.deptui-agent = {
       description = "deptui auto-deploy agent";
       restartIfChanged = cfg.restartOnUpdate;
-      # A passphrase-protected key makes a headless agent silently
-      # useless (SSH_ASKPASS=/bin/false skips the prompt and every
-      # auth fails as plain "Permission denied"). Say so at startup —
-      # loudly, but without blocking the service: the control API is
-      # still worth serving.
-      preStart = lib.mkIf (cfg.sshKeyFile != null) ''
-        if ! ${pkgs.openssh}/bin/ssh-keygen -y -P "" -f ${lib.escapeShellArg cfg.sshKeyFile} >/dev/null 2>&1; then
-          echo "WARNING: ${cfg.sshKeyFile} is passphrase-protected or unreadable —" >&2
-          echo "         a headless agent cannot use it; every ssh will fail with" >&2
-          echo "         'Permission denied'. Strip it: ssh-keygen -p -N \"\" -f <key>" >&2
-        fi
-      '';
+      # First-start key generation (dedicated user, no sshKeyFile): the
+      # private half never leaves the machine, so there is no secret to
+      # manage. And when a key IS provided: a passphrase-protected one
+      # makes a headless agent silently useless (SSH_ASKPASS=/bin/false
+      # skips the prompt; every auth fails as bare "Permission
+      # denied") — warn loudly without blocking the service.
+      preStart =
+        lib.optionalString (cfg.sshKeyFile == null && cfg.generateSshKey && cfg.user == defaultUser)
+          ''
+            if [ ! -f "$STATE_DIRECTORY/.ssh/id_ed25519" ]; then
+              mkdir -p "$STATE_DIRECTORY/.ssh"
+              chmod 700 "$STATE_DIRECTORY/.ssh"
+              ${pkgs.openssh}/bin/ssh-keygen -t ed25519 -N "" \
+                -C "deptui-agent@$(${pkgs.nettools}/bin/hostname)" \
+                -f "$STATE_DIRECTORY/.ssh/id_ed25519"
+              echo "generated the agent's ssh identity; authorize this public key on the targets:" >&2
+              cat "$STATE_DIRECTORY/.ssh/id_ed25519.pub" >&2
+            fi
+          ''
+        + lib.optionalString (cfg.sshKeyFile != null) ''
+          if ! ${pkgs.openssh}/bin/ssh-keygen -y -P "" -f ${lib.escapeShellArg cfg.sshKeyFile} >/dev/null 2>&1; then
+            echo "WARNING: ${cfg.sshKeyFile} is passphrase-protected or unreadable —" >&2
+            echo "         a headless agent cannot use it; every ssh will fail with" >&2
+            echo "         'Permission denied'. Strip it: ssh-keygen -p -N \"\" -f <key>" >&2
+          fi
+        '';
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];

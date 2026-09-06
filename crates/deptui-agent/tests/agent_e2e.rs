@@ -707,3 +707,44 @@ fn daemon_waits_for_cadence_and_approval_takes_next_round() {
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();
 }
+
+/// `pubkey` prints the public half and names the passphrase trap.
+#[test]
+fn pubkey_reads_and_diagnoses_identities() {
+    let dir = TempDir::new().unwrap();
+    let key = dir.path().join("id_ed25519");
+    let ok = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+        .arg(&key)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("pubkey")
+        .arg("--key")
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("ssh-ed25519 "));
+
+    // Passphrase-protected: refuse with the fix named. Remove the .pub
+    // so the check derives from the private half.
+    let locked = dir.path().join("locked");
+    let ok = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "hunter2", "-q", "-f"])
+        .arg(&locked)
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    fs::remove_file(dir.path().join("locked.pub")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("pubkey")
+        .arg("--key")
+        .arg(&locked)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("passphrase"));
+}
