@@ -10,6 +10,16 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- Getting-started polish from the validation walk: newest
+  nixos-rebuild flags first (old spellings as comments), the sudo
+  rationale as a proper admonition, "deploy the targets" shown with
+  the Space-mark-then-Shift+S batch flow and shell commands, and the
+  restart-once note moved to troubleshooting (it only applies when
+  switching a long-running agent to the generated identity — a fresh
+  install never needs it).
+
 ## [0.13.0] — 2026-09-06
 
 ### Fixed

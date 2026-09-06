@@ -132,8 +132,8 @@ Deploy the agent host:
 deptui .
 # …or plain nixos-rebuild from your workstation:
 nixos-rebuild switch --flake .#<agent-host> \
-  --target-host <you>@<agent-host> --use-remote-sudo
-#   (newer nixos-rebuild spells the last flag --elevate=sudo; if the
+  --target-host <you>@<agent-host> --elevate=sudo
+#   (older nixos-rebuild spells that flag --use-remote-sudo; if the
 #    target's sudo asks for a password, add --ask-elevate-password.
 #    Caveat: nixos-rebuild also prints the --ask-elevate-password hint
 #    whenever the remote command exits non-zero for ANY reason — if you
@@ -148,13 +148,6 @@ deploy .#<agent-host>
 
 On first start the agent **generates its own ssh identity** — no
 secrets management; the private key never leaves the machine.
-
-> Already had the agent running before this update? Its service
-> deliberately isn't restarted by activation (`restartOnUpdate =
-> false`, the self-deploy protection), so run
-> `sudo systemctl restart deptui-agent` once to let first-start
-> generation happen — `deptui-agent pubkey` will tell you exactly
-> this if the key is missing.
 
 ### Authorize its key
 
@@ -172,7 +165,16 @@ users.users.yourname.openssh.authorizedKeys.keys = [
 ];
 ```
 
-and deploy the targets once. Host keys need no setup: the agent
+and deploy the targets once — deptui makes the batch easy: `deptui .`,
+mark each target with `Space` (the host list shows a `+` per mark),
+then one `Shift+S` deploys them all in sequence. Or per host from the
+shell:
+
+```bash
+deploy .#<host1> && deploy .#<host2>
+```
+
+Host keys need no setup: the agent
 trusts a target on first contact and pins it from then on
 (`hostKeyChecking = "strict"` if you'd rather pre-pin via
 `programs.ssh.knownHosts`).
@@ -191,16 +193,18 @@ security.sudo.extraRules = [{
 #  treat wheel that way)
 ```
 
-**Why not scope the rule to the one command deploy-rs runs?**
-Because that command is a *store path that changes every generation*
-(`sudo /nix/store/<hash>-…/activate-rs …`), a scoped rule must
-wildcard it — `NOPASSWD: /nix/store/*/activate-rs` or similar. And on
-a Nix machine that wildcard is root: any local user can ask the nix
-daemon to materialize a store path with any content under a matching
-name (that is what `nix build` *is*), so the deploy user could build
-their own "activate-rs" that execs a shell and sudo it. Pinning the
-exact hash instead is a chicken-and-egg: the deploy that would
-install next generation's rule needs the permission before it runs.
+> [!IMPORTANT]
+> **Why not scope the rule to the one command deploy-rs runs?**
+> Because that command is a *store path that changes every generation*
+> (`sudo /nix/store/<hash>-…/activate-rs …`), a scoped rule must
+> wildcard it — `NOPASSWD: /nix/store/*/activate-rs` or similar. And on
+> a Nix machine that wildcard is root: any local user can ask the nix
+> daemon to materialize a store path with any content under a matching
+> name (that is what `nix build` *is*), so the deploy user could build
+> their own "activate-rs" that execs a shell and sudo it. Pinning the
+> exact hash instead is a chicken-and-egg: the deploy that would
+> install next generation's rule needs the permission before it runs.
+
 So an agent-managed host has exactly two configurations:
 
 - **NOPASSWD `ALL` for a dedicated deploy user** — root-equivalent,
@@ -323,4 +327,5 @@ surface never leaves the group-gated Unix socket. (`ssh <agent-host> deptui-agen
 | every target: bare `Permission denied` | run `validate` — usually a missing or passphrase-protected key, both named outright |
 | socket `Permission denied` on `deptui-agent status` | your ssh user isn't in `services.deptui-agent.users` |
 | host shows `HELD` | by design: first encounter differs from the repo — approve it (`Enter` / `approve`) |
+| `pubkey` says no key exists on a long-running agent | key generation happens at service start, and activation deliberately never restarts a running agent — after switching an agent from `sshKeyFile` to the generated identity, `sudo systemctl restart deptui-agent` once |
 | agent deployed its own host and disappeared | you set `restartOnUpdate = true`; the default (`false`) survives self-deploys, new agent takes over on next restart/reboot |
