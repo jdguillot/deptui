@@ -594,7 +594,10 @@ interval = "15m"
             cfg.watches[0].git_crypt_key_file.as_deref(),
             Some(std::path::Path::new("/run/secrets/gc.key"))
         );
-        assert_eq!(cfg.watches[0].post_checkout.as_deref(), Some("git lfs pull"));
+        assert_eq!(
+            cfg.watches[0].post_checkout.as_deref(),
+            Some("git lfs pull")
+        );
     }
 
     #[test]

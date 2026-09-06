@@ -463,6 +463,9 @@ impl AgentUi {
 pub struct AgentManaged {
     pub failed: bool,
     pub offline: bool,
+    /// Pending like `offline`, but the host is up and refusing the
+    /// agent's ssh — a lockout for the human, not a sleeping host.
+    pub denied: bool,
     /// First-encounter hold: awaiting adoption.
     pub held: bool,
 }
@@ -3104,6 +3107,7 @@ resolve the paths so they can be seeded",
                                 let entry = self.agent_managed.entry(h.name.clone()).or_default();
                                 entry.failed |= h.failed_rev.is_some();
                                 entry.offline |= h.offline_rev.is_some();
+                                entry.denied |= h.offline_rev.is_some() && h.offline_denied;
                                 entry.held |= h.held_rev.is_some();
                             }
                         }
@@ -3704,12 +3708,11 @@ resolve the paths so they can be seeded",
         let ssh = ssh.to_string();
         self.agent.last_tail_start = Some(std::time::Instant::now());
         let tx = self.status_tx.clone();
-        let handle =
-            agentclient::spawn_tail(ssh, self.askpass_env.clone(), move |line| {
-                // Best-effort: a full channel drops tail lines rather than
-                // blocking the reader (the history endpoint has the truth).
-                let _ = tx.try_send(StatusUpdate::AgentTail(line));
-            });
+        let handle = agentclient::spawn_tail(ssh, self.askpass_env.clone(), move |line| {
+            // Best-effort: a full channel drops tail lines rather than
+            // blocking the reader (the history endpoint has the truth).
+            let _ = tx.try_send(StatusUpdate::AgentTail(line));
+        });
         self.agent.tail_task = Some(handle);
     }
 
@@ -5416,6 +5419,7 @@ mod tests {
                         unreachable: None,
                         offline_rev: None,
                         offline_time: None,
+                        offline_denied: false,
                         held_rev: None,
                         held_time: None,
                         approved: false,
@@ -5431,6 +5435,7 @@ mod tests {
                         unreachable: None,
                         offline_rev: None,
                         offline_time: None,
+                        offline_denied: false,
                         held_rev: None,
                         held_time: None,
                         approved: false,
@@ -5694,6 +5699,7 @@ mod tests {
                     unreachable: None,
                     offline_rev: None,
                     offline_time: None,
+                    offline_denied: false,
                     held_rev: None,
                     held_time: None,
                     approved: false,
@@ -5862,6 +5868,7 @@ mod tests {
                     unreachable: None,
                     offline_rev: None,
                     offline_time: None,
+                    offline_denied: false,
                     held_rev: None,
                     held_time: None,
                     approved: false,

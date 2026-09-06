@@ -420,13 +420,25 @@ fn print_status(s: &wire::AgentStatus) {
                 bits.push("approved for the next update round".to_string());
             }
             if let (Some(rev), Some(t)) = (&h.offline_rev, h.offline_time) {
+                // One segment: the state, what is waiting, and ssh's
+                // reason — listing "unreachable: …" separately made
+                // one probe read as two problems.
+                let what = if h.offline_denied {
+                    "SSH DENIED (host is up)"
+                } else {
+                    "OFFLINE"
+                };
+                let why = h
+                    .unreachable
+                    .as_deref()
+                    .map(|u| format!(" — {u}"))
+                    .unwrap_or_default();
                 bits.push(format!(
-                    "OFFLINE since {} — {} pending",
+                    "{what} since {} — {} pending{why}",
                     fmt_time(t),
                     short(rev)
                 ));
-            }
-            if let Some(u) = &h.unreachable {
+            } else if let Some(u) = &h.unreachable {
                 bits.push(format!("unreachable: {u}"));
             }
             if bits.is_empty() {
@@ -560,58 +572,13 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
             runner::execute(&cfg.state_dir, w, &cfg.notify, plan, &log_tx, cancel_rx).await;
         let time = record.finished.unwrap_or_else(state::now_unix);
         for hr in &record.hosts {
-            let hs = state
+            any_failed |= hr.outcome == "failed";
+            state
                 .watch_mut(&w.name)
                 .hosts
                 .entry(hr.host.clone())
-                .or_default();
-            match hr.outcome.as_str() {
-                "ok" | "adopted" => {
-                    hs.deployed = Some(state::Stamp {
-                        rev: rev.clone(),
-                        time,
-                    });
-                    hs.failed = None;
-                    hs.offline = None;
-                    hs.held = None;
-                    hs.approved = false;
-                    hs.deployed_toplevels = hr.toplevels.clone();
-                }
-                "held" => {
-                    hs.held = Some(state::Stamp {
-                        rev: rev.clone(),
-                        time,
-                    });
-                }
-                "failed" => {
-                    any_failed = true;
-                    hs.failed = Some(state::FailStamp {
-                        rev: rev.clone(),
-                        time,
-                        message: hr.message.clone().unwrap_or_default(),
-                    });
-                    hs.offline = None;
-                    // The approval bought this round, success or not.
-                    hs.approved = false;
-                }
-                "offline" => {
-                    hs.offline = Some(state::OfflineStamp {
-                        rev: rev.clone(),
-                        time,
-                        target: hr.target.clone().unwrap_or_default(),
-                    });
-                }
-                "cancelled" => {
-                    hs.failed = Some(state::FailStamp {
-                        rev: rev.clone(),
-                        time,
-                        message: hr.message.clone().unwrap_or_else(|| "cancelled".into()),
-                    });
-                    hs.offline = None;
-                    hs.approved = false;
-                }
-                _ => {}
-            }
+                .or_default()
+                .apply_outcome(hr, &rev, time);
         }
         for line in &record.log {
             println!("{line}");
@@ -743,8 +710,8 @@ pub(crate) async fn validation_report(cfg: &AgentConfig) -> (String, u32) {
             let target = deptui_core::host::build_ssh_target(node, "system", &override_);
             match runner::check_reachable(&target, &override_).await {
                 Ok(()) => out.push(format!("{}: {host} ({target}) ok", w.name)),
-                Err(e) => {
-                    out.push(format!("{}: {host} ({target}) UNREACHABLE: {e}", w.name));
+                Err(u) => {
+                    out.push(format!("{}: {host} ({target}) {}", w.name, u.headline()));
                     failures += 1;
                 }
             }

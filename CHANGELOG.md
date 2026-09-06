@@ -10,6 +10,44 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Changed
+
+- **Agent view: a locked-out host is not a sleeping host.** The
+  pre-deploy probe now tells *down* from *denied*: an ssh error that
+  means the host answered and refused the agent (`Permission denied`,
+  host-key failures, …) is outcome `denied` — same pending marker and
+  recheck as offline (fix the key and the next recheck deploys), but
+  drawn `⊘ ssh denied …` in full colour with its reason, badged
+  `[agent⊘]` on the main screen, `SSH DENIED (host is up)` in
+  `deptui-agent status`/`validate`, and it fires an `unreachable`
+  notification. Before, a host that was up and rejecting the key got
+  the greyed-out "asleep" row and read as down. Wire: `HostStatus`
+  gains `offline_denied` (older agents report `false`).
+- **One miss, one segment.** A pending host's row folds ssh's reason
+  into its `offline … — <rev> pending — <reason>` segment; the separate
+  `unreachable: …` segment now shows only when there is no pending
+  update. The row wrapped to three states for what was one probe.
+- **Failure messages keep their root cause.** The `failed <rev> — …`
+  segment elides the *middle* of a long message instead of cutting at
+  60 characters, so an anyhow chain shows both the step and the last
+  error (`…: unable to read key file`) rather than a path prefix.
+
+### Fixed
+
+- **A stale failure no longer sits next to the current pending
+  state.** An `offline`/`denied` outcome clears a `failed` park from an
+  older revision (that round could only start because a newer
+  revision or an approval ended the park), and existing state files
+  carrying both are cleaned up on load. The row showed `! failed
+  <old rev> …; offline … — <new rev> pending` and it was impossible to
+  tell which was current; the main screen's `[agent!]` badge and
+  "N host deploy(s) failed" notice counted the stale park too.
+- **`unreachable` no longer contradicts `deployed`.** It was written
+  only by the startup probe and never cleared, so a host deployed
+  seconds ago still read `unreachable: Could not resolve hostname`.
+  It is now updated by every probe miss (run outcome, recheck) and
+  cleared by every success and every recheck that answers.
+
 ## [0.17.0] — 2026-09-06
 
 ### Added

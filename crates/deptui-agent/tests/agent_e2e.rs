@@ -28,6 +28,9 @@ struct Env {
     deploy_log: PathBuf,
     /// While this file exists, the `ssh` shim reports the host down.
     down_marker: PathBuf,
+    /// While this file exists, the `ssh` shim answers like sshd
+    /// rejecting our key — the host is up, we are locked out.
+    denied_marker: PathBuf,
     /// The ssh shim answers `readlink` commands with this file's
     /// contents (absent → empty, like a host with no answer) — the
     /// "what the host is running" knob for the drift-guard tests.
@@ -75,6 +78,7 @@ fn setup_with(deploy_exit: i32, extra_host_cfg: &str) -> Env {
     // drift-guard paths are testable; absent files → empty output,
     // which is what the pre-guard shim produced.
     let down_marker = shims.path().join("host-down");
+    let denied_marker = shims.path().join("host-denied");
     let remote_path = shims.path().join("remote-path");
     let conf_rev = shims.path().join("conf-rev");
     let ssh = shims.path().join("ssh");
@@ -83,12 +87,14 @@ fn setup_with(deploy_exit: i32, extra_host_cfg: &str) -> Env {
         format!(
             "#!/bin/sh\n\
              if [ -e {down} ]; then echo 'Connection refused' >&2; exit 255; fi\n\
+             if [ -e {denied} ]; then echo 'root@web.lan: Permission denied (publickey).' >&2; exit 255; fi\n\
              case \"$*\" in\n\
              *nixos-version*) cat {conf} 2>/dev/null; exit 0;;\n\
              *readlink*) cat {path} 2>/dev/null; exit 0;;\n\
              esac\n\
              exit 0\n",
             down = down_marker.display(),
+            denied = denied_marker.display(),
             conf = conf_rev.display(),
             path = remote_path.display(),
         ),
@@ -159,6 +165,7 @@ offline_recheck = "1s"
         config_path,
         deploy_log,
         down_marker,
+        denied_marker,
         remote_path,
         conf_rev,
         git_crypt_log,
@@ -429,6 +436,75 @@ fn offline_host_is_pending_not_failed_and_catches_up() {
     let host = &state["watches"]["infra"]["hosts"]["web"];
     assert!(host["offline"].is_null(), "marker cleared: {state}");
     assert!(host["deployed"]["rev"].is_string());
+}
+
+/// A host that answers but refuses the key is pending like an offline
+/// one (fixing the key is enough — no approval, no new commit), but
+/// its state says `denied` so no view draws it as asleep. It also
+/// supersedes an older park: the stale "failed at R" next to
+/// "pending at S" was unreadable.
+#[test]
+fn denied_host_is_pending_flagged_and_supersedes_old_failure() {
+    let env = setup(1);
+    // Round one: deploy fails → parked at rev A.
+    let out = agent(&env, &["check"]);
+    assert!(!out.status.success());
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.state.path().join("state.json")).unwrap())
+            .unwrap();
+    let rev_a = state["watches"]["infra"]["hosts"]["web"]["failed"]["rev"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Round two: new commit, host now refuses our key.
+    commit(&env, "two");
+    fs::write(&env.denied_marker, "").unwrap();
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "denied is pending, not failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("denied"), "{stdout}");
+    assert!(stdout.contains("Permission denied"), "{stdout}");
+    assert_eq!(
+        deploy_calls(&env).len(),
+        1,
+        "no deploy attempt while locked out"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.state.path().join("state.json")).unwrap())
+            .unwrap();
+    let host = &state["watches"]["infra"]["hosts"]["web"];
+    assert!(
+        host["failed"].is_null(),
+        "park at {rev_a} survived a newer pending round: {state}"
+    );
+    assert_eq!(host["offline"]["denied"], true, "{state}");
+    assert_ne!(host["offline"]["rev"].as_str().unwrap(), rev_a);
+    assert_eq!(
+        host["unreachable"],
+        "root@web.lan: Permission denied (publickey)."
+    );
+
+    // Key fixed: the pending update is attempted at once (the shim
+    // still fails it, which parks the host at the *new* revision —
+    // the pending marker gives way to the fresh, current failure).
+    fs::remove_file(&env.denied_marker).unwrap();
+    let _ = agent(&env, &["check"]);
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.state.path().join("state.json")).unwrap())
+            .unwrap();
+    let host = &state["watches"]["infra"]["hosts"]["web"];
+    assert!(host["offline"].is_null(), "marker cleared: {state}");
+    assert_ne!(host["failed"]["rev"].as_str().unwrap(), rev_a);
+    assert_eq!(
+        deploy_calls(&env).len(),
+        2,
+        "deploy attempted once the key works"
+    );
 }
 
 #[test]
@@ -876,7 +952,10 @@ fn git_crypt_watch_unlocks_once_and_repins_filters() {
     let env = setup(0);
     let key = env.state.path().join("gc.key");
     fs::write(&key, "exported-key-bytes").unwrap();
-    add_watch_cfg(&env, &format!("git_crypt_key_file = \"{}\"\n", key.display()));
+    add_watch_cfg(
+        &env,
+        &format!("git_crypt_key_file = \"{}\"\n", key.display()),
+    );
 
     let out = agent(&env, &["check"]);
     assert!(
@@ -895,7 +974,12 @@ fn git_crypt_watch_unlocks_once_and_repins_filters() {
         "exactly one unlock, with the key"
     );
     let smudge = Command::new("git")
-        .args(["-C", &clone.to_string_lossy(), "config", "filter.git-crypt.smudge"])
+        .args([
+            "-C",
+            &clone.to_string_lossy(),
+            "config",
+            "filter.git-crypt.smudge",
+        ])
         .output()
         .unwrap();
     assert_eq!(
@@ -1062,7 +1146,10 @@ fn idle_daemon_exits_cleanly_when_unit_names_new_config() {
     let exe = env!("CARGO_BIN_EXE_deptui-agent");
     fs::write(
         &unit,
-        format!("[Service]\nExecStart={exe} --config {} run\n", cfg_same.display()),
+        format!(
+            "[Service]\nExecStart={exe} --config {} run\n",
+            cfg_same.display()
+        ),
     )
     .unwrap();
 
@@ -1088,7 +1175,10 @@ fn idle_daemon_exits_cleanly_when_unit_names_new_config() {
     let cfg_b = mk_cfg("b.toml", "# changed\n");
     fs::write(
         &unit,
-        format!("[Service]\nExecStart={exe} --config {} run\n", cfg_b.display()),
+        format!(
+            "[Service]\nExecStart={exe} --config {} run\n",
+            cfg_b.display()
+        ),
     )
     .unwrap();
     let start = Instant::now();

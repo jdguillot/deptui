@@ -53,11 +53,14 @@ pub enum DeployOutcome {
         /// failed (guard disarms rather than holding on stale data).
         toplevels: std::collections::BTreeMap<String, String>,
     },
-    /// The host was down before we started and `catch_up` is on: the
-    /// update stays pending and the daemon re-probes `target`.
+    /// The pre-deploy probe could not get in and `catch_up` is on: the
+    /// update stays pending and the daemon re-probes `target`. `denied`
+    /// separates a host that answered but refused us (a lockout the
+    /// human must fix) from one that is simply down.
     Offline {
         target: String,
         message: String,
+        denied: bool,
     },
     /// The user cancelled the run while this host was deploying; the
     /// process group has been torn down.
@@ -71,9 +74,55 @@ pub enum DeployOutcome {
     },
     /// First encounter and the target runs something else: refused to
     /// deploy over it. The message says what differed.
-    Held {
-        message: String,
-    },
+    Held { message: String },
+}
+
+/// Why a BatchMode probe could not get in. `denied` means the host
+/// *answered* — sshd rejected our key, or the host key didn't check
+/// out — so it is up and waiting on a human, not asleep. Collapsing
+/// the two into "offline" made a locked-out host look like a sleeping
+/// one in every status view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreachable {
+    pub denied: bool,
+    /// What ssh said, trimmed.
+    pub message: String,
+}
+
+impl Unreachable {
+    /// Upper-case headline for the `validate` report and the journal.
+    pub fn headline(&self) -> String {
+        if self.denied {
+            format!("SSH DENIED (host is up): {}", self.message)
+        } else {
+            format!("UNREACHABLE: {}", self.message)
+        }
+    }
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Does this ssh stderr describe a host that answered and turned us
+/// away? Best-effort text match on OpenSSH's fixed phrasings — the
+/// exit status is 255 for connection failures and auth failures
+/// alike, so the text is the only signal. Unknown phrasings fall
+/// through to "down", which keeps the old behaviour.
+pub fn is_lockout(stderr: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "Permission denied",
+        "Host key verification failed",
+        "Too many authentication failures",
+        "REMOTE HOST IDENTIFICATION HAS CHANGED",
+        "no matching host key type",
+        "no matching key exchange method",
+        "no matching cipher",
+        "Authentication failed",
+    ];
+    PATTERNS.iter().any(|p| stderr.contains(p))
 }
 
 /// BatchMode reachability probe, mirroring what a deploy will need.
@@ -82,7 +131,7 @@ pub enum DeployOutcome {
 pub async fn check_reachable(
     target: &str,
     override_: &deptui_core::ssh::SshOverride,
-) -> Result<(), String> {
+) -> Result<(), Unreachable> {
     let mut cmd = tokio::process::Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]);
     for arg in override_.ssh_args() {
@@ -94,11 +143,21 @@ pub async fn check_reachable(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    let down = |message: String| Unreachable {
+        denied: false,
+        message,
+    };
     match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
         Ok(Ok(out)) if out.status.success() => Ok(()),
-        Ok(Ok(out)) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
-        Ok(Err(e)) => Err(format!("spawning ssh: {e}")),
-        Err(_) => Err("ssh probe timed out".to_string()),
+        Ok(Ok(out)) => {
+            let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(Unreachable {
+                denied: is_lockout(&message),
+                message,
+            })
+        }
+        Ok(Err(e)) => Err(down(format!("spawning ssh: {e}"))),
+        Err(_) => Err(down("ssh probe timed out".to_string())),
     }
 }
 
@@ -113,6 +172,7 @@ pub fn summarize_outcomes(hosts: &[HostRun]) -> String {
         "adopted",
         "held",
         "offline",
+        "denied",
         "failed",
         "cancelled",
         "skipped",
@@ -335,17 +395,47 @@ pub async fn execute(
                     toplevels: Default::default(),
                 });
             }
-            Ok(DeployOutcome::Offline { target, message }) => {
-                log(
-                    &mut record,
-                    format!(
-                        "[{}] {host}: offline ({target}) — update pending until it answers",
-                        watch.name
-                    ),
-                );
+            Ok(DeployOutcome::Offline {
+                target,
+                message,
+                denied,
+            }) => {
+                if denied {
+                    // The host is up; only a human can fix a lockout.
+                    // Same pending path as offline (the recheck deploys
+                    // the moment the key is accepted), but it must not
+                    // read as a sleeping host — and it notifies.
+                    log(
+                        &mut record,
+                        format!(
+                            "[{}] {host}: ssh denied ({target}) — {message}; update pending \
+                             until the agent can log in",
+                            watch.name
+                        ),
+                    );
+                    notify::dispatch(
+                        notify_cfg,
+                        Event::new(
+                            "unreachable",
+                            &watch.name,
+                            Some(host),
+                            &plan.rev,
+                            format!("ssh denied ({target}): {message}"),
+                        ),
+                    );
+                } else {
+                    log(
+                        &mut record,
+                        format!(
+                            "[{}] {host}: offline ({target}) — {message}; update pending \
+                             until it answers",
+                            watch.name
+                        ),
+                    );
+                }
                 record.hosts.push(HostRun {
                     host: host.clone(),
-                    outcome: "offline".into(),
+                    outcome: if denied { "denied" } else { "offline" }.into(),
                     message: Some(message),
                     target: Some(target),
                     toplevels: Default::default(),
@@ -434,8 +524,12 @@ async fn deploy_host(
     if hc.catch_up() {
         let override_ = hc.ssh_override();
         let target = build_ssh_target(node, "system", &override_);
-        if let Err(message) = check_reachable(&target, &override_).await {
-            return Ok(DeployOutcome::Offline { target, message });
+        if let Err(u) = check_reachable(&target, &override_).await {
+            return Ok(DeployOutcome::Offline {
+                target,
+                message: u.message,
+                denied: u.denied,
+            });
         }
     }
 
@@ -705,6 +799,35 @@ mod tests {
             summarize_outcomes(&[hr("ok"), hr("ok"), hr("offline"), hr("failed")]),
             "2 ok, 1 offline, 1 failed"
         );
+        assert_eq!(summarize_outcomes(&[hr("denied")]), "1 denied");
+    }
+
+    #[test]
+    fn lockout_is_told_apart_from_down() {
+        assert!(is_lockout(
+            "cyberfighter@vm-gameserver-nix: Permission denied (publickey,keyboard-interactive)."
+        ));
+        assert!(is_lockout("Host key verification failed."));
+        assert!(is_lockout(
+            "Received disconnect from 10.0.0.2: Too many authentication failures"
+        ));
+        assert!(!is_lockout(
+            "ssh: Could not resolve hostname simple-vm: Name or service not known"
+        ));
+        assert!(!is_lockout(
+            "ssh: connect to host web.lan port 22: Connection refused"
+        ));
+        assert!(!is_lockout(
+            "ssh: connect to host web.lan port 22: No route to host"
+        ));
+        assert!(!is_lockout("ssh probe timed out"));
+        assert!(!is_lockout(""));
+        let u = Unreachable {
+            denied: true,
+            message: "root@web: Permission denied (publickey).".into(),
+        };
+        assert!(u.headline().starts_with("SSH DENIED"));
+        assert_eq!(u.to_string(), "root@web: Permission denied (publickey).");
     }
 
     #[test]

@@ -276,7 +276,10 @@ Rules the agent lives by:
 - **Offline hosts catch up.** A host that is down when an update
   arrives is *pending*, not failed: the agent re-probes it
   (`offline_recheck`) and deploys the moment it answers. Per-host
-  `catch_up = false` opts out.
+  `catch_up = false` opts out. A host that is *up* but refuses the
+  agent's ssh (`Permission denied`, host-key trouble) is pending the
+  same way but reported as **ssh denied** — it needs a human, and the
+  next recheck after the fix deploys.
 - **The agent only overwrites what it deployed** (drift guard,
   default on). It records the profile paths each deploy leaves and
   holds instead of deploying over a host that changed out-of-band —
@@ -357,8 +360,12 @@ runs, not just what streamed while you watched. Pause gates *future*
 polls; `x`/`cancel` stops a deploy already running — its hosts stay
 parked at that revision until a new commit, a kick after one, or an
 approval. Agent-managed hosts show an `[agent]` badge in the host
-list — `[agent!]` when the last agent deploy failed, `[agent~]` when
-an update is pending on an offline host.
+list — `[agent!]` when the last agent deploy failed, `[agent⊘]` when
+the agent is locked out of a host that is up (ssh denied), `[agent≠]`
+when a first-encounter host is held, `[agent~]` when an update is
+pending on an offline host. The same glyphs lead each host row in the
+agent view (`✓` deployed, `↑` approved); a sleeping host's row is
+greyed, a locked-out one keeps full colour.
 
 ### Kicking from CI
 

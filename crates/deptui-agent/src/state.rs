@@ -56,12 +56,17 @@ pub struct HostState {
     #[serde(default)]
     pub deployed: Option<Stamp>,
     /// Set when the last deploy of this host failed; cleared by the next
-    /// success. A host failed at revision R is skipped until a newer
-    /// revision arrives (or a human force-deploys it).
+    /// success, and by a later round that leaves the host *pending*
+    /// (offline/denied) — that round is by definition a newer
+    /// revision or an approval, either of which ends the park, and a
+    /// stale "failed at R" next to "pending at S" left the user unable
+    /// to tell which one was current.
     #[serde(default)]
     pub failed: Option<FailStamp>,
-    /// Non-empty when the startup reachability probe failed; the message
-    /// is what ssh said.
+    /// What ssh last said when it could not get in: set by the startup
+    /// probe, by an offline/denied run outcome, and by a recheck that
+    /// still fails; cleared by a recheck that answers and by any
+    /// successful deploy. Never stale next to a fresh `deployed`.
     #[serde(default)]
     pub unreachable: Option<String>,
     /// The human's standing ok for a held/unadopted host: at the next
@@ -77,10 +82,10 @@ pub struct HostState {
     /// bootstrap) or a later equality adoption.
     #[serde(default)]
     pub held: Option<Stamp>,
-    /// Set when the host was down at deploy time and `catch_up` is on:
-    /// the update is pending, the daemon re-probes `target` at the
-    /// watch's `offline_recheck` cadence and deploys the moment the
-    /// host answers. Cleared by any later success or real failure.
+    /// Set when the pre-deploy probe could not get in and `catch_up`
+    /// is on: the update is pending, the daemon re-probes `target` at
+    /// the watch's `offline_recheck` cadence and deploys the moment the
+    /// host lets it in. Cleared by any later success or real failure.
     #[serde(default)]
     pub offline: Option<OfflineStamp>,
     /// What the agent's last successful deploy left on the host, per
@@ -106,6 +111,78 @@ pub struct OfflineStamp {
     /// Resolved `user@host` ssh target, stored so rechecks don't need a
     /// clone + discovery round-trip.
     pub target: String,
+    /// The host answered and refused us (auth/host-key), rather than
+    /// being down. Same pending machinery, different story for the
+    /// human: nothing will change until they fix the lockout.
+    #[serde(default)]
+    pub denied: bool,
+}
+
+impl HostState {
+    /// Fold one run outcome into the host's standing state. The single
+    /// place the daemon and the oneshot `check` agree on what a
+    /// success clears, what a failure parks, and what a pending round
+    /// supersedes.
+    pub fn apply_outcome(&mut self, hr: &HostRun, rev: &str, time: u64) {
+        match hr.outcome.as_str() {
+            "ok" | "adopted" => {
+                self.deployed = Some(Stamp {
+                    rev: rev.to_string(),
+                    time,
+                });
+                self.failed = None;
+                self.offline = None;
+                self.held = None;
+                // We just got in; whatever ssh said before is history.
+                self.unreachable = None;
+                // The ok was for this update; consumed.
+                self.approved = false;
+                self.deployed_toplevels = hr.toplevels.clone();
+            }
+            "held" => {
+                self.held = Some(Stamp {
+                    rev: rev.to_string(),
+                    time,
+                });
+            }
+            "failed" => {
+                self.failed = Some(FailStamp {
+                    rev: rev.to_string(),
+                    time,
+                    message: hr.message.clone().unwrap_or_default(),
+                });
+                self.offline = None;
+                // The approval bought this round; a standing ok
+                // surviving a failure would retry every poll.
+                self.approved = false;
+            }
+            "offline" | "denied" => {
+                self.offline = Some(OfflineStamp {
+                    rev: rev.to_string(),
+                    time,
+                    target: hr.target.clone().unwrap_or_default(),
+                    denied: hr.outcome == "denied",
+                });
+                // Reaching this round means the park at the older
+                // revision is over (see `failed`).
+                self.failed = None;
+                self.unreachable = hr.message.clone();
+            }
+            // A cancel parks the host exactly like a failure — the run
+            // must not quietly resume at the next poll — but the
+            // message tells the user it was their call.
+            "cancelled" => {
+                self.failed = Some(FailStamp {
+                    rev: rev.to_string(),
+                    time,
+                    message: hr.message.clone().unwrap_or_else(|| "cancelled".into()),
+                });
+                self.offline = None;
+                self.approved = false;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,7 +267,10 @@ impl AgentState {
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         match serde_json::from_str::<AgentState>(&text) {
-            Ok(s) if s.schema == SCHEMA => Ok(s),
+            Ok(mut s) if s.schema == SCHEMA => {
+                s.drop_superseded_parks();
+                Ok(s)
+            }
             Ok(s) => {
                 tracing::warn!(
                     "discarding state file with schema {} (expected {SCHEMA})",
@@ -207,6 +287,20 @@ impl AgentState {
                     schema: SCHEMA,
                     ..Default::default()
                 })
+            }
+        }
+    }
+
+    /// A `failed` stamp next to a pending `offline` stamp is the older
+    /// of the two: the pending round could only start because a newer
+    /// revision arrived or the human approved. Files written before
+    /// `apply_outcome` cleared it on the way in still carry both.
+    fn drop_superseded_parks(&mut self) {
+        for ws in self.watches.values_mut() {
+            for hs in ws.hosts.values_mut() {
+                if hs.offline.is_some() {
+                    hs.failed = None;
+                }
             }
         }
     }
@@ -231,6 +325,87 @@ fn state_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(outcome: &str, message: Option<&str>) -> HostRun {
+        HostRun {
+            host: "web".into(),
+            outcome: outcome.into(),
+            message: message.map(str::to_string),
+            target: Some("root@web.lan".into()),
+            toplevels: Default::default(),
+        }
+    }
+
+    #[test]
+    fn pending_round_supersedes_older_park() {
+        let mut hs = HostState::default();
+        hs.apply_outcome(&run("failed", Some("boom")), "aaaa", 1);
+        assert_eq!(hs.failed.as_ref().unwrap().rev, "aaaa");
+
+        // A newer revision finds the host down: pending, park over.
+        hs.apply_outcome(&run("offline", Some("Connection refused")), "bbbb", 2);
+        assert!(hs.failed.is_none(), "stale failure survived: {hs:?}");
+        let off = hs.offline.as_ref().unwrap();
+        assert_eq!(off.rev, "bbbb");
+        assert!(!off.denied);
+        assert_eq!(hs.unreachable.as_deref(), Some("Connection refused"));
+
+        // Locked out: same pending shape, flagged so it isn't drawn
+        // as a sleeping host.
+        hs.apply_outcome(
+            &run("denied", Some("Permission denied (publickey)")),
+            "bbbb",
+            3,
+        );
+        assert!(hs.offline.as_ref().unwrap().denied);
+        assert_eq!(
+            hs.unreachable.as_deref(),
+            Some("Permission denied (publickey)")
+        );
+
+        // A success clears every standing complaint, ssh's included.
+        hs.apply_outcome(&run("ok", None), "bbbb", 4);
+        assert!(hs.offline.is_none());
+        assert!(hs.unreachable.is_none());
+        assert_eq!(hs.deployed.as_ref().unwrap().rev, "bbbb");
+    }
+
+    #[test]
+    fn failure_after_pending_parks_and_clears_pending() {
+        let mut hs = HostState::default();
+        hs.apply_outcome(&run("offline", Some("down")), "aaaa", 1);
+        hs.apply_outcome(&run("failed", Some("boom")), "aaaa", 2);
+        assert!(hs.offline.is_none());
+        assert_eq!(hs.failed.as_ref().unwrap().message, "boom");
+    }
+
+    #[test]
+    fn load_drops_park_superseded_by_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = AgentState::load(dir.path()).unwrap();
+        s.watch_mut("infra").hosts.insert(
+            "web".into(),
+            HostState {
+                failed: Some(FailStamp {
+                    rev: "aaaa".into(),
+                    time: 1,
+                    message: "boom".into(),
+                }),
+                offline: Some(OfflineStamp {
+                    rev: "bbbb".into(),
+                    time: 2,
+                    target: "root@web.lan".into(),
+                    denied: false,
+                }),
+                ..Default::default()
+            },
+        );
+        s.save(dir.path()).unwrap();
+        let s2 = AgentState::load(dir.path()).unwrap();
+        let hs = &s2.watches["infra"].hosts["web"];
+        assert!(hs.failed.is_none());
+        assert_eq!(hs.offline.as_ref().unwrap().rev, "bbbb");
+    }
 
     #[test]
     fn roundtrip_and_missing_file() {

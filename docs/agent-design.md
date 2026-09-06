@@ -56,7 +56,18 @@ rationale record; CLAUDE.md carries the working invariants.
   answers, triggers a "catch-up" poll so normal eligibility deploys the
   coalesced newest revision. Markers persist in state, so rechecks
   resume across agent restarts. `catch_up = false` restores
-  attempt-and-park.
+  attempt-and-park. The probe tells **down** from **denied**: an ssh
+  error that means the host answered and refused us (`Permission
+  denied`, host-key failures, …) gets outcome `denied` — the same
+  pending marker and recheck (fixing the key is enough; the next
+  recheck deploys), but flagged `denied` in state and on the wire
+  (`offline_denied`) and it fires an `unreachable` notification,
+  because nothing will change until a human acts. A pending outcome
+  also clears a `failed` park from an older revision — that round
+  could only start because a newer revision or an approval ended
+  the park, and the stale stamp made the current state unreadable.
+  `unreachable` (ssh's last words) is written by every miss and
+  cleared by every success, so it never contradicts `deployed`.
   `auto-rollback` / `magic-rollback` follow deploy-rs defaults but are
   exposed as per-host settings. `interactive_sudo` is **rejected** in agent
   config (headless — no PTY/askpass path).

@@ -394,6 +394,7 @@ fn agent_status() -> deptui_core::agentwire::AgentStatus {
                     unreachable: None,
                     offline_rev: None,
                     offline_time: None,
+                    offline_denied: false,
                     held_rev: None,
                     held_time: None,
                     approved: false,
@@ -409,6 +410,7 @@ fn agent_status() -> deptui_core::agentwire::AgentStatus {
                     unreachable: None,
                     offline_rev: None,
                     offline_time: None,
+                    offline_denied: false,
                     held_rev: None,
                     held_time: None,
                     approved: false,
@@ -462,6 +464,78 @@ fn agent_view_renders_status_and_tail() {
     );
 }
 
+/// A host the agent cannot log into is drawn as locked out, not as
+/// asleep, and a sleeping host folds ssh's reason into its one
+/// pending segment instead of listing "unreachable" as a second
+/// problem. Both were live-use confusions: a grey row read as "down"
+/// for a host that was up and refusing the key.
+#[test]
+fn agent_view_tells_locked_out_from_offline() {
+    use deptui_core::agentwire::HostStatus;
+    let mut app = app_with_agent();
+    app.agent.open = true;
+    let mut status = agent_status();
+    status.watches[0].hosts = vec![
+        HostStatus {
+            name: "asleep".into(),
+            paused: false,
+            deployed_rev: None,
+            deployed_time: None,
+            failed_rev: None,
+            failed_time: None,
+            failed_message: None,
+            unreachable: Some("ssh: Could not resolve hostname asleep".into()),
+            offline_rev: Some("abcdef1234567890".into()),
+            offline_time: Some(1),
+            offline_denied: false,
+            held_rev: None,
+            held_time: None,
+            approved: false,
+        },
+        HostStatus {
+            name: "lockedout".into(),
+            paused: false,
+            deployed_rev: None,
+            deployed_time: None,
+            failed_rev: None,
+            failed_time: None,
+            failed_message: None,
+            unreachable: Some("me@lockedout: Permission denied (publickey).".into()),
+            offline_rev: Some("abcdef1234567890".into()),
+            offline_time: Some(1),
+            offline_denied: true,
+            held_rev: None,
+            held_time: None,
+            approved: false,
+        },
+    ];
+    app.agent.status = Some(status);
+    let out = render(&mut app, 140, 40);
+    assert!(
+        out.contains("~ asleep  offline"),
+        "sleeping host glyph/state missing: {out}"
+    );
+    // The reason follows the pending rev in the same segment (it may
+    // wrap, so check the two halves).
+    assert!(
+        out.contains("abcdef1234 pending — ssh:")
+            && out.contains("Could not resolve hostname asleep"),
+        "reason not folded into the pending segment: {out}"
+    );
+    assert!(
+        !out.contains("unreachable:"),
+        "a pending host must not list its miss twice: {out}"
+    );
+    assert!(
+        out.contains("⊘ lockedout  ssh denied"),
+        "locked-out host must not read as offline: {out}"
+    );
+    assert!(
+        out.contains("abcdef1234 pending —") && out.contains("me@lockedout: Permission denied"),
+        "lockout reason missing: {out}"
+    );
+}
+
 /// The footer hint strip must stack at hint boundaries on narrow
 /// windows — a fixed 3-row footer clipped everything past the first
 /// wrapped row, so the later hints (q:close included) went off screen.
@@ -473,7 +547,10 @@ fn agent_footer_hints_stack_on_narrow_windows() {
     for (w, h) in [(120u16, 40u16), (80, 24)] {
         let out = render(&mut app, w, h);
         for hint in ["Tab:log/watches", "Enter:approve", "r:refresh", "q:close"] {
-            assert!(out.contains(hint), "hint `{hint}` clipped at {w}x{h}: {out}");
+            assert!(
+                out.contains(hint),
+                "hint `{hint}` clipped at {w}x{h}: {out}"
+            );
         }
     }
 }
@@ -574,6 +651,7 @@ fn managed_hosts_get_agent_badges_and_title_notice() {
         AgentManaged {
             failed: false,
             offline: true,
+            denied: false,
             held: false,
         },
     );
@@ -582,12 +660,19 @@ fn managed_hosts_get_agent_badges_and_title_notice() {
         AgentManaged {
             failed: true,
             offline: false,
+            denied: false,
             held: false,
         },
     );
     let out = render(&mut app, 120, 40);
     assert!(out.contains("[agent~]"), "offline badge missing: {out}");
     assert!(out.contains("[agent!]"), "failed badge missing: {out}");
+    // Pending because the host refuses us: its own glyph, not `~`.
+    app.agent_managed.get_mut("alpha").unwrap().denied = true;
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("[agent⊘]"), "locked-out badge missing: {out}");
+    assert!(!out.contains("[agent~]"), "lockout drawn as asleep: {out}");
+    app.agent_managed.get_mut("alpha").unwrap().denied = false;
     assert!(
         out.contains("agent: 1 host deploy(s) failed"),
         "title notice missing: {out}"

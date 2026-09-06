@@ -61,14 +61,21 @@ pub struct HostStatus {
     pub failed_time: Option<u64>,
     #[serde(default)]
     pub failed_message: Option<String>,
+    /// What ssh last said when the agent could not get in. Cleared by
+    /// a successful deploy, so it never contradicts `deployed_*`.
     #[serde(default)]
     pub unreachable: Option<String>,
-    /// Set when the host was down at deploy time (catch-up pending):
-    /// the revision waiting to land and when the host was found down.
+    /// Set when the pre-deploy probe could not get in (catch-up
+    /// pending): the revision waiting to land and when that was.
     #[serde(default)]
     pub offline_rev: Option<String>,
     #[serde(default)]
     pub offline_time: Option<u64>,
+    /// With `offline_rev`: the host answered and refused the agent
+    /// (auth or host key) — it is up, the lockout needs a human.
+    /// Absent from older agents, which report every miss as down.
+    #[serde(default)]
+    pub offline_denied: bool,
     /// First-encounter hold: the host runs something other than the
     /// watched revision and the agent refused to deploy over it.
     #[serde(default)]
@@ -80,7 +87,8 @@ pub struct HostStatus {
     pub approved: bool,
 }
 
-/// Per-host outcome inside a run: `"ok"`, `"failed"`, or `"skipped"`.
+/// Per-host outcome inside a run: `"ok"`, `"adopted"`, `"held"`,
+/// `"offline"`, `"denied"`, `"failed"`, `"cancelled"`, or `"skipped"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostRun {
     pub host: String,

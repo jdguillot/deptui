@@ -576,10 +576,13 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
             }
             // Agent badge. Glyph-first (house rule): the suffix inside
             // the bracket carries the state, colour only reinforces —
-            // `!` failed, `~` offline-pending, bare = managed and fine.
+            // `!` failed, `⊘` ssh denied (host up, agent locked out),
+            // `≠` held, `~` offline-pending, bare = managed and fine.
             if let Some(m) = app.agent_managed.get(&node.name) {
                 let (label, color) = if m.failed {
                     (" [agent!]", theme::ERROR)
+                } else if m.denied {
+                    (" [agent⊘]", theme::ERROR)
                 } else if m.held {
                     (" [agent≠]", theme::WARNING)
                 } else if m.offline {
@@ -3397,7 +3400,11 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
         if let Some(op) = &app.agent.last_op {
             let last_w = 1 + hint_rows
                 .last()
-                .map(|r| r.iter().map(|(k, l)| k.len() + 1 + l.len() + 2).sum::<usize>())
+                .map(|r| {
+                    r.iter()
+                        .map(|(k, l)| k.len() + 1 + l.len() + 2)
+                        .sum::<usize>()
+                })
                 .unwrap_or(0);
             if last_w + 2 + op.chars().count() > inner_w {
                 op_own_row = true;
@@ -3563,6 +3570,19 @@ fn approve_warning_line(watch: &str, host: &str) -> Line<'static> {
         ),
         Span::styled(" cancels", Style::default().fg(theme::MUTED)),
     ])
+}
+
+/// Shorten a one-line message by cutting its middle: the first `head`
+/// and last `tail` characters survive, joined by `…`. Cuts land on
+/// char boundaries. Messages that already fit are returned as-is.
+fn elide_middle(msg: &str, head: usize, tail: usize) -> String {
+    let n = msg.chars().count();
+    if n <= head + tail + 1 {
+        return msg.to_string();
+    }
+    let front: String = msg.chars().take(head).collect();
+    let back: String = msg.chars().skip(n - tail).collect();
+    format!("{}… …{}", front.trim_end(), back.trim_start())
 }
 
 fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
@@ -3770,10 +3790,14 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 // The standing approval outranks the parked states it
                 // unlocks — approving a cancelled host otherwise left
                 // `!` in place with no sign the approval registered.
+                let denied = h.offline_rev.is_some() && h.offline_denied;
                 let (glyph, style) = if h.approved && h.deployed_rev.is_none() {
                     ("↑", Style::default().fg(theme::ACCENT))
                 } else if h.failed_rev.is_some() {
                     ("!", Style::default().fg(theme::ERROR))
+                } else if denied {
+                    // Up but locked out: a call to action, not a sleep.
+                    ("⊘", Style::default().fg(theme::ERROR))
                 } else if h.held_rev.is_some() {
                     ("≠", Style::default().fg(theme::WARNING))
                 } else if h.offline_rev.is_some() {
@@ -3824,14 +3848,11 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                             &mut state,
                         );
                     } else {
-                        let mut short_msg = msg.lines().next().unwrap_or("").to_string();
-                        if short_msg.len() > 60 {
-                            let cut = (0..=60)
-                                .rfind(|&i| short_msg.is_char_boundary(i))
-                                .unwrap_or(0);
-                            short_msg.truncate(cut);
-                            short_msg.push('…');
-                        }
+                        // Head *and* tail: an anyhow chain puts the
+                        // step first and the root cause last, and a
+                        // head-only cut lost exactly the part that
+                        // says what to fix.
+                        let short_msg = elide_middle(msg.lines().next().unwrap_or(""), 48, 72);
                         let text = if short_msg.is_empty() {
                             format!("failed {}", short_rev(rev))
                         } else {
@@ -3859,17 +3880,38 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                     );
                 }
                 if let (Some(rev), Some(t)) = (&h.offline_rev, h.offline_time) {
-                    seg(
-                        format!(
-                            "offline {} — {} pending",
-                            format_unix_ago(t),
-                            short_rev(rev)
-                        ),
-                        Style::default().fg(theme::WARNING),
-                        &mut state,
-                    );
-                }
-                if let Some(u) = &h.unreachable {
+                    // One segment per probe: state, what is waiting,
+                    // then ssh's reason. A separate "unreachable: …"
+                    // made one miss read as two problems.
+                    let why = h
+                        .unreachable
+                        .as_deref()
+                        .map(|u| format!(" — {u}"))
+                        .unwrap_or_default();
+                    if denied {
+                        seg(
+                            format!(
+                                "ssh denied {} — {} pending{why}",
+                                format_unix_ago(t),
+                                short_rev(rev)
+                            ),
+                            Style::default()
+                                .fg(theme::ERROR)
+                                .add_modifier(Modifier::BOLD),
+                            &mut state,
+                        );
+                    } else {
+                        seg(
+                            format!(
+                                "offline {} — {} pending{why}",
+                                format_unix_ago(t),
+                                short_rev(rev)
+                            ),
+                            Style::default().fg(theme::WARNING),
+                            &mut state,
+                        );
+                    }
+                } else if let Some(u) = &h.unreachable {
                     seg(
                         format!("unreachable: {u}"),
                         Style::default().fg(theme::ERROR),
@@ -3892,7 +3934,9 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                         &mut state,
                     );
                 }
-                let offline = h.offline_rev.is_some();
+                // Only a *sleeping* host is context rather than a call
+                // to action; a lockout keeps full colour.
+                let offline = h.offline_rev.is_some() && !denied;
                 let name_style = if is_sel {
                     Style::default()
                         .fg(theme::ON_ACCENT)
@@ -3999,6 +4043,29 @@ fn format_unix_ago_or_in(t: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn elide_middle_keeps_the_root_cause() {
+        let msg = "run setup failed: unlocking git-crypt in /var/lib/deptui-agent/clones/fleet \
+                   (the key must be an exported symmetric key): git-crypt unlock failed \
+                   (exit status: 1): Error: /run/git-crypt/key: unable to read key file";
+        let out = super::elide_middle(msg, 48, 72);
+        assert!(
+            out.starts_with("run setup failed: unlocking git-crypt in"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("Error: /run/git-crypt/key: unable to read key file"),
+            "{out}"
+        );
+        assert!(out.contains("… …"), "{out}");
+        assert!(out.chars().count() < msg.chars().count());
+        // Short messages pass through untouched; the cut is char-safe.
+        assert_eq!(super::elide_middle("boom", 48, 72), "boom");
+        let uni = "é".repeat(200);
+        let out = super::elide_middle(&uni, 10, 10);
+        assert_eq!(out.chars().count(), 10 + "… …".chars().count() + 10);
+    }
+
     use super::*;
     use crate::host::ProgressLine;
 

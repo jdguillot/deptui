@@ -19,7 +19,7 @@ use deptui_core::host::build_ssh_target;
 use crate::config::{AgentConfig, Cadence, WatchConfig};
 use crate::notify::{self, Event};
 use crate::runner::{self, check_reachable, RunPlan};
-use crate::state::{now_unix, AgentState, FailStamp, Stamp};
+use crate::state::{now_unix, AgentState};
 use crate::wire;
 
 /// Commands the API (and CLI verbs behind it) can send.
@@ -153,10 +153,7 @@ impl Daemon {
             next_poll.insert(w.name.clone(), first);
             cadences.insert(w.name.clone(), cadence);
         }
-        let config_snapshot = cfg
-            .source_path
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok());
+        let config_snapshot = cfg.source_path.as_ref().and_then(|p| std::fs::read(p).ok());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (log_tx, _) = broadcast::channel(1024);
         let pubkey = std::env::var_os("HOME")
@@ -247,12 +244,12 @@ impl Daemon {
             return false;
         };
         if self.idle() {
-            tracing::info!("updated agent {what} detected — exiting for systemd to restart into it");
+            tracing::info!(
+                "updated agent {what} detected — exiting for systemd to restart into it"
+            );
             return true;
         }
-        tracing::info!(
-            "updated agent {what} detected — restarting once the current work finishes"
-        );
+        tracing::info!("updated agent {what} detected — restarting once the current work finishes");
         self.restart_wanted = true;
         false
     }
@@ -389,12 +386,18 @@ impl Daemon {
                     .or_default();
                 match result {
                     Ok(()) => entry.unreachable = None,
-                    Err(msg) => {
-                        tracing::warn!("{host} ({target}) unreachable: {msg}");
-                        entry.unreachable = Some(msg.clone());
+                    Err(u) => {
+                        tracing::warn!("{host} ({target}) {}", u.headline());
+                        entry.unreachable = Some(u.message.clone());
+                        // A standing pending marker learns the fresh
+                        // verdict: a host that came up but now refuses
+                        // us must stop being drawn as asleep.
+                        if let Some(off) = entry.offline.as_mut() {
+                            off.denied = u.denied;
+                        }
                         notify::dispatch(
                             &self.cfg.notify,
-                            Event::new("unreachable", &w.name, Some(host), "", msg),
+                            Event::new("unreachable", &w.name, Some(host), "", u.headline()),
                         );
                     }
                 }
@@ -522,6 +525,7 @@ impl Daemon {
                             unreachable: hs.unreachable.clone(),
                             offline_rev: hs.offline.as_ref().map(|o| o.rev.clone()),
                             offline_time: hs.offline.as_ref().map(|o| o.time),
+                            offline_denied: hs.offline.as_ref().is_some_and(|o| o.denied),
                             held_rev: hs.held.as_ref().map(|s| s.rev.clone()),
                             held_time: hs.held.as_ref().map(|s| s.time),
                             approved: hs.approved,
@@ -765,21 +769,36 @@ impl Daemon {
                 })
                 .unwrap_or_default();
             let mut back = Vec::new();
-            let mut still_down = false;
+            let mut still_down: Vec<(String, crate::runner::Unreachable)> = Vec::new();
             for (host, stamp) in &offline {
                 let override_ = overrides.get(host).cloned().unwrap_or_default();
                 match check_reachable(&stamp.target, &override_).await {
                     Ok(()) => back.push(host.clone()),
-                    Err(_) => still_down = true,
+                    Err(u) => still_down.push((host.clone(), u)),
                 }
             }
-            if !back.is_empty() {
+            {
+                // Every probe's verdict lands in state: a host that
+                // answers sheds its marker and ssh's last words; one
+                // that doesn't keeps the freshest reason (and whether
+                // it is a lockout now rather than a sleep).
                 let ws = self.state.watch_mut(&watch);
                 for host in &back {
                     if let Some(hs) = ws.hosts.get_mut(host) {
                         hs.offline = None;
+                        hs.unreachable = None;
                     }
                 }
+                for (host, u) in &still_down {
+                    if let Some(hs) = ws.hosts.get_mut(host) {
+                        if let Some(off) = hs.offline.as_mut() {
+                            off.denied = u.denied;
+                        }
+                        hs.unreachable = Some(u.message.clone());
+                    }
+                }
+            }
+            if !back.is_empty() {
                 self.save_state();
                 tracing::info!(
                     "watch {watch}: {} back online — catching up",
@@ -787,7 +806,8 @@ impl Daemon {
                 );
                 self.request_poll(&watch, "catch-up").await;
             }
-            if still_down {
+            if !still_down.is_empty() {
+                self.save_state();
                 self.schedule_recheck(&watch);
             }
         }
@@ -905,9 +925,7 @@ impl Daemon {
                             "paused"
                         } else if at(&hs.deployed) {
                             "already deployed"
-                        } else if hs.failed.as_ref().map(|s| s.rev.as_str())
-                            == Some(rev.as_str())
-                        {
+                        } else if hs.failed.as_ref().map(|s| s.rev.as_str()) == Some(rev.as_str()) {
                             "parked at this revision (approve, or push a new commit)"
                         } else if at(&hs.held) {
                             "held (approve to let the next round deploy)"
@@ -922,9 +940,9 @@ impl Daemon {
                 } else {
                     format!(" — {}", parts.join("; "))
                 };
-                let _ = self
-                    .log_tx
-                    .send(format!("[{watch}] {trigger}: {short} needs no deploys{detail}"));
+                let _ = self.log_tx.send(format!(
+                    "[{watch}] {trigger}: {short} needs no deploys{detail}"
+                ));
             }
             self.save_state();
             return;
@@ -988,73 +1006,16 @@ impl Daemon {
         {
             let ws = self.state.watch_mut(&watch);
             for hr in &record.hosts {
-                let hs = ws.hosts.entry(hr.host.clone()).or_default();
-                match hr.outcome.as_str() {
-                    "ok" => {
-                        hs.deployed = Some(Stamp {
-                            rev: rev.clone(),
-                            time,
-                        });
-                        hs.failed = None;
-                        hs.offline = None;
-                        hs.held = None;
-                        // The ok was for this update; consumed.
-                        hs.approved = false;
-                        hs.deployed_toplevels = hr.toplevels.clone();
-                    }
-                    // Adoption: the host already ran this revision.
-                    "adopted" => {
-                        hs.deployed = Some(Stamp {
-                            rev: rev.clone(),
-                            time,
-                        });
-                        hs.failed = None;
-                        hs.offline = None;
-                        hs.held = None;
-                        hs.approved = false;
-                        hs.deployed_toplevels = hr.toplevels.clone();
-                    }
-                    "held" => {
-                        hs.held = Some(Stamp {
-                            rev: rev.clone(),
-                            time,
-                        });
-                    }
-                    "failed" => {
-                        hs.failed = Some(FailStamp {
-                            rev: rev.clone(),
-                            time,
-                            message: hr.message.clone().unwrap_or_default(),
-                        });
-                        hs.offline = None;
-                        // The approval bought this round; a standing ok
-                        // surviving a failure would retry every poll.
-                        hs.approved = false;
-                    }
-                    "offline" => {
-                        hs.offline = Some(crate::state::OfflineStamp {
-                            rev: rev.clone(),
-                            time,
-                            target: hr.target.clone().unwrap_or_default(),
-                        });
-                    }
-                    // A cancel parks the host exactly like a failure —
-                    // the run must not quietly resume at the next poll —
-                    // but the message tells the user it was their call.
-                    "cancelled" => {
-                        hs.failed = Some(FailStamp {
-                            rev: rev.clone(),
-                            time,
-                            message: hr.message.clone().unwrap_or_else(|| "cancelled".into()),
-                        });
-                        hs.offline = None;
-                        hs.approved = false;
-                    }
-                    _ => {}
-                }
+                ws.hosts
+                    .entry(hr.host.clone())
+                    .or_default()
+                    .apply_outcome(hr, &rev, time);
             }
         }
-        let had_offline = record.hosts.iter().any(|h| h.outcome == "offline");
+        let had_offline = record
+            .hosts
+            .iter()
+            .any(|h| matches!(h.outcome.as_str(), "offline" | "denied"));
         self.state.push_run(&watch, record);
         self.running = None;
         self.save_state();
