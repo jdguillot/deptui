@@ -207,11 +207,17 @@ repo = "git@github.com:me/infra.git"
 branch = "main"          # or: tag = "prod" (a moving tag)
 interval = "15m"         # or: cron = "0 */6 * * *"
 offline_recheck = "2m"   # re-probe cadence for offline hosts
+# git_crypt_key_file = "/run/secrets/infra-git-crypt.key"
+#                        # unlock the agent's clone (git-crypt export-key;
+#                        # symmetric key file — GPG mode is not supported)
+# post_checkout = "git lfs pull"
+#                        # sh -c hook in the fresh checkout after updates
 
 [watch.hosts.web]
 # deploy-rs flags, only-emit-if-changed like the TUI:
 # skip_checks / magic_rollback / auto_rollback / remote_build = true|false
 # catch_up = false      # disable deploy-on-return for this host
+# drift_guard = false   # allow deploying over out-of-band changes
 # mode = "boot"         # default "switch"
 # profile = "system"    # default "all"
 
@@ -271,6 +277,19 @@ Rules the agent lives by:
   arrives is *pending*, not failed: the agent re-probes it
   (`offline_recheck`) and deploys the moment it answers. Per-host
   `catch_up = false` opts out.
+- **The agent only overwrites what it deployed** (drift guard,
+  default on). It records the profile paths each deploy leaves and
+  holds instead of deploying over a host that changed out-of-band —
+  your uncommitted or other-branch work survives the scheduled
+  update. A manual deploy of a commit that IS in the watched history
+  (`configurationRevision` ancestry) passes through; `approve` buys
+  one round past the hold; `drift_guard = false` opts out.
+- **git-crypt repos work** — but only via the agent: the encryption
+  lives in the git objects, so any clone of a pre-unlocked mirror
+  checks out ciphertext again. Give the watch a
+  `git_crypt_key_file` (an exported symmetric key) and the agent
+  unlocks its own clone; `post_checkout` is the generic hook for
+  LFS/submodule-style preparations.
 - Sequential deploys, coalesced to the newest revision; state (and
   the last 50 runs per watch) in `/var/lib/deptui-agent`.
 - **Self-managing agents are safe by default.** An agent may watch
@@ -278,10 +297,12 @@ Rules the agent lives by:
   false` on the service so the activation can't kill the agent
   mid-deploy (the trap: unit changed → activation stops the agent →
   the run, the start-phase, and deploy-rs's confirmation all die with
-  it, leaving the service stopped). The running agent keeps its old
-  version until `systemctl restart deptui-agent` or a reboot; set
-  `restartOnUpdate = true` only if the agent never deploys its own
-  host.
+  it, leaving the service stopped). Instead the daemon notices a new
+  binary **or config** in the installed unit and restarts itself at
+  the next idle moment (`autoRestartWhenIdle`, default on — within a
+  minute, or right after the run in flight finishes). With it off,
+  every binary and config change needs a manual
+  `systemctl restart deptui-agent` after the switch.
 
 ### CLI
 

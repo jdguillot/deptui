@@ -1035,6 +1035,76 @@ fn drift_guard_can_be_disabled() {
     assert_eq!(deploy_calls(&env).len(), 2, "guard off: deploys anyway");
 }
 
+/// A config change hands over exactly like a binary update: activation
+/// never restarts the unit (self-deploy safety), so the daemon itself
+/// must notice the unit's `--config` no longer matches what it loaded
+/// and exit cleanly at idle. Same content at a new path stays put.
+#[test]
+fn idle_daemon_exits_cleanly_when_unit_names_new_config() {
+    let state = TempDir::new().unwrap();
+    let mk_cfg = |name: &str, extra: &str| {
+        let p = state.path().join(name);
+        fs::write(
+            &p,
+            format!(
+                "state_dir = \"{0}\"\nsocket = \"{0}/agent.sock\"\n{extra}",
+                state.path().display()
+            ),
+        )
+        .unwrap();
+        p
+    };
+    let cfg_a = mk_cfg("a.toml", "");
+    // Identical bytes at a different path: no restart — the behavior
+    // is the same, the path is not the point.
+    let cfg_same = mk_cfg("same.toml", "");
+    let unit = state.path().join("deptui-agent.service");
+    let exe = env!("CARGO_BIN_EXE_deptui-agent");
+    fs::write(
+        &unit,
+        format!("[Service]\nExecStart={exe} --config {} run\n", cfg_same.display()),
+    )
+    .unwrap();
+
+    let mut daemon = Command::new(exe)
+        .arg("--config")
+        .arg(&cfg_a)
+        .arg("run")
+        .env("DEPTUI_AGENT_SELF_RESTART", "1")
+        .env("DEPTUI_AGENT_SELF_CHECK_SECS", "1")
+        .env("DEPTUI_AGENT_UNIT", &unit)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        daemon.try_wait().unwrap().is_none(),
+        "identical config content must not trigger a restart"
+    );
+
+    // Point the unit at genuinely different content: hand over.
+    let cfg_b = mk_cfg("b.toml", "# changed\n");
+    fs::write(
+        &unit,
+        format!("[Service]\nExecStart={exe} --config {} run\n", cfg_b.display()),
+    )
+    .unwrap();
+    let start = Instant::now();
+    loop {
+        if let Some(st) = daemon.try_wait().unwrap() {
+            assert!(st.success(), "handover must be a clean exit: {st:?}");
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "daemon did not hand over to the new config"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// `pubkey` prints the public half and names the passphrase trap.
 #[test]
 fn pubkey_reads_and_diagnoses_identities() {

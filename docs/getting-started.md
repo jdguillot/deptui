@@ -241,6 +241,42 @@ This diagnoses the agent's identity first (missing / passphrase /
 ok — printing the public key), then probes every configured host.
 Each failure names its own fix.
 
+### Updates and config changes: when they actually take effect
+
+Deploying the agent host does **not** restart a running agent — that
+is deliberate (`restartOnUpdate = false` by default). An agent that
+deploys its *own* host would otherwise be killed by its own
+activation mid-run: the deploy driver, deploy-rs's confirmation, and
+the service itself all die together, leaving the unit stopped.
+
+Instead the daemon watches the installed unit itself (once a minute)
+and hands over **at the next idle moment** — exiting cleanly so
+systemd's `Restart=always` starts the new version. This covers both
+halves of the unit:
+
+- **a new binary** (you deployed a newer deptui-agent), and
+- **a new config** (you changed `services.deptui-agent.*` — watches,
+  keys, notify hooks; the generated TOML is part of `ExecStart`, and
+  the daemon compares the file's *content* against what it loaded at
+  startup).
+
+So after a switch, expect up to a minute — or, if a run is in flight,
+the moment it finishes — before the new binary/config is live. The
+journal says which it noticed: `updated agent binary/config detected`.
+`systemctl restart deptui-agent` is always a safe manual override
+when the agent is idle.
+
+Two situations still need a hand:
+
+- **`autoRestartWhenIdle = false`**: you opted out of the handover, so
+  *every* binary and config change needs a manual
+  `systemctl restart deptui-agent` after the switch. Until you
+  restart, the daemon keeps running with its old in-memory config —
+  a classic confusing symptom is an error naming a config value (a
+  key path, a repo URL) you already fixed.
+- **Agents older than v0.17.0** only noticed binary changes; config
+  changes always needed the manual restart.
+
 ### First encounters: the agent asks before it takes over
 
 The agent never blind-deploys a host it has never deployed. On first

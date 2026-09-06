@@ -42,6 +42,11 @@ pub struct AgentConfig {
     /// The repositories to watch. TOML `[[watch]]` tables.
     #[serde(default, rename = "watch")]
     pub watches: Vec<WatchConfig>,
+    /// Where this config was loaded from — recorded by [`Self::load`],
+    /// never a TOML field. The daemon's self-restart check re-reads it
+    /// to notice in-place edits.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
 }
 
 fn default_socket() -> PathBuf {
@@ -393,8 +398,9 @@ impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading agent config {}", path.display()))?;
-        let cfg: AgentConfig = toml::from_str(&text)
+        let mut cfg: AgentConfig = toml::from_str(&text)
             .with_context(|| format!("parsing agent config {}", path.display()))?;
+        cfg.source_path = Some(path.to_path_buf());
         cfg.validate()?;
         Ok(cfg)
     }

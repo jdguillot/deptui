@@ -111,6 +111,9 @@ pub struct Daemon {
     /// the new version. Enabled by DEPTUI_AGENT_SELF_RESTART.
     self_restart: bool,
     next_self_check: Instant,
+    /// Raw bytes of the config file as loaded at startup — the
+    /// baseline the self-restart check compares against.
+    config_snapshot: Option<Vec<u8>>,
     /// Set when an update was detected while busy — re-checked as
     /// soon as the daemon goes idle.
     restart_wanted: bool,
@@ -150,6 +153,10 @@ impl Daemon {
             next_poll.insert(w.name.clone(), first);
             cadences.insert(w.name.clone(), cadence);
         }
+        let config_snapshot = cfg
+            .source_path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok());
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (log_tx, _) = broadcast::channel(1024);
         let pubkey = std::env::var_os("HOME")
@@ -167,6 +174,7 @@ impl Daemon {
             validating: false,
             self_restart: std::env::var_os("DEPTUI_AGENT_SELF_RESTART").is_some(),
             next_self_check: now + self_check_interval(),
+            config_snapshot,
             restart_wanted: false,
             pending: Vec::new(),
             log_tx,
@@ -218,8 +226,11 @@ impl Daemon {
     }
 
     /// Periodic update check: returns true when the daemon should exit
-    /// (cleanly) so systemd restarts it as the new binary. Busy →
-    /// remember and hand over the moment the work finishes.
+    /// (cleanly) so systemd restarts it with the new binary *or* the
+    /// new config — activation deliberately never restarts the unit
+    /// (self-deploy safety), so a changed config would otherwise sit
+    /// unread in a store path the running process never looks at.
+    /// Busy → remember and hand over the moment the work finishes.
     fn self_check_due(&mut self) -> bool {
         if !self.self_restart || Instant::now() < self.next_self_check {
             return false;
@@ -227,18 +238,43 @@ impl Daemon {
         self.next_self_check = Instant::now() + self_check_interval();
         let unit = std::env::var("DEPTUI_AGENT_UNIT")
             .unwrap_or_else(|_| "/etc/systemd/system/deptui-agent.service".to_string());
-        if updated_exe(std::path::Path::new(&unit)).is_none() {
+        let unit = std::path::Path::new(&unit);
+        let what = if updated_exe(unit).is_some() {
+            "binary"
+        } else if self.updated_config(unit) {
+            "config"
+        } else {
             return false;
-        }
+        };
         if self.idle() {
-            tracing::info!(
-                "updated agent binary detected — exiting for systemd to restart into it"
-            );
+            tracing::info!("updated agent {what} detected — exiting for systemd to restart into it");
             return true;
         }
-        tracing::info!("updated agent binary detected — restarting once the current work finishes");
+        tracing::info!(
+            "updated agent {what} detected — restarting once the current work finishes"
+        );
         self.restart_wanted = true;
         false
+    }
+
+    /// Has the config the unit would start with diverged from what this
+    /// process loaded at startup? Content compare, not path compare: a
+    /// NixOS switch puts a *new store path* in ExecStart's `--config`,
+    /// an in-place edit keeps the path — both must hand over. An
+    /// unreadable file never triggers (a half-provisioned boot must not
+    /// restart-loop).
+    fn updated_config(&self, unit_path: &std::path::Path) -> bool {
+        let Some(loaded) = &self.config_snapshot else {
+            return false;
+        };
+        let target = exec_start_config(unit_path).or_else(|| self.cfg.source_path.clone());
+        let Some(target) = target else {
+            return false;
+        };
+        match std::fs::read(&target) {
+            Ok(now) => now != *loaded,
+            Err(_) => false,
+        }
     }
 
     /// The soonest scheduled poll or offline recheck, for the select!
@@ -1051,15 +1087,33 @@ fn self_check_interval() -> Duration {
 /// leaves the running agent alone (self-deploy safety); this is how
 /// the agent notices and hands over.
 fn updated_exe(unit_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let tokens = exec_start_tokens(unit_path)?;
+    let expected = std::fs::canonicalize(tokens.first()?).ok()?;
+    let current = std::fs::canonicalize("/proc/self/exe").ok()?;
+    (!same_install(&expected, &current)).then_some(expected)
+}
+
+/// The whitespace-split ExecStart argv of the installed unit.
+fn exec_start_tokens(unit_path: &std::path::Path) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(unit_path).ok()?;
     let line = text
         .lines()
         .map(str::trim_start)
         .find(|l| l.starts_with("ExecStart="))?;
-    let first = line.strip_prefix("ExecStart=")?.split_whitespace().next()?;
-    let expected = std::fs::canonicalize(first).ok()?;
-    let current = std::fs::canonicalize("/proc/self/exe").ok()?;
-    (!same_install(&expected, &current)).then_some(expected)
+    Some(
+        line.strip_prefix("ExecStart=")?
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// The `--config <path>` the installed unit would start with, when it
+/// names one.
+fn exec_start_config(unit_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let tokens = exec_start_tokens(unit_path)?;
+    let idx = tokens.iter().position(|t| t == "--config")?;
+    tokens.get(idx + 1).map(std::path::PathBuf::from)
 }
 
 /// Whether the unit's ExecStart and the running process come from the
@@ -1087,8 +1141,25 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::same_install;
+    use super::{exec_start_config, same_install};
     use std::path::Path;
+
+    #[test]
+    fn exec_start_config_finds_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("a.service");
+        std::fs::write(
+            &unit,
+            "[Service]\nExecStart=/nix/store/x/bin/deptui-agent --config /nix/store/y-config.toml run\n",
+        )
+        .unwrap();
+        assert_eq!(
+            exec_start_config(&unit),
+            Some("/nix/store/y-config.toml".into())
+        );
+        std::fs::write(&unit, "[Service]\nExecStart=/bin/foo run\n").unwrap();
+        assert_eq!(exec_start_config(&unit), None);
+    }
 
     #[test]
     fn same_install_same_file() {

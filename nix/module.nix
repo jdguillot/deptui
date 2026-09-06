@@ -260,13 +260,16 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        The agent notices when a deploy installed a newer unit/binary
-        and restarts itself at the next idle moment (within a minute;
-        immediately after a run finishes — which is what makes
-        self-deploy updates apply right after the run that shipped
-        them). Uses Restart=always plus a clean exit, so `systemctl
-        stop` still stops it. Disable to manage restarts entirely by
-        hand.
+        The agent notices when a deploy installed a newer unit —
+        binary *or* generated config — and restarts itself at the next
+        idle moment (within a minute; immediately after a run finishes
+        — which is what makes self-deploy updates apply right after
+        the run that shipped them). Uses Restart=always plus a clean
+        exit, so `systemctl stop` still stops it. Disable to manage
+        restarts entirely by hand — then every binary AND config
+        change needs a manual `systemctl restart deptui-agent` after
+        the switch, because activation deliberately never restarts the
+        unit (restartOnUpdate).
       '';
     };
 

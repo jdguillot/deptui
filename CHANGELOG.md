@@ -10,6 +10,34 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-09-06
+
+### Added
+
+- **Config changes apply themselves too.** The idle self-restart
+  check now watches both halves of the installed unit's ExecStart:
+  the binary (as before) and the `--config` file — compared by
+  *content*, so a NixOS switch (new store path) and an in-place edit
+  (same path, new bytes) both hand over at the next idle moment.
+  Before, activation deliberately not restarting the unit
+  (self-deploy safety) meant every agent config change silently
+  didn't apply until a manual `systemctl restart deptui-agent`, with
+  the daemon erroring against values already fixed on disk — the
+  reported case: a corrected `git_crypt_key_file` path that the
+  running daemon's stale in-memory config never saw. Same content at
+  a new path does not restart. The journal names what it noticed
+  ("updated agent binary/config detected").
+
+### Changed
+
+- Docs: getting-started gains "Updates and config changes: when they
+  actually take effect" (the restart model, the
+  `autoRestartWhenIdle = false` caveat, the stale-in-memory-config
+  symptom); the README's agent section catches up on the drift
+  guard, git-crypt watches, `post_checkout`, and the self-restart
+  behavior (it still described the pre-0.14 manual-restart world);
+  module option descriptions updated to match.
+
 ## [0.16.0] — 2026-09-06
 
 ### Added

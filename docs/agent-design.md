@@ -86,6 +86,16 @@ rationale record; CLAUDE.md carries the working invariants.
   `--validate` mode exits non-zero for CI/module assertions.
 - `deptui-agent check [--watch NAME] [--once]` — oneshot poll+deploy escape
   hatch for cron/timer purists, no daemon required.
+- **Self-restart at idle** (`autoRestartWhenIdle`, default on):
+  activation never restarts the unit (self-deploy safety —
+  `restartOnUpdate = false`); the daemon compares the installed unit's
+  ExecStart against itself every 60s — the binary (by install, the
+  wrapper makes file compare wrong) AND the `--config` file (by
+  *content*: a NixOS switch changes the store path, an in-place edit
+  doesn't) — and exits cleanly at the next idle moment for
+  `Restart=always` to start the new version. Without this, a config
+  change silently doesn't apply until a manual restart, with the
+  daemon erroring against values the user already fixed on disk.
 
 ## API & control plane
 
