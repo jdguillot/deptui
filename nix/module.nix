@@ -211,6 +211,18 @@ in
     systemd.services.deptui-agent = {
       description = "deptui auto-deploy agent";
       restartIfChanged = cfg.restartOnUpdate;
+      # A passphrase-protected key makes a headless agent silently
+      # useless (SSH_ASKPASS=/bin/false skips the prompt and every
+      # auth fails as plain "Permission denied"). Say so at startup —
+      # loudly, but without blocking the service: the control API is
+      # still worth serving.
+      preStart = lib.mkIf (cfg.sshKeyFile != null) ''
+        if ! ${pkgs.openssh}/bin/ssh-keygen -y -P "" -f ${lib.escapeShellArg cfg.sshKeyFile} >/dev/null 2>&1; then
+          echo "WARNING: ${cfg.sshKeyFile} is passphrase-protected or unreadable —" >&2
+          echo "         a headless agent cannot use it; every ssh will fail with" >&2
+          echo "         'Permission denied'. Strip it: ssh-keygen -p -N \"\" -f <key>" >&2
+        fi
+      '';
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];

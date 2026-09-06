@@ -10,6 +10,17 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-09-05
+
+### Fixed
+
+- A passphrase-protected `sshKeyFile` made the agent silently useless
+  (headless ssh skips the prompt; every host fails with a bare
+  "Permission denied"). The module now checks the key at service
+  start and logs a loud, actionable warning naming the fix
+  (`ssh-keygen -p -N ""`) — without blocking the service, since the
+  control API is still worth serving.
+
 ## [0.10.0] — 2026-09-05
 
 ### Added
