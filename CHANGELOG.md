@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-09-06
+
 ### Added
 
 - **git-crypt watches.** Per-watch `git_crypt_key_file` (config +
