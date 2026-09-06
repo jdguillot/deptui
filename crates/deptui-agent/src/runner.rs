@@ -216,8 +216,7 @@ pub async fn execute(
 
     // Checkout + discovery happen once per run, not per host.
     let setup = async {
-        let dir = crate::gitwatch::ensure_checkout(state_dir, &watch.name, &watch.repo, &plan.rev)
-            .await?;
+        let dir = crate::gitwatch::ensure_checkout(state_dir, watch, &plan.rev).await?;
         let flake_ref = dir
             .to_str()
             .ok_or_else(|| anyhow!("clone path is not valid UTF-8"))?

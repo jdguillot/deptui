@@ -158,6 +158,31 @@ let
         example = "2m";
         description = "Re-probe cadence for offline hosts with a pending update (agent default: 2m).";
       };
+      git_crypt_key_file = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/secrets/dotfiles-git-crypt.key";
+        description = ''
+          Exported symmetric git-crypt key (`git-crypt export-key`) the
+          agent uses to unlock its clone of this watch. A string path to
+          a file outside the store (sops/agenix-provisioned, readable by
+          the agent user) — never a path literal, which would copy the
+          key into the world-readable store. Note that the decrypted
+          secrets then exist in the agent's clone under its state
+          directory, and — as with any manual deploy of a git-crypt
+          flake — in the nix store once built.
+        '';
+      };
+      post_checkout = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "git lfs pull";
+        description = ''
+          Command run via `sh -c` inside the fresh checkout after every
+          update (after the git-crypt unlock, when configured). Must be
+          non-interactive; a non-zero exit fails the run.
+        '';
+      };
       hosts = lib.mkOption {
         type = lib.types.attrsOf hostModule;
         default = { };

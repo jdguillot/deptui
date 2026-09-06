@@ -716,7 +716,7 @@ pub(crate) async fn validation_report(cfg: &AgentConfig) -> (String, u32) {
                 continue;
             }
         };
-        let dir = match gitwatch::ensure_checkout(&cfg.state_dir, &w.name, &w.repo, &rev).await {
+        let dir = match gitwatch::ensure_checkout(&cfg.state_dir, w, &rev).await {
             Ok(d) => d,
             Err(e) => {
                 out.push(format!("{}: checkout failed: {e:#}", w.name));

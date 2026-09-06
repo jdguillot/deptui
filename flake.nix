@@ -115,7 +115,12 @@
           # private clones it deploys from.
           deptui-agent = mkPackage {
             pname = "deptui-agent";
-            extraRuntime = [ pkgs.git ];
+            # git-crypt: unlocking watches whose repos carry encrypted
+            # secrets, and the smudge filter later checkouts invoke.
+            extraRuntime = [
+              pkgs.git
+              pkgs.git-crypt
+            ];
           };
           # Dev-profile variants: same wrapping, debug compile, no
           # tests. `nix run .#deptui-dev`, or `nix copy` them to
@@ -127,7 +132,10 @@
           };
           deptui-agent-dev = mkPackage {
             pname = "deptui-agent";
-            extraRuntime = [ pkgs.git ];
+            extraRuntime = [
+              pkgs.git
+              pkgs.git-crypt
+            ];
             buildType = "debug";
           };
           default = self.packages.${system}.deptui;

@@ -36,6 +36,15 @@ rationale record; CLAUDE.md carries the working invariants.
 - Update detection = `git ls-remote` head comparison. Deploys run from the
   agent's **private clone** at the detected commit — never from a human's
   working tree, never dirty-tree-triggered.
+- **Repo preparation** happens inside `ensure_checkout`, so the runner,
+  the oneshot `check`, and `validate` all get the identical tree:
+  per-watch `git_crypt_key_file` (exported symmetric key; unlock once,
+  filters re-pinned to PATH-resolved `git-crypt` each round so a GC'd
+  store path can't break checkouts; GPG mode unsupported — headless)
+  and `post_checkout` (generic `sh -c` hook in the fresh checkout —
+  LFS, submodules; non-interactive, 10-minute kill, non-zero fails the
+  run's setup). Decryption can only ever happen here: git-crypt lives
+  in the git objects, so any clone of an unlocked mirror re-encrypts.
 - Hosts deploy **sequentially**. Updates arriving mid-run **coalesce to the
   newest** head. **No same-commit retry**: a failed host is parked
   (failed-at-C) until a new commit, a kick, or a force-deploy.

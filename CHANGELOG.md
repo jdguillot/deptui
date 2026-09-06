@@ -10,6 +10,29 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- **git-crypt watches.** Per-watch `git_crypt_key_file` (config +
+  module option): the agent unlocks its private clone with an
+  exported symmetric key (`git-crypt export-key`; file path,
+  sops/agenix-provisioned — GPG mode is deliberately unsupported in a
+  headless daemon). Unlock happens once per clone; every round the
+  smudge/clean filter config is re-pinned to a PATH-resolved
+  `git-crypt` so a garbage-collected store path can't break later
+  checkouts. `git-crypt` ships in the agent package's wrapper. A
+  missing key file fails the run loudly instead of deploying
+  ciphertext. This is the only place decryption *can* happen —
+  git-crypt encrypts the git objects, so pointing a watch at an
+  unlocked local mirror still checks out ciphertext.
+- **Per-watch `post_checkout` hook** (config + module option): a
+  `sh -c` command run inside the fresh checkout after every update
+  (after the unlock, when both are set) — the escape hatch for `git
+  lfs pull`, submodule init, and other repo preparations. Headless
+  rules apply: prompts fail fast, a hang is killed after ten minutes,
+  a non-zero exit fails the run's setup with the hook's stderr.
+  Both run inside `ensure_checkout`, so the daemon's runs, oneshot
+  `check`, and `validate` all prepare the identical tree.
+
 ## [0.15.1] — 2026-09-06
 
 ### Fixed

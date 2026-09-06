@@ -35,6 +35,10 @@ struct Env {
     /// The ssh shim answers `nixos-version --json` with this file's
     /// contents — the running generation's provenance.
     conf_rev: PathBuf,
+    /// Every `git-crypt` invocation appends its argv here; `unlock`
+    /// also drops the real tool's `.git/git-crypt/keys/default` marker
+    /// in the cwd (the clone).
+    git_crypt_log: PathBuf,
 }
 
 fn setup(deploy_exit: i32) -> Env {
@@ -92,6 +96,23 @@ fn setup_with(deploy_exit: i32, extra_host_cfg: &str) -> Env {
     .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
 
+    // `git-crypt` shim: record argv; `unlock` leaves the marker the
+    // real tool would, so the agent's skip-if-unlocked check works.
+    let git_crypt_log = shims.path().join("git-crypt-calls.log");
+    let git_crypt = shims.path().join("git-crypt");
+    fs::write(
+        &git_crypt,
+        format!(
+            "#!/bin/sh\n\
+             echo \"$@\" >> {log}\n\
+             if [ \"$1\" = \"unlock\" ]; then mkdir -p .git/git-crypt/keys && touch .git/git-crypt/keys/default; fi\n\
+             exit 0\n",
+            log = git_crypt_log.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&git_crypt, fs::Permissions::from_mode(0o755)).unwrap();
+
     let shim_path = format!(
         "{}:{}",
         shims.path().display(),
@@ -140,7 +161,17 @@ offline_recheck = "1s"
         down_marker,
         remote_path,
         conf_rev,
+        git_crypt_log,
     }
+}
+
+/// Append watch-level config lines to the generated config file.
+fn add_watch_cfg(env: &Env, lines: &str) {
+    let cfg = fs::read_to_string(&env.config_path).unwrap().replace(
+        "offline_recheck = \"1s\"\n",
+        &format!("offline_recheck = \"1s\"\n{lines}"),
+    );
+    fs::write(&env.config_path, cfg).unwrap();
 }
 
 fn commit(env: &Env, content: &str) {
@@ -834,6 +865,69 @@ fn daemon_waits_for_cadence_and_approval_takes_next_round() {
 
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();
+}
+
+/// git-crypt watches: the agent unlocks its clone once with the
+/// exported key, later rounds skip the unlock (marker present), and
+/// the filter config is re-pinned to PATH resolution so a GC'd
+/// git-crypt store path can't break future checkouts.
+#[test]
+fn git_crypt_watch_unlocks_once_and_repins_filters() {
+    let env = setup(0);
+    let key = env.state.path().join("gc.key");
+    fs::write(&key, "exported-key-bytes").unwrap();
+    add_watch_cfg(&env, &format!("git_crypt_key_file = \"{}\"\n", key.display()));
+
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(deploy_calls(&env).len(), 1);
+
+    let clone = env.state.path().join("clones/infra");
+    assert!(clone.join(".git/git-crypt/keys/default").exists());
+    let gc_calls = fs::read_to_string(&env.git_crypt_log).unwrap();
+    assert_eq!(
+        gc_calls.trim(),
+        format!("unlock {}", key.display()),
+        "exactly one unlock, with the key"
+    );
+    let smudge = Command::new("git")
+        .args(["-C", &clone.to_string_lossy(), "config", "filter.git-crypt.smudge"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&smudge.stdout).trim(),
+        "\"git-crypt\" smudge",
+        "filter must resolve git-crypt via PATH"
+    );
+
+    // Next update: no second unlock, deploy proceeds normally.
+    commit(&env, "{ two = 1; }");
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert_eq!(deploy_calls(&env).len(), 2);
+    let gc_calls = fs::read_to_string(&env.git_crypt_log).unwrap();
+    assert_eq!(gc_calls.lines().count(), 1, "already unlocked: {gc_calls}");
+}
+
+/// A configured-but-missing key file is a loud setup failure naming
+/// the option, not a deploy of ciphertext.
+#[test]
+fn git_crypt_missing_key_fails_loudly() {
+    let env = setup(0);
+    add_watch_cfg(&env, "git_crypt_key_file = \"/nonexistent/gc.key\"\n");
+
+    let out = agent(&env, &["check"]);
+    assert!(!out.status.success(), "missing key must fail the run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("git_crypt_key_file") && stdout.contains("does not exist"),
+        "{stdout}"
+    );
+    assert_eq!(deploy_calls(&env).len(), 0, "nothing deployed");
 }
 
 /// The drift guard: after the agent has deployed a host, an

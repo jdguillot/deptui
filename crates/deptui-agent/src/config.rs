@@ -137,6 +137,22 @@ pub struct WatchConfig {
     /// string; default "2m".
     #[serde(default)]
     pub offline_recheck: Option<String>,
+    /// Exported symmetric git-crypt key (`git-crypt export-key <file>`)
+    /// used to unlock the agent's private clone. The encryption lives
+    /// in the git objects, so only the agent's own checkout can
+    /// decrypt — pointing the watch at an unlocked local mirror does
+    /// nothing. A file path (sops/agenix-provisioned), never inline;
+    /// GPG-mode unlocking is deliberately unsupported (headless).
+    #[serde(default)]
+    pub git_crypt_key_file: Option<PathBuf>,
+    /// Command run via `sh -c` inside the fresh checkout after every
+    /// update (and after the git-crypt unlock) — the escape hatch for
+    /// repo preparations the agent doesn't know about: `git lfs pull`,
+    /// submodule init, …. Non-interactive like every other child; a
+    /// non-zero exit fails the run's setup, and a hang is killed after
+    /// ten minutes.
+    #[serde(default)]
+    pub post_checkout: Option<String>,
     /// Hosts to push to, keyed by the node name in `deploy.nodes`.
     /// Deployed sequentially in the order given by the map (BTreeMap:
     /// alphabetical — predictable, if not configurable yet).
@@ -555,6 +571,24 @@ interval = "15m"
         let bad = minimal("offline_recheck = \"nope\"\n");
         let cfg: AgentConfig = toml::from_str(&bad).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn git_crypt_and_post_checkout_parse() {
+        let cfg: AgentConfig = toml::from_str(&minimal("")).unwrap();
+        assert!(cfg.watches[0].git_crypt_key_file.is_none());
+        assert!(cfg.watches[0].post_checkout.is_none());
+
+        let toml = minimal(
+            "git_crypt_key_file = \"/run/secrets/gc.key\"\npost_checkout = \"git lfs pull\"\n",
+        );
+        let cfg: AgentConfig = toml::from_str(&toml).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.watches[0].git_crypt_key_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/gc.key"))
+        );
+        assert_eq!(cfg.watches[0].post_checkout.as_deref(), Some("git lfs pull"));
     }
 
     #[test]

@@ -557,6 +557,16 @@ Key invariants worth knowing before touching the code:
   against a fresh agent rolling hosts back to a stale repo. The
   daemon's first poll also waits for the cadence: starting the agent
   is not a deploy trigger.
+- **Repo preparation lives in `gitwatch::ensure_checkout`.** The
+  git-crypt unlock (`git_crypt_key_file`, exported symmetric key only
+  — GPG needs a pinentry, which a headless daemon must never wait on)
+  and the `post_checkout` hook run there so runner, oneshot `check`,
+  and `validate` prepare identical trees. The filter config is
+  re-pinned to PATH-resolved `git-crypt` every round: unlock records
+  the unlocking binary's absolute store path, and a GC'd path there
+  breaks every later checkout. git-crypt encrypts git *objects* —
+  decryption can only happen in the agent's own checkout, never via
+  a pre-unlocked mirror it clones from.
 - **The agent only overwrites what it deployed.** Every successful
   deploy/adoption records the remote profile paths (`deployed_toplevels`
   in state); the drift guard re-reads them pre-deploy and holds on a

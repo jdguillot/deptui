@@ -286,6 +286,61 @@ The view shows watches, per-host state, and the agent's full log
 (searchable, selectable, yankable — same powers as the main job log),
 with `u` kick, `p`/`P` pause, `x` cancel, `Enter` approve.
 
+### git-crypt repos (and other repo preparations)
+
+git-crypt encrypts the *git objects*: plaintext only ever exists in a
+checkout whose repo has the filters plus the key. The agent deploys
+from its own private clone, so an unlocked working tree elsewhere —
+yours, or a local mirror you keep fresh — helps nothing: the agent's
+clone checks the secrets out encrypted again, and the deploy fails
+evaluating ciphertext. The agent has to hold a key.
+
+Export a symmetric key once, from any unlocked checkout:
+
+```console
+$ git-crypt export-key /tmp/dotfiles-git-crypt.key
+```
+
+Provision it to the agent host (sops-nix/agenix — same pattern as the
+listener token: a root-owned file handed to the agent user, never the
+store) and point the watch at it:
+
+```nix
+services.deptui-agent.watches.dotfiles = {
+  repo = "git@github.com:me/dotfiles.git";
+  branch = "main";
+  interval = "1h";
+  git_crypt_key_file = "/run/secrets/dotfiles-git-crypt.key";
+  hosts.ryzn-server = { };
+};
+```
+
+The agent unlocks its clone on the first run (a one-time operation —
+git-crypt installs its smudge filter, so every later checkout decrypts
+automatically) and keeps the filter pinned to a PATH-resolved
+`git-crypt` so a garbage-collected store path can't break future
+checkouts. GPG-mode unlocking is deliberately unsupported: the agent
+is headless, and a GPG pinentry prompt is a silent outage.
+
+Two things to be aware of, both equally true of your manual deploys
+today: the decrypted secrets exist in the agent's clone (under its
+state directory, owned by the agent user), and building the flake
+copies the tree into the world-readable nix store. If that last part
+bothers you, the long-term fix is sops-nix/agenix for the secrets
+themselves — ciphertext in the store, decryption on the target.
+
+For repo preparations the agent doesn't know about — `git lfs pull`,
+submodule bootstrap — there's a generic escape hatch, run via `sh -c`
+in the fresh checkout after every update (after the unlock, when both
+are set):
+
+```nix
+services.deptui-agent.watches.dotfiles.post_checkout = "git lfs pull";
+```
+
+It must be non-interactive; a non-zero exit (or a ten-minute hang)
+fails the run with the hook's stderr in the log.
+
 ### Notifications
 
 ```nix
