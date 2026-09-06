@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-09-06
+
 ### Added
 
 - **Drift guard: the agent only overwrites what it deployed.** Every
