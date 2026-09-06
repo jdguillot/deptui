@@ -759,8 +759,14 @@ async fn validate(cli: &Cli, state_dir: Option<PathBuf>) -> Result<()> {
             // No daemon — fall through to the local walk.
         }
         Err(e) => {
-            // Daemon answered with a failing report (400) or errored.
-            bail!("{e:#}");
+            let msg = format!("{e:#}");
+            if msg.contains("older than this CLI") {
+                bail!("{msg}");
+            }
+            // The failing report itself (400 body): it is the answer,
+            // not an error wrapper — print it plainly, exit non-zero.
+            println!("{msg}");
+            std::process::exit(1);
         }
     }
     let cfg = load_config(cli, state_dir)?;

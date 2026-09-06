@@ -10,6 +10,18 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.13.3] — 2026-09-06
+
+### Fixed
+
+- A CLI newer than the running daemon said "HTTP 404:" — every verb
+  now explains version skew outright ("the running agent is older
+  than this CLI … restart it once"), since the service deliberately
+  keeps running across updates.
+- A failing `validate` printed its whole report under an "Error:"
+  prefix; the report is the answer, not an error wrapper — it prints
+  plainly and the command exits non-zero.
+
 ## [0.13.2] — 2026-09-06
 
 ### Fixed

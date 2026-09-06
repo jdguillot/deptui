@@ -98,6 +98,15 @@ pub async fn post_json<T: serde::de::DeserializeOwned>(socket: &Path, path: &str
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(resp: Response) -> Result<T> {
+    if resp.status == 404 {
+        // A route this CLI knows but the daemon doesn't: version skew.
+        // Naming it beats a bare "HTTP 404" for every future verb too.
+        bail!(
+            "the running agent doesn't know this endpoint — it is older than \
+             this CLI (the service keeps running across updates by design). \
+             Restart it once: sudo systemctl restart deptui-agent"
+        );
+    }
     if !(200..300).contains(&resp.status) {
         // The server sends {"error": "..."} bodies; show them plainly.
         if let Ok(err) = serde_json::from_slice::<crate::wire::ErrorReply>(&resp.body) {
