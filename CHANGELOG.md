@@ -10,6 +10,18 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Fixed
+
+- The self-restart-on-update check restarted the agent once a minute,
+  forever: the flake wraps the binary (`wrapProgram`), so the unit's
+  ExecStart names the wrapper script while the running process is the
+  `.deptui-agent-wrapped` sibling — the two paths never compared
+  equal, every 60s check said "updated binary", and each restart left
+  a ~5s window with no control socket (the intermittent "connecting
+  to the agent socket … No such file or directory" in the TUI). The
+  check now compares the install (same `bin/` directory), not the
+  file.
+
 ### Added
 
 - Getting-started: the kick listener has a real section — why kicks

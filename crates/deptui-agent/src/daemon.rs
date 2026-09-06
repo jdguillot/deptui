@@ -1002,7 +1002,19 @@ fn updated_exe(unit_path: &std::path::Path) -> Option<std::path::PathBuf> {
     let first = line.strip_prefix("ExecStart=")?.split_whitespace().next()?;
     let expected = std::fs::canonicalize(first).ok()?;
     let current = std::fs::canonicalize("/proc/self/exe").ok()?;
-    (expected != current).then_some(expected)
+    (!same_install(&expected, &current)).then_some(expected)
+}
+
+/// Whether the unit's ExecStart and the running process come from the
+/// same install. Compared by parent directory, not by file: the flake
+/// wraps the binary (`wrapProgram`), so ExecStart names a wrapper
+/// script at `$out/bin/deptui-agent` that execs
+/// `$out/bin/.deptui-agent-wrapped` — the running exe never equals the
+/// wrapper path, and a file comparison declared "updated binary" on
+/// every check, restarting the agent once a minute forever.
+fn same_install(expected: &std::path::Path, current: &std::path::Path) -> bool {
+    expected == current
+        || matches!((expected.parent(), current.parent()), (Some(a), Some(b)) if a == b)
 }
 
 /// SIGTERM (systemd stop) or ctrl-c.
@@ -1013,5 +1025,33 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = term.recv() => {}
         _ = int.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_install;
+    use std::path::Path;
+
+    #[test]
+    fn same_install_same_file() {
+        let p = Path::new("/nix/store/aaa-deptui-agent-0.14.0/bin/deptui-agent");
+        assert!(same_install(p, p));
+    }
+
+    #[test]
+    fn same_install_wrapper_and_wrapped_sibling() {
+        assert!(same_install(
+            Path::new("/nix/store/aaa-deptui-agent-0.14.0/bin/deptui-agent"),
+            Path::new("/nix/store/aaa-deptui-agent-0.14.0/bin/.deptui-agent-wrapped"),
+        ));
+    }
+
+    #[test]
+    fn same_install_different_store_paths() {
+        assert!(!same_install(
+            Path::new("/nix/store/bbb-deptui-agent-0.14.1/bin/deptui-agent"),
+            Path::new("/nix/store/aaa-deptui-agent-0.14.0/bin/.deptui-agent-wrapped"),
+        ));
     }
 }
