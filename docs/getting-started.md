@@ -57,8 +57,6 @@ remote-controls the agent over ssh:
 
 ```mermaid
 flowchart LR
-    repo[("git repo<br/>watched branch")]
-
     subgraph ws["your workstation"]
         tui["deptui TUI"]
     end
@@ -68,15 +66,17 @@ flowchart LR
     end
 
     subgraph fleet["fleet — deploy.nodes"]
-        web["web"]
-        db["db"]
+        host1["host1"]
+        host2["host2"]
         more["..."]
     end
 
-    tui -- "direct deploys<br/>(your ssh key)" --> web & db & more
+    repo[("git repo<br/>watched branch")]
+
+    tui -- "direct deploys<br/>(your ssh key)" --> fleet
     tui -- "agent mode (a):<br/>ssh agent-host deptui-agent ..." --> agent
+    agent -- "scheduled deploys<br/>(its own generated key)" --> fleet
     agent -- "polls on schedule<br/>(or kick / catch-up)" --> repo
-    agent -- "scheduled deploys<br/>(its own generated key)" --> web & db & more
 ```
 
 (agent-host may itself be one of the fleet nodes — the module makes
@@ -95,14 +95,14 @@ services.deptui-agent = {
   enable = true;
   # "infra" is your name for this watch; the keys under `hosts` are
   # NOT arbitrary — each must match a node name in the watched
-  # flake's `deploy.nodes` ("web" and "db" here are placeholders for
-  # whatever your nodes are called).
+  # flake's `deploy.nodes` ("host1"/"host2" stand in for whatever
+  # your nodes are called).
   watches.infra = {
     repo = "git@github.com:you/infra.git";  # or https://…
     branch = "main";                        # or tag = "prod" (a moving tag)
     interval = "15m";                       # or cron = "0 */6 * * *"
-    hosts.web = { };                        # ← deploy.nodes.web, deploy-rs defaults
-    hosts.db = { remote_build = true; };    # ← deploy.nodes.db, per-host overrides
+    hosts.host1 = { };                      # ← deploy.nodes.host1, deploy-rs defaults
+    hosts.host2 = { remote_build = true; }; # ← deploy.nodes.host2, per-host overrides
   };
   # who may control the agent over ssh / from the TUI (socket access):
   users = [ "yourname" ];
