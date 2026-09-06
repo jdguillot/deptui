@@ -57,6 +57,21 @@ rationale record; CLAUDE.md carries the working invariants.
   host, pause flags (runtime state that overlays config and survives
   restarts), and history: last ~50 runs per watch, per-run log capped at
   2000 lines (matching the TUI cap).
+- **Drift guard** (per-host `drift_guard`, default on): the agent only
+  overwrites what it put there. Every successful deploy (and adoption)
+  records the remote profile paths it left active; before the next
+  deploy of that host the runner re-reads them. A mismatch means the
+  host was changed out-of-band since the agent's last deploy — the
+  host is **held** (notify fires; a new revision re-checks) — with one
+  escape hatch: when the running generation's `configurationRevision`
+  (`nixos-version --json`) is a commit in the watched history, the
+  change was a manual deploy of committed work and the update
+  proceeds with a log note. No rev, a `dirty` marker, or an unknown
+  commit protect the generation — uncommitted or other-branch work is
+  exactly what the guard exists for. An approval bypasses the guard
+  for the one round it buys; an empty baseline (pre-guard state files,
+  failed read-back) leaves the guard disarmed until the next
+  successful deploy rather than holding on stale data.
 - **Startup/reload validation**: check each target's non-interactive
   reachability; on failure warn + mark unreachable + notify, keep running.
   `--validate` mode exits non-zero for CI/module assertions.

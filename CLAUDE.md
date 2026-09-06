@@ -557,6 +557,14 @@ Key invariants worth knowing before touching the code:
   against a fresh agent rolling hosts back to a stale repo. The
   daemon's first poll also waits for the cadence: starting the agent
   is not a deploy trigger.
+- **The agent only overwrites what it deployed.** Every successful
+  deploy/adoption records the remote profile paths (`deployed_toplevels`
+  in state); the drift guard re-reads them pre-deploy and holds on a
+  mismatch — unless the running generation's `configurationRevision`
+  is an ancestor of the watched rev (manual deploy of committed work
+  passes; dirty/other-branch WIP is protected). Approval bypasses the
+  guard for its one round; an empty baseline disarms rather than
+  holding on stale data. Per-host `drift_guard = false` opts out.
 - **Pause is not stop.** Pause gates *future* polls; `cancel`
   (`POST /cancel`, CLI `cancel`, TUI `x` in the agent view) is what
   stops a run in flight — it signals the deploy's process group via

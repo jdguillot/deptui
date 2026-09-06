@@ -28,6 +28,13 @@ struct Env {
     deploy_log: PathBuf,
     /// While this file exists, the `ssh` shim reports the host down.
     down_marker: PathBuf,
+    /// The ssh shim answers `readlink` commands with this file's
+    /// contents (absent → empty, like a host with no answer) — the
+    /// "what the host is running" knob for the drift-guard tests.
+    remote_path: PathBuf,
+    /// The ssh shim answers `nixos-version --json` with this file's
+    /// contents — the running generation's provenance.
+    conf_rev: PathBuf,
 }
 
 fn setup(deploy_exit: i32) -> Env {
@@ -59,14 +66,27 @@ fn setup_with(deploy_exit: i32, extra_host_cfg: &str) -> Env {
     fs::set_permissions(&deploy, fs::Permissions::from_mode(0o755)).unwrap();
 
     // `ssh` shim: up unless the down-marker exists. The catch-up probe
-    // (and the daemon's rechecks) go through this.
+    // (and the daemon's rechecks) go through this. `readlink` and
+    // `nixos-version` remote commands answer from control files so the
+    // drift-guard paths are testable; absent files → empty output,
+    // which is what the pre-guard shim produced.
     let down_marker = shims.path().join("host-down");
+    let remote_path = shims.path().join("remote-path");
+    let conf_rev = shims.path().join("conf-rev");
     let ssh = shims.path().join("ssh");
     fs::write(
         &ssh,
         format!(
-            "#!/bin/sh\nif [ -e {} ]; then echo 'Connection refused' >&2; exit 255; fi\nexit 0\n",
-            down_marker.display()
+            "#!/bin/sh\n\
+             if [ -e {down} ]; then echo 'Connection refused' >&2; exit 255; fi\n\
+             case \"$*\" in\n\
+             *nixos-version*) cat {conf} 2>/dev/null; exit 0;;\n\
+             *readlink*) cat {path} 2>/dev/null; exit 0;;\n\
+             esac\n\
+             exit 0\n",
+            down = down_marker.display(),
+            conf = conf_rev.display(),
+            path = remote_path.display(),
         ),
     )
     .unwrap();
@@ -118,7 +138,34 @@ offline_recheck = "1s"
         config_path,
         deploy_log,
         down_marker,
+        remote_path,
+        conf_rev,
     }
+}
+
+fn commit(env: &Env, content: &str) {
+    fs::write(env.repo.path().join("flake.nix"), content).unwrap();
+    git(env.repo.path(), &["add", "flake.nix"]);
+    git(env.repo.path(), &["commit", "-qm", content]);
+}
+
+fn head_rev(env: &Env) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env.repo.path())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Flip the approved bit in the state file directly — the oneshot
+/// `check` tests have no daemon socket to send `approve` through, and
+/// the state file is a documented, deletable plain-JSON contract.
+fn approve_in_state(env: &Env) {
+    let p = env.state.path().join("state.json");
+    let mut v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+    v["watches"]["infra"]["hosts"]["web"]["approved"] = serde_json::Value::Bool(true);
+    fs::write(&p, serde_json::to_string(&v).unwrap()).unwrap();
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -787,6 +834,111 @@ fn daemon_waits_for_cadence_and_approval_takes_next_round() {
 
     unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
     let _ = daemon.wait();
+}
+
+/// The drift guard: after the agent has deployed a host, an
+/// out-of-band change holds the next update instead of overwriting it
+/// — unless the running generation's `configurationRevision` is in
+/// the watched history (a manual deploy of committed work), or the
+/// human approves.
+#[test]
+fn drift_guard_protects_out_of_band_changes() {
+    let env = setup(0); // bootstrap = "deploy": first deploy is blind
+    let first_rev = head_rev(&env);
+    fs::write(&env.remote_path, "/nix/store/aaa-system\n").unwrap();
+
+    // Deploy #1: the read-back arms the guard.
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(deploy_calls(&env).len(), 1);
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.state.path().join("state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        state["watches"]["infra"]["hosts"]["web"]["deployed_toplevels"]["system"],
+        "/nix/store/aaa-system",
+        "baseline recorded: {state}"
+    );
+
+    // New commit, host untouched since our deploy: a normal update.
+    commit(&env, "{ two = 1; }");
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert_eq!(deploy_calls(&env).len(), 2);
+
+    // Out-of-band change with no provenance: HELD, nothing deployed.
+    fs::write(&env.remote_path, "/nix/store/bbb-system\n").unwrap();
+    commit(&env, "{ three = 1; }");
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "held is not a failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("HELD"), "{stdout}");
+    assert!(
+        stdout.contains("changed on the host since the agent's last deploy"),
+        "{stdout}"
+    );
+    assert_eq!(deploy_calls(&env).len(), 2, "must not overwrite the WIP");
+
+    // Same generation, but its configurationRevision is a commit in
+    // the watched history: a manual deploy of committed work — the
+    // next update goes through and re-arms on the new path.
+    fs::write(
+        &env.conf_rev,
+        format!("{{\"configurationRevision\":\"{first_rev}\"}}\n"),
+    )
+    .unwrap();
+    commit(&env, "{ four = 1; }");
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("in the watched history"),
+        "escape-hatch note missing: {stdout}"
+    );
+    assert_eq!(deploy_calls(&env).len(), 3);
+
+    // Out-of-band again, provenance now a dirty marker (no commit):
+    // held; then approval buys exactly the next round through.
+    fs::write(&env.remote_path, "/nix/store/ccc-system\n").unwrap();
+    fs::write(&env.conf_rev, "{\"configurationRevision\":\"dirty\"}\n").unwrap();
+    commit(&env, "{ five = 1; }");
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("HELD"));
+    assert_eq!(deploy_calls(&env).len(), 3);
+
+    approve_in_state(&env);
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(deploy_calls(&env).len(), 4, "approval unlocks the round");
+}
+
+/// `drift_guard = false` opts a host out entirely.
+#[test]
+fn drift_guard_can_be_disabled() {
+    let env = setup_with(0, "bootstrap = \"deploy\"\ndrift_guard = false\n");
+    fs::write(&env.remote_path, "/nix/store/aaa-system\n").unwrap();
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert_eq!(deploy_calls(&env).len(), 1);
+
+    fs::write(&env.remote_path, "/nix/store/bbb-system\n").unwrap();
+    commit(&env, "{ two = 1; }");
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert_eq!(deploy_calls(&env).len(), 2, "guard off: deploys anyway");
 }
 
 /// `pubkey` prints the public half and names the passphrase trap.

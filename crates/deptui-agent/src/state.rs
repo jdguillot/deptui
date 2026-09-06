@@ -83,6 +83,14 @@ pub struct HostState {
     /// host answers. Cleared by any later success or real failure.
     #[serde(default)]
     pub offline: Option<OfflineStamp>,
+    /// What the agent's last successful deploy left on the host, per
+    /// profile (remote store path read back after activation). The
+    /// drift guard compares against this before the next deploy; an
+    /// out-of-band change holds instead of overwriting. Empty = guard
+    /// disarmed (pre-guard state files, or the read-back failed) —
+    /// re-armed by the next successful deploy.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deployed_toplevels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +143,12 @@ pub struct HostRun {
     /// store it in [`OfflineStamp`] without re-resolving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// For `"ok"`/`"adopted"`: the remote profile paths the run left
+    /// (or found) active, recorded into
+    /// [`HostState::deployed_toplevels`]. Empty when the read-back
+    /// failed — the guard disarms rather than holding on stale data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub toplevels: BTreeMap<String, String>,
 }
 
 pub fn now_unix() -> u64 {

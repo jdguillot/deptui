@@ -10,6 +10,23 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- **Drift guard: the agent only overwrites what it deployed.** Every
+  successful deploy (and adoption) records the remote profile paths
+  it left active; before the next deploy the agent re-reads them, and
+  a host changed out-of-band since then is HELD instead of
+  overwritten — your uncommitted or other-branch work-in-progress
+  survives the weekly update. One escape hatch: when the running
+  generation's `configurationRevision` (`nixos-version --json`) is a
+  commit in the watched history, the change was a manual deploy of
+  committed work and the update proceeds with a log note. Approval
+  (`approve` / Enter) buys one round past the guard, same as the
+  other holds. Per-host `drift_guard = false` (module option
+  `drift_guard`) opts out. Hosts deployed before this release have no
+  recorded baseline yet — the guard arms on their next successful
+  deploy.
+
 ## [0.14.4] — 2026-09-06
 
 ### Fixed

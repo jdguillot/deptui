@@ -531,6 +531,13 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                 Some(runner::PlanHost {
                     name: h.clone(),
                     adopt: !hs.approved && hs.deployed.is_none(),
+                    // Approval bypasses the drift guard for the one
+                    // round it buys — same rule as the daemon.
+                    recorded_toplevels: if hs.approved {
+                        Default::default()
+                    } else {
+                        hs.deployed_toplevels.clone()
+                    },
                 })
             })
             .collect();
@@ -568,6 +575,7 @@ async fn check_once(cli: &Cli, only: Option<String>, state_dir: Option<PathBuf>)
                     hs.offline = None;
                     hs.held = None;
                     hs.approved = false;
+                    hs.deployed_toplevels = hr.toplevels.clone();
                 }
                 "held" => {
                     hs.held = Some(state::Stamp {

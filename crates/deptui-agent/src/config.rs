@@ -185,6 +185,14 @@ pub struct HostConfig {
     /// revision.
     #[serde(default)]
     pub catch_up: Option<bool>,
+    /// Drift guard (default true): before deploying, verify the host
+    /// still runs what this agent last put there. Changed out-of-band
+    /// → held, unless the running generation's
+    /// `configurationRevision` is in the watched history (a manual
+    /// deploy of committed work is legitimate; uncommitted or
+    /// other-branch work is exactly what the guard protects).
+    #[serde(default)]
+    pub drift_guard: Option<bool>,
     /// Extra arguments forwarded to `nix build` via deploy-rs's `--`
     /// tail.
     #[serde(default)]
@@ -249,6 +257,10 @@ impl HostConfig {
 
     pub fn catch_up(&self) -> bool {
         self.catch_up.unwrap_or(true)
+    }
+
+    pub fn drift_guard(&self) -> bool {
+        self.drift_guard.unwrap_or(true)
     }
 
     pub fn ssh_override(&self) -> SshOverride {
@@ -543,6 +555,20 @@ interval = "15m"
         let bad = minimal("offline_recheck = \"nope\"\n");
         let cfg: AgentConfig = toml::from_str(&bad).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn drift_guard_defaults_on_and_can_be_disabled() {
+        let cfg: AgentConfig = toml::from_str(&minimal("")).unwrap();
+        assert!(cfg.watches[0].hosts["web"].drift_guard());
+
+        let toml = minimal("").replace(
+            "[watch.hosts.web]\n",
+            "[watch.hosts.web]\ndrift_guard = false\n",
+        );
+        let cfg: AgentConfig = toml::from_str(&toml).unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.watches[0].hosts["web"].drift_guard());
     }
 
     #[test]

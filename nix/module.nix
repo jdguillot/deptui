@@ -105,6 +105,16 @@ let
         default = null;
         description = "First-encounter policy: probe-and-hold (default) or pure-GitOps deploy.";
       };
+      drift_guard = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = ''
+          Hold instead of deploying when the host was changed outside the
+          agent since its last deploy (agent default: true). A manual
+          deploy of a commit that is in the watched history passes; a
+          dirty-tree or other-branch generation is protected.
+        '';
+      };
       extra_build_args = lib.mkOption {
         type = lib.types.listOf lib.types.str;
         default = [ ];

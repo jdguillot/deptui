@@ -38,11 +38,21 @@ pub struct PlanHost {
     /// a repo that is *behind* the host would otherwise be rolled
     /// forward onto it as a rollback.
     pub adopt: bool,
+    /// What the agent's last successful deploy left on the host, per
+    /// profile — the drift guard's baseline. Empty disables the guard
+    /// for this round: no record yet (pre-guard state, first deploy),
+    /// or an approval standing in as the human's override.
+    pub recorded_toplevels: std::collections::BTreeMap<String, String>,
 }
 
 /// How one host ended, when the deploy machinery itself didn't error.
 pub enum DeployOutcome {
-    Deployed,
+    Deployed {
+        /// Remote profile paths read back after activation — the next
+        /// round's drift-guard baseline. Empty when the read-back
+        /// failed (guard disarms rather than holding on stale data).
+        toplevels: std::collections::BTreeMap<String, String>,
+    },
     /// The host was down before we started and `catch_up` is on: the
     /// update stays pending and the daemon re-probes `target`.
     Offline {
@@ -54,7 +64,11 @@ pub enum DeployOutcome {
     Cancelled,
     /// First encounter and the target already runs the watched
     /// revision's closure: recorded as deployed, nothing pushed.
-    Adopted,
+    Adopted {
+        /// The paths the probe found running — same role as
+        /// [`DeployOutcome::Deployed::toplevels`].
+        toplevels: std::collections::BTreeMap<String, String>,
+    },
     /// First encounter and the target runs something else: refused to
     /// deploy over it. The message says what differed.
     Held {
@@ -224,6 +238,7 @@ pub async fn execute(
                     outcome: "failed".into(),
                     message: Some(msg.clone()),
                     target: None,
+                    toplevels: Default::default(),
                 });
                 notify::dispatch(
                     notify_cfg,
@@ -253,6 +268,7 @@ pub async fn execute(
                 outcome: "cancelled".into(),
                 message: Some("run cancelled before this host started".into()),
                 target: None,
+                toplevels: Default::default(),
             });
             continue;
         }
@@ -260,8 +276,7 @@ pub async fn execute(
             watch,
             &flake_ref,
             &nodes,
-            host,
-            ph.adopt,
+            ph,
             &plan.rev,
             notify_cfg,
             cancel_rx.clone(),
@@ -269,7 +284,7 @@ pub async fn execute(
         )
         .await;
         match outcome {
-            Ok(DeployOutcome::Adopted) => {
+            Ok(DeployOutcome::Adopted { toplevels }) => {
                 log(
                     &mut record,
                     format!(
@@ -282,6 +297,7 @@ pub async fn execute(
                     outcome: "adopted".into(),
                     message: None,
                     target: None,
+                    toplevels,
                 });
             }
             Ok(DeployOutcome::Held { message }) => {
@@ -297,6 +313,7 @@ pub async fn execute(
                     outcome: "held".into(),
                     message: Some(message.clone()),
                     target: None,
+                    toplevels: Default::default(),
                 });
                 notify::dispatch(
                     notify_cfg,
@@ -316,6 +333,7 @@ pub async fn execute(
                     outcome: "cancelled".into(),
                     message: Some("cancelled by user".into()),
                     target: None,
+                    toplevels: Default::default(),
                 });
             }
             Ok(DeployOutcome::Offline { target, message }) => {
@@ -331,9 +349,10 @@ pub async fn execute(
                     outcome: "offline".into(),
                     message: Some(message),
                     target: Some(target),
+                    toplevels: Default::default(),
                 });
             }
-            Ok(DeployOutcome::Deployed) => {
+            Ok(DeployOutcome::Deployed { toplevels }) => {
                 log(
                     &mut record,
                     format!("[{}] {host}: deployed {short}", watch.name),
@@ -343,6 +362,7 @@ pub async fn execute(
                     outcome: "ok".into(),
                     message: None,
                     target: None,
+                    toplevels,
                 });
                 notify::dispatch(
                     notify_cfg,
@@ -366,6 +386,7 @@ pub async fn execute(
                     outcome: "failed".into(),
                     message: Some(msg.clone()),
                     target: None,
+                    toplevels: Default::default(),
                 });
                 notify::dispatch(
                     notify_cfg,
@@ -389,18 +410,19 @@ async fn deploy_host(
     watch: &WatchConfig,
     flake_ref: &str,
     nodes: &[flake::Node],
-    host: &str,
-    adopt: bool,
+    ph: &PlanHost,
     rev: &str,
     notify_cfg: &NotifyConfig,
     mut cancel_rx: watch::Receiver<bool>,
     mut log: impl FnMut(String),
 ) -> Result<DeployOutcome> {
+    let host = &ph.name;
+    let adopt = ph.adopt;
     let hc = watch
         .hosts
         .get(host)
         .ok_or_else(|| anyhow!("host `{host}` is not configured in watch `{}`", watch.name))?;
-    let node = nodes.iter().find(|n| n.name == host).ok_or_else(|| {
+    let node = nodes.iter().find(|n| &n.name == host).ok_or_else(|| {
         anyhow!(
             "node `{host}` not found in deploy.nodes at {}",
             &rev[..rev.len().min(12)]
@@ -426,6 +448,24 @@ async fn deploy_host(
         ));
     }
 
+    // The profiles this host config actually manages — shared by the
+    // first-encounter probe, the drift guard, and the post-deploy
+    // read-back that arms it.
+    let profiles: Vec<String> = node
+        .ordered_profiles()
+        .into_iter()
+        .filter(|p| {
+            match hc
+                .profile_sel()
+                .unwrap_or(deptui_core::deploy::ProfileSel::All)
+            {
+                deptui_core::deploy::ProfileSel::All => true,
+                deptui_core::deploy::ProfileSel::System => p == "system",
+                deptui_core::deploy::ProfileSel::Home => p == "home",
+            }
+        })
+        .collect();
+
     // First encounter (unless the host opted into bootstrap deploys):
     // probe instead of deploying. A fresh agent state says nothing
     // about the *host* — it may already run this revision (adopt), or
@@ -434,27 +474,18 @@ async fn deploy_host(
     if adopt && !hc.bootstrap_deploys() {
         let override_ = hc.ssh_override();
         let askpass = askpass_disabled();
-        let profiles: Vec<String> = node
-            .ordered_profiles()
-            .into_iter()
-            .filter(|p| {
-                match hc
-                    .profile_sel()
-                    .unwrap_or(deptui_core::deploy::ProfileSel::All)
-                {
-                    deptui_core::deploy::ProfileSel::All => true,
-                    deptui_core::deploy::ProfileSel::System => p == "system",
-                    deptui_core::deploy::ProfileSel::Home => p == "home",
-                }
-            })
-            .collect();
+        let mut toplevels = std::collections::BTreeMap::new();
         for profile in &profiles {
             match deptui_core::host::check_profile_up_to_date(
                 flake_ref, node, profile, &override_, &askpass,
             )
             .await
             {
-                Ok(check) if check.up_to_date => continue,
+                Ok(check) if check.up_to_date => {
+                    if !check.remote_path.is_empty() {
+                        toplevels.insert(profile.clone(), check.remote_path.clone());
+                    }
+                }
                 Ok(check) => {
                     let what = if check.not_deployed {
                         format!("profile `{profile}` has never been deployed there")
@@ -470,7 +501,73 @@ async fn deploy_host(
                 }
             }
         }
-        return Ok(DeployOutcome::Adopted);
+        // All-or-nothing: a partial baseline would false-hold the
+        // profile it missed at the next round.
+        if toplevels.len() != profiles.len() {
+            toplevels.clear();
+        }
+        return Ok(DeployOutcome::Adopted { toplevels });
+    }
+
+    // Drift guard: the agent only overwrites what it put there. Each
+    // recorded profile path is compared against what the host runs
+    // right now; a mismatch means someone changed the host out-of-band
+    // since our last deploy — hold and protect it, unless the running
+    // generation's `configurationRevision` is in the watched history
+    // (a manual deploy of committed work is legitimate; uncommitted or
+    // other-branch WIP is exactly what must not be overwritten).
+    // Approval and `drift_guard = false` arrive here with an empty map.
+    if hc.drift_guard() && !ph.recorded_toplevels.is_empty() {
+        let override_ = hc.ssh_override();
+        let askpass = askpass_disabled();
+        for (profile, recorded) in &ph.recorded_toplevels {
+            let current = match deptui_core::host::read_remote_profile_path(
+                node, profile, &override_, &askpass,
+            )
+            .await
+            {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    return Ok(DeployOutcome::Held {
+                        message: format!(
+                            "profile `{profile}` is no longer deployed on the host \
+                             (the agent last left {})",
+                            short_store(recorded)
+                        ),
+                    });
+                }
+                Err(e) => {
+                    return Ok(DeployOutcome::Held {
+                        message: format!("drift-guard probe failed: {e:#}"),
+                    });
+                }
+            };
+            if current == *recorded {
+                continue;
+            }
+            // The escape hatch. One generation, one blessing: an
+            // in-history rev covers the whole host, so stop checking.
+            if let Ok(Some(running_rev)) =
+                deptui_core::host::read_remote_configuration_rev(node, &override_, &askpass).await
+            {
+                if crate::gitwatch::is_ancestor(Path::new(flake_ref), &running_rev, rev).await {
+                    log(format!(
+                        "[{host}] note: host was deployed out-of-band to {} — that commit is \
+                         in the watched history, updating over it",
+                        &running_rev[..running_rev.len().min(12)]
+                    ));
+                    break;
+                }
+            }
+            return Ok(DeployOutcome::Held {
+                message: format!(
+                    "profile `{profile}` changed on the host since the agent's last deploy \
+                     (running {}, agent left {}) — protecting possible work in progress",
+                    short_store(&current),
+                    short_store(recorded),
+                ),
+            });
+        }
     }
 
     notify::dispatch(
@@ -550,10 +647,44 @@ async fn deploy_host(
         return Err(anyhow!("deploy failed to run: {e}"));
     }
     match exit {
-        Some(0) => Ok(DeployOutcome::Deployed),
+        Some(0) => {
+            // Arm the drift guard: read back what activation left on
+            // the host. All-or-nothing — a partial baseline would
+            // false-hold the profile it missed next round.
+            let override_ = hc.ssh_override();
+            let askpass = askpass_disabled();
+            let mut toplevels = std::collections::BTreeMap::new();
+            for profile in &profiles {
+                match deptui_core::host::read_remote_profile_path(
+                    node, profile, &override_, &askpass,
+                )
+                .await
+                {
+                    Ok(Some(p)) => {
+                        toplevels.insert(profile.clone(), p);
+                    }
+                    _ => {
+                        toplevels.clear();
+                        break;
+                    }
+                }
+            }
+            if toplevels.is_empty() {
+                log(format!(
+                    "[{host}] note: couldn't read the deployed profile paths back — \
+                     drift guard disarmed until the next successful deploy"
+                ));
+            }
+            Ok(DeployOutcome::Deployed { toplevels })
+        }
         Some(code) => Err(anyhow!("deploy exited with code {code}")),
         None => Err(anyhow!("deploy ended without an exit status")),
     }
+}
+
+/// Store-path basename, for hold messages a human has to read.
+fn short_store(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -567,6 +698,7 @@ mod tests {
             outcome: outcome.into(),
             message: None,
             target: None,
+            toplevels: Default::default(),
         };
         assert_eq!(summarize_outcomes(&[]), "nothing to do");
         assert_eq!(summarize_outcomes(&[hr("held")]), "1 held");

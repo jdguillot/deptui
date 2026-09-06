@@ -561,6 +561,60 @@ async fn resolve_local_toplevel_quiet(wrapper_path: &str, remote_path: &str) -> 
     None
 }
 
+/// The store path a profile currently resolves to on the remote — the
+/// cheap remote half of [`check_profile_up_to_date`], for callers that
+/// only need what the host is running *right now* (the agent's drift
+/// guard records and re-reads this). `Ok(None)` = the profile link
+/// doesn't exist there.
+pub async fn read_remote_profile_path(
+    node: &Node,
+    profile: &str,
+    override_: &SshOverride,
+    askpass: &AskpassEnv,
+) -> Result<Option<String>> {
+    let remote_cmd = match profile {
+        "system" => "readlink -f /run/current-system".to_string(),
+        "home" => {
+            r#"if [ -L ~/.local/state/nix/profiles/home-manager ]; then readlink -f ~/.local/state/nix/profiles/home-manager; elif [ -L ~/.nix-profile ]; then readlink -f ~/.nix-profile; else printf 'NOT_DEPLOYED\n'; fi"#.to_string()
+        }
+        other => return Err(anyhow!("unknown profile `{other}`")),
+    };
+    let target = build_ssh_target(node, profile, override_);
+    let out = ssh_capture(&target, &remote_cmd, override_, askpass).await?;
+    let first = out.lines().next().unwrap_or("").trim();
+    if first.is_empty() || first == "NOT_DEPLOYED" {
+        return Ok(None);
+    }
+    Ok(Some(first.to_string()))
+}
+
+/// The git revision the running NixOS generation was built from, when
+/// the flake records one (`nixos-version --json` →
+/// `configurationRevision`). `Ok(None)`: the field is unset, null, or
+/// not a plain commit hash (a `"dirty"` marker must not pass an
+/// ancestry check).
+pub async fn read_remote_configuration_rev(
+    node: &Node,
+    override_: &SshOverride,
+    askpass: &AskpassEnv,
+) -> Result<Option<String>> {
+    let target = build_ssh_target(node, "system", override_);
+    let out = ssh_capture(&target, "nixos-version --json", override_, askpass).await?;
+    let parsed: serde_json::Value = match serde_json::from_str(out.trim()) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let rev = parsed
+        .get("configurationRevision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if rev.len() >= 7 && rev.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(Some(rev.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Medium-tier check: closure size delta.
 ///
 /// Runs `nix path-info --closure-size` locally against the `local_path`

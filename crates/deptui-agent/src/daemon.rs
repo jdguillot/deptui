@@ -835,6 +835,14 @@ impl Daemon {
                 // rollback attempt would be exactly backwards. An
                 // approval turns the probe-and-hold into a real deploy.
                 adopt: !hs.approved && hs.deployed.is_none(),
+                // Approval bypasses the drift guard the same way it
+                // bypasses the holds: empty baseline = guard off for
+                // the one round the approval buys.
+                recorded_toplevels: if hs.approved {
+                    Default::default()
+                } else {
+                    hs.deployed_toplevels.clone()
+                },
             });
         }
         if hosts.is_empty() {
@@ -956,6 +964,7 @@ impl Daemon {
                         hs.held = None;
                         // The ok was for this update; consumed.
                         hs.approved = false;
+                        hs.deployed_toplevels = hr.toplevels.clone();
                     }
                     // Adoption: the host already ran this revision.
                     "adopted" => {
@@ -967,6 +976,7 @@ impl Daemon {
                         hs.offline = None;
                         hs.held = None;
                         hs.approved = false;
+                        hs.deployed_toplevels = hr.toplevels.clone();
                     }
                     "held" => {
                         hs.held = Some(Stamp {

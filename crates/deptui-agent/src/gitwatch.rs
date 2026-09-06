@@ -80,6 +80,20 @@ pub async fn ensure_checkout(
     Ok(dir)
 }
 
+/// Is `ancestor` reachable from `descendant` in the watch's clone?
+/// Backs the drift guard's escape hatch: a host manually deployed to a
+/// commit that IS in the watched history is a legitimate deploy, not
+/// work to protect. Any failure — rev unknown to the clone, not a
+/// commit, git error — is `false`: unverifiable means hold.
+pub async fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> bool {
+    git(
+        Some(dir),
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    )
+    .await
+    .is_ok()
+}
+
 /// Run git, surfacing stderr in the error (house rule: never swallow a
 /// child's stderr).
 async fn git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
@@ -172,5 +186,12 @@ mod tests {
 
         // Unknown ref is None, not an error.
         assert!(ls_remote(&rp, "refs/heads/nope").await.unwrap().is_none());
+
+        // Ancestry, in the agent's clone: rev1 precedes rev2, a rev is
+        // its own ancestor, and garbage is unverifiable → false.
+        assert!(is_ancestor(&dir, &rev1, &rev2).await);
+        assert!(is_ancestor(&dir, &rev2, &rev2).await);
+        assert!(!is_ancestor(&dir, &rev2, &rev1).await);
+        assert!(!is_ancestor(&dir, "deadbeef", &rev2).await);
     }
 }
