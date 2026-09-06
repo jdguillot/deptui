@@ -10,6 +10,12 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- `docs/getting-started.md`: the new-user walkthrough — TUI in one
+  command, the agent's three-step trust setup, adoption/approval
+  semantics, notifications, CI kicks, and a troubleshooting table.
+
 ## [0.11.0] — 2026-09-05
 
 ### Added

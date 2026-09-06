@@ -6,6 +6,8 @@ and (on demand) which ones are running stale builds, and lets you push
 NixOS host configs, home-manager configs, or both — either as an
 immediate switch or as a new boot entry for next boot.
 
+**New here? Start with [docs/getting-started.md](docs/getting-started.md).**
+
 ## Features
 
 - Auto-discovers every entry in `deploy.nodes` from a flake.
