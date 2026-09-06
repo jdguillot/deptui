@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-09-06
+
 ### Added
 
 - **Agent view: a hung sshd is "ssh unresponsive", not "offline".**
