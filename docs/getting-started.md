@@ -94,7 +94,7 @@ declaratively, e.g.:
 
 ```nix
 users.users.yourname.openssh.authorizedKeys.keys = [
-  "ssh-ed25519 AAAA… deptui-agent@agent-host"
+  "ssh-ed25519 AAAA… deptui-agent@<agent-host>"  # paste pubkey's output verbatim
 ];
 ```
 
