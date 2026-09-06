@@ -361,8 +361,9 @@ services.deptui-agent = {
 at it:
 
 ```bash
-ssh <agent-host> "sudo install -o deptui-agent -g deptui-agent -m 400 \
-  <(openssl rand -hex 32) /var/lib/deptui-agent/listen-token"
+ssh <agent-host> 'openssl rand -hex 32 | sudo tee /var/lib/deptui-agent/listen-token >/dev/null \
+  && sudo chown deptui-agent:deptui-agent /var/lib/deptui-agent/listen-token \
+  && sudo chmod 400 /var/lib/deptui-agent/listen-token'
 ```
 
 ```nix
