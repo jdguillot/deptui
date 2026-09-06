@@ -1,5 +1,8 @@
 # Getting started
 
+(Anything in `<angle-brackets>` below is yours to replace — e.g.
+`<agent-host>` is the hostname/IP of the machine running the agent.)
+
 Two pieces — the TUI stands alone; the agent is optional on top:
 
 - **`deptui`** — a terminal UI for [deploy-rs](https://github.com/serokell/deploy-rs):
@@ -82,10 +85,11 @@ the machine.
 ### Authorize its key
 
 ```bash
-ssh agent-host deptui-agent pubkey
+ssh <agent-host> deptui-agent pubkey   # <agent-host> = where the agent runs
 ```
 
-Add that line to the deploy user's `authorized_keys` on every target —
+Add the printed line to the deploy user's `authorized_keys` on every
+target —
 declaratively, e.g.:
 
 ```nix
@@ -152,7 +156,7 @@ module manages).
 ### Check the chain
 
 ```bash
-ssh agent-host deptui-agent validate
+ssh <agent-host> deptui-agent validate
 ```
 
 This diagnoses the agent's identity first (missing / passphrase /
@@ -214,12 +218,11 @@ services.deptui-agent = {
 - run: |
     curl -fsS -X POST \
       -H "Authorization: Bearer ${{ secrets.DEPTUI_KICK_TOKEN }}" \
-      "https://agent-host:7337/kick?watch=infra"
+      "https://<agent-host>:7337/kick?watch=infra"
 ```
 
 The TCP listener serves *only* kick + status; the full control
-surface never leaves the group-gated Unix socket. (`ssh agent-host
-deptui-agent kick` works too, with no open port at all.)
+surface never leaves the group-gated Unix socket. (`ssh <agent-host> deptui-agent kick` works too, with no open port at all.)
 
 ## Troubleshooting one-liners
 

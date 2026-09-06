@@ -232,8 +232,8 @@ So the whole trust setup is:
 
 ```bash
 # 1. enable the agent and deploy its host — it generates its key
-# 2. read the public half:
-ssh agent-host deptui-agent pubkey
+# 2. read the public half (<agent-host> = where the agent runs):
+ssh <agent-host> deptui-agent pubkey
 # 3. add that line to your targets' authorized_keys (declaratively!)
 #    and deploy them once
 ```
