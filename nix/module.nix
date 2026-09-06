@@ -21,8 +21,8 @@ let
   generatedSettings =
     {
       # `[[watch]]` tables from the `watches.<name>` attrset, the name
-      # folded in.
-      watch = lib.mapAttrsToList (name: w: w // { inherit name; }) cfg.watches;
+      # folded in and unset (null) typed options scrubbed.
+      watch = lib.mapAttrsToList (name: w: scrub (w // { inherit name; })) cfg.watches;
     }
     // lib.optionalAttrs cfg.listen.enable {
       listen = {
@@ -31,10 +31,130 @@ let
       };
     };
 
-  mergedSettings = lib.recursiveUpdate generatedSettings cfg.settings;
+  # Typed options default to null when unset; TOML has no null, so
+  # unset fields are scrubbed before generation (empty attrsets stay —
+  # `hosts.web = { }` is meaningful).
+  scrub =
+    v: if lib.isAttrs v then lib.mapAttrs (_: scrub) (lib.filterAttrs (_: x: x != null) v) else v;
+
+  mergedSettings = lib.recursiveUpdate generatedSettings (scrub cfg.settings);
   configFile = settingsFormat.generate "deptui-agent-config.toml" mergedSettings;
 
   defaultUser = "deptui-agent";
+
+  # Typed per-host options with a freeform escape hatch: every knob
+  # the agent's TOML schema knows is a real, documented, mergeable
+  # NixOS option, and anything the schema grows later still passes
+  # through untyped.
+  hostModule = lib.types.submodule {
+    freeformType = settingsFormat.type;
+    options = {
+      profile = lib.mkOption {
+        type = lib.types.nullOr (
+          lib.types.enum [
+            "all"
+            "system"
+            "home"
+          ]
+        );
+        default = null;
+        description = "Which deploy-rs profiles to push (agent default: all).";
+      };
+      mode = lib.mkOption {
+        type = lib.types.nullOr (
+          lib.types.enum [
+            "switch"
+            "boot"
+          ]
+        );
+        default = null;
+        description = "Activation mode (agent default: switch).";
+      };
+      skip_checks = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "deploy-rs -s / --skip-checks (unset: deploy-rs default).";
+      };
+      magic_rollback = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "deploy-rs --magic-rollback (unset: deploy-rs default, on).";
+      };
+      auto_rollback = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "deploy-rs --auto-rollback (unset: deploy-rs default, on).";
+      };
+      remote_build = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Build on the target instead of the agent host.";
+      };
+      catch_up = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Deploy a pending update when an offline host returns (agent default: true).";
+      };
+      bootstrap = lib.mkOption {
+        type = lib.types.nullOr (
+          lib.types.enum [
+            "hold"
+            "deploy"
+          ]
+        );
+        default = null;
+        description = "First-encounter policy: probe-and-hold (default) or pure-GitOps deploy.";
+      };
+      extra_build_args = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Extra arguments forwarded to nix build via deploy-rs's -- tail.";
+      };
+    };
+  };
+
+  watchModule = lib.types.submodule {
+    freeformType = settingsFormat.type;
+    options = {
+      repo = lib.mkOption {
+        type = lib.types.str;
+        description = "Git URL or local path to watch — anything `git clone` accepts.";
+      };
+      branch = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Branch whose head to follow. Exactly one of branch/tag.";
+      };
+      tag = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Moving tag to follow. Exactly one of branch/tag.";
+      };
+      interval = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "15m";
+        description = "Poll cadence as a duration. Exactly one of interval/cron.";
+      };
+      cron = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "0 */6 * * *";
+        description = "Poll cadence as a cron expression. Exactly one of interval/cron.";
+      };
+      offline_recheck = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "2m";
+        description = "Re-probe cadence for offline hosts with a pending update (agent default: 2m).";
+      };
+      hosts = lib.mkOption {
+        type = lib.types.attrsOf hostModule;
+        default = { };
+        description = "Hosts to deploy, keyed by node name in deploy.nodes.";
+      };
+    };
+  };
 in
 {
   options.services.deptui-agent = {
@@ -58,7 +178,7 @@ in
     };
 
     watches = lib.mkOption {
-      type = lib.types.attrsOf settingsFormat.type;
+      type = lib.types.attrsOf watchModule;
       default = { };
       example = lib.literalExpression ''
         {

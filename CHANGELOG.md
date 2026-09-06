@@ -10,6 +10,23 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-09-06
+
+### Changed
+
+- `services.deptui-agent.watches` is now properly typed: watches and
+  their hosts are option submodules — documented, defaulted,
+  type-checked at eval, and mergeable across modules — with a
+  freeform fallback so schema additions still pass through. Existing
+  freeform definitions keep working; unset options are scrubbed
+  before TOML generation.
+
+### Added
+
+- docs: the NixOS sudoers recipe for targets, and why deptui ships
+  no option for it (wrong machine, and store-path scoping is
+  security theater — the grant belongs where you can see it).
+
 ### Added
 
 - `docs/getting-started.md`: the new-user walkthrough — TUI in one

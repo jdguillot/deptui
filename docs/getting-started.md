@@ -82,7 +82,25 @@ trusts a target on first contact and pins it from then on
 
 The targets must accept **non-interactive activation**: a root deploy
 user, or NOPASSWD sudo for the deploy user. A headless daemon cannot
-answer prompts — anything that would prompt fails fast instead.
+answer prompts — anything that would prompt fails fast instead. On
+NixOS targets:
+
+```nix
+security.sudo.extraRules = [{
+  users = [ "yourname" ];
+  commands = [ { command = "ALL"; options = [ "NOPASSWD" ]; } ];
+}];
+# (or simply security.sudo.wheelNeedsPassword = false; if you already
+#  treat wheel that way)
+```
+
+deptui deliberately ships no option for this, for an honest reason:
+it would live on the *target's* config, not the agent's, and scoping
+it tighter than `ALL` is security theater on NixOS — activation runs
+per-generation `/nix/store/*` paths, and any rule matching those
+matches a shell too. A deploy user with NOPASSWD is root-equivalent;
+that is inherent to what deploying *is*, so the grant belongs where
+you can see it.
 
 ### Check the chain
 
