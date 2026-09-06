@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-09-06
+
 ### Changed
 
 - **Agent view: a locked-out host is not a sleeping host.** The
