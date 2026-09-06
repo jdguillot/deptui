@@ -4263,20 +4263,34 @@ target's store instead.",
                 // process alive. Report the failure NOW — the exit
                 // code minutes later says nothing new.
                 if s.contains("Deployment to node") && s.contains("failed") {
+                    let mut end_it = false;
                     if let Some(d) = self.deploy.as_mut() {
                         if !d.failure_seen {
                             d.failure_seen = true;
+                            end_it = true;
                             let node = d.current.clone();
-                            self.busy_label = Some(format!(
-                                "deploy {node} FAILED (rolled back) — deploy-rs is waiting \
-                                 out its confirmation window; x skips the wait"
-                            ));
-                            self.push_log(
-                                "✗ failure confirmed and rolled back — the exit that follows \
-                                 is a formality (x stops the remaining wait)",
-                                true,
-                            );
+                            self.busy_label =
+                                Some(format!("deploy {node} FAILED (rolled back) — cleaning up…"));
                         }
+                    }
+                    if end_it {
+                        // The verdict line prints AFTER deploy-rs has
+                        // finished rolling the target back; the process
+                        // only lingers to wait out the confirmation
+                        // window. Nothing of value remains — run the
+                        // same group teardown `x` would, so the session
+                        // frees for the user's retry instead of sitting
+                        // occupied until the timeout. The canceller
+                        // stays in place; Exit flows through the normal
+                        // bookkeeping (and the batch queue continues).
+                        if let Some(c) = self.deploy.as_ref().and_then(|d| d.cancel.as_ref()) {
+                            c.cancel();
+                        }
+                        self.push_log(
+                            "✗ failure confirmed and rolled back — ending the lingering \
+                             deploy-rs wait now",
+                            true,
+                        );
                     }
                 } else if s.contains("Waiting for confirmation") {
                     if let Some(d) = self.deploy.as_mut() {
@@ -4294,8 +4308,8 @@ target's store instead.",
                         if !d.hinted_err {
                             d.hinted_err = true;
                             self.push_log(
-                                "! activation reported errors — deploy-rs rolls back and the \
-                                 final failed status lands after its confirm-timeout",
+                                "! activation reported errors — deploy-rs is rolling back; \
+                                 the failed status lands when its verdict prints",
                                 true,
                             );
                         }
@@ -5705,7 +5719,10 @@ mod tests {
             label.contains("FAILED"),
             "busy label must say failed: {label}"
         );
-        assert!(app.log.iter().any(|e| e.text.contains("failure confirmed")));
+        assert!(app
+            .log
+            .iter()
+            .any(|e| e.text.contains("ending the lingering")));
         // Once per session — a repeated line doesn't spam.
         let hints = app
             .log

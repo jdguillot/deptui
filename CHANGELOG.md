@@ -10,6 +10,19 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-09-06
+
+### Fixed
+
+- A definitively-failed deploy now actually ends: deploy-rs prints
+  its per-node verdict ("Deployment to node X failed, rolled back…")
+  *after* the rollback completes, then lingers waiting out the
+  confirmation window — v0.10.0 flipped the label but the session
+  stayed occupied until timeout or a manual `x`. The verdict line now
+  triggers the same process-group teardown `x` runs, automatically:
+  the deploy exits within moments, bookkeeping and the batch queue
+  proceed normally, and the session frees for the retry.
+
 ### Added
 
 - Getting-started polish from the validation walk: newest
