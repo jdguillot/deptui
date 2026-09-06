@@ -3584,6 +3584,10 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
+    // Line index of the selected host row — the pane has no scroll
+    // state of its own; selection is the cursor and the view follows
+    // it (a fleet taller than the pane was simply cut off before).
+    let mut sel_line: Option<usize> = None;
     if app.agent.agents.is_empty() && app.agent.scanning {
         let sp = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
         lines.push(Line::from(Span::styled(
@@ -3930,6 +3934,9 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                     Span::raw("  "),
                 ];
                 row.extend(state);
+                if is_sel {
+                    sel_line = Some(lines.len());
+                }
                 lines.push(Line::from(row));
             }
             lines.push(Line::raw(""));
@@ -3945,7 +3952,28 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme::MUTED),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    // Scroll just far enough that the selected row's last wrapped line
+    // is on screen; when everything fits, don't scroll at all.
+    let mut scroll = 0usize;
+    if let Some(sel) = sel_line {
+        let width = inner.width as usize;
+        let height_of = |l: &Line| -> usize {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            wrapped_rows(&text, width)
+        };
+        let top: usize = lines[..sel].iter().map(height_of).sum();
+        let sel_h = height_of(&lines[sel]);
+        let view = inner.height as usize;
+        if top + sel_h > view {
+            scroll = top + sel_h - view;
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll as u16, 0)),
+        inner,
+    );
 }
 
 /// "in 3m" / "12s ago" for next-poll stamps that can sit either side

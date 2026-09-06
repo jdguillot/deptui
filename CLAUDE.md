@@ -270,8 +270,10 @@ Key invariants worth knowing before touching the code:
   `push_log_line` writes through `main_log_mut()` (app messages must
   not leak into the agent log while swapped), tail/backfill ingest
   writes through `agent_log_mut()`, and
-  `filtered_log_indices_for_job_log` picks its axes (marked/selected
-  node vs agent marks/selected watch-row host) off `agent.open`.
+  `filtered_log_indices_for_job_log` picks its axes off `agent.open`:
+  main screen = marked hosts, else the selected node; agent view =
+  Space-marked hosts, else EVERYTHING (selection there is an action
+  cursor — filtering to it hid a running deploy's host-tagged output).
   Watch-tagged agent lines are stored untagged so they behave like
   the main screen's app-level messages.
 - **The mouse adds reach, not abilities.** `ui::draw` rebuilds

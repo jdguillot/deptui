@@ -2441,11 +2441,16 @@ impl App {
     /// [`joblog::filtered_indices`].
     pub fn filtered_log_indices_for_job_log(&self) -> Vec<usize> {
         if self.agent.open {
-            // Same filter rules, agent axes: Space-marked hosts win,
-            // otherwise the watches pane's selected host; untagged
-            // (watch-level) lines always show.
-            let selected = self.selected_agent_host_name();
-            return joblog::filtered_indices(&self.log, &self.agent.marked, selected.as_deref());
+            // Agent axes: Space-marked hosts filter; with no marks the
+            // pane shows EVERYTHING. The main screen's selection filter
+            // made a running agent deploy invisible — the run picks its
+            // own hosts, and the watches-pane selection is an action
+            // cursor (pause/approve), not a statement about which
+            // host's output you want to see.
+            if self.agent.marked.is_empty() {
+                return (0..self.log.len()).collect();
+            }
+            return joblog::filtered_indices(&self.log, &self.agent.marked, None);
         }
         joblog::filtered_indices(
             &self.log,
@@ -5664,6 +5669,27 @@ mod tests {
         assert_eq!(app.agent.marked, vec!["web".to_string()]);
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(app.agent.marked.is_empty());
+
+        // Unmarked agent view shows EVERY line — a running deploy's
+        // host-tagged output must be visible without selecting or
+        // marking that host (selection is an action cursor, not a
+        // filter). Marks remain the explicit opt-in filter.
+        app.log.push(LogEntry {
+            text: "building closure".into(),
+            is_err: false,
+            host: Some("db".into()), // not selected (web is), not marked
+            kind: crate::host::LogKind::Plain,
+        });
+        let idx = app.log.len() - 1;
+        assert!(
+            app.filtered_log_indices_for_job_log().contains(&idx),
+            "unmarked agent view must not hide other hosts' deploy output"
+        );
+        app.agent.marked.push("web".into());
+        assert!(
+            !app.filtered_log_indices_for_job_log().contains(&idx),
+            "marks still filter"
+        );
     }
 
     /// Each confirmed batch opens with a separator header, so a

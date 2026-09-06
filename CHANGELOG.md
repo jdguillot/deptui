@@ -10,6 +10,19 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.14.3] — 2026-09-06
+
+### Fixed
+
+- Agent view: a fleet taller than the watches pane was silently cut
+  off at the bottom. The pane now scrolls to follow the selection
+  (j/k), wrapping included.
+- Agent view: with no hosts marked, the log pane now shows
+  *everything* instead of filtering to the selected watch-row host —
+  a running deploy's output was invisible unless you happened to have
+  exactly that host selected. Space-marking hosts remains the
+  explicit filter.
+
 ## [0.14.2] — 2026-09-06
 
 ### Fixed

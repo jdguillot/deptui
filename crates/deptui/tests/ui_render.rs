@@ -478,6 +478,36 @@ fn agent_footer_hints_stack_on_narrow_windows() {
     }
 }
 
+/// A fleet taller than the watches pane must scroll to the selection —
+/// the pane used to render from the top and silently cut the rest off.
+#[test]
+fn agent_watches_scroll_to_the_selected_host() {
+    let mut app = app_with_agent();
+    app.agent.open = true;
+    let mut status = agent_status();
+    let template = status.watches[0].hosts[0].clone();
+    status.watches[0].hosts = (0..40)
+        .map(|i| {
+            let mut h = template.clone();
+            h.name = format!("host-{i:02}");
+            h
+        })
+        .collect();
+    app.agent.status = Some(status);
+    app.agent.sel = 39;
+    let out = render(&mut app, 120, 40);
+    assert!(
+        out.contains("host-39"),
+        "selected bottom host not scrolled into view: {out}"
+    );
+
+    // Selection back at the top: no scroll, the header is visible.
+    app.agent.sel = 0;
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("host-00"), "{out}");
+    assert!(out.contains("infra"), "watch header lost at top: {out}");
+}
+
 /// The approval warning wraps on narrow windows; both keys of the
 /// two-step confirm must stay visible.
 #[test]
