@@ -10,6 +10,17 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-09-05
+
+### Fixed
+
+- `deptui-agent validate`/`check` over ssh work out of the box: the
+  NixOS module links the generated config at
+  `/etc/deptui-agent/config.toml` (the CLI's default path), and git
+  invocations without a repo anchor at `/` so `sudo -u deptui-agent`
+  from an unreadable home directory can't break `ls-remote` before
+  the network is touched.
+
 ## [0.10.1] — 2026-09-05
 
 ### Fixed

@@ -178,6 +178,11 @@ in
       }
     ];
 
+    # The CLI's default --config path, so `deptui-agent validate` /
+    # `check` work over ssh without hunting down the store path the
+    # service was started with.
+    environment.etc."deptui-agent/config.toml".source = configFile;
+
     # The CLI must be reachable over `ssh host deptui-agent …` — that
     # is the TUI's remote-control transport and what its agent
     # discovery probes. The service alone runs fine from the store

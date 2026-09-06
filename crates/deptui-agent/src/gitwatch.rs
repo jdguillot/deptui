@@ -86,6 +86,13 @@ async fn git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("git");
     if let Some(d) = dir {
         cmd.arg("-C").arg(d);
+    } else {
+        // Anchor repo-less invocations (ls-remote, clone) at / — git
+        // walks the cwd looking for a repository even for remote-only
+        // commands, and `sudo -u deptui-agent` from someone's
+        // unreadable home dir made that walk fail before the network
+        // was ever touched.
+        cmd.current_dir("/");
     }
     cmd.args(args)
         .stdin(Stdio::null())
