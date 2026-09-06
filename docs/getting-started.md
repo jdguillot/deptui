@@ -1,12 +1,13 @@
 # Getting started
 
-Two pieces, adopt one or both:
+Two pieces — the TUI stands alone; the agent is optional on top:
 
 - **`deptui`** — a terminal UI for [deploy-rs](https://github.com/serokell/deploy-rs):
   host status, update probes, preflights, and deploys, for any flake
   with `deploy.nodes`.
-- **`deptui-agent`** — a daemon that watches your git repo and deploys
-  updates on a schedule, with the TUI as its remote control.
+- **`deptui-agent`** *(optional)* — a daemon that watches your git
+  repo and deploys updates on a schedule, with the TUI as its remote
+  control. Skip section 2 entirely if you only want the TUI.
 
 ## 1. The TUI
 
@@ -16,17 +17,31 @@ No install needed to try it:
 nix run github:jdguillot/deptui -- /path/to/your/flake
 ```
 
-(or add `github:jdguillot/deptui` as a flake input and put
-`deptui.packages.${system}.deptui` in your packages). The flake ref
-can be anything `nix` accepts — a local checkout, `github:you/infra`,
-etc. You'll see every `deploy.nodes` host with reachability dots and
-per-profile badges.
+The flake ref can be anything `nix` accepts — a local checkout,
+`github:you/infra`, etc. You'll see every `deploy.nodes` host with
+reachability dots and per-profile badges.
+
+To install just the TUI permanently:
+
+```nix
+# flake input
+inputs.deptui.url = "github:jdguillot/deptui";
+
+# NixOS
+environment.systemPackages = [ inputs.deptui.packages.${pkgs.system}.deptui ];
+# …or home-manager
+home.packages = [ inputs.deptui.packages.${pkgs.system}.deptui ];
+```
+
+(or imperatively: `nix profile install github:jdguillot/deptui`). The
+package wraps `deploy`, `nix`, and `ssh` onto its PATH, so nothing
+else is required.
 
 The keys to know on day one: `r` refresh, `u` update check, `Space`
 mark hosts, `Shift+S` deploy (switch), `x` cancel, `?` the full cheat
 sheet. Everything is also clickable.
 
-## 2. The agent
+## 2. The agent (optional)
 
 The agent runs on an always-on machine (it can be one of your deploy
 nodes — self-deploys are safe) and needs three things: the module
@@ -44,12 +59,16 @@ imports = [ inputs.deptui.nixosModules.deptui-agent ];
 
 services.deptui-agent = {
   enable = true;
+  # "infra" is your name for this watch; the keys under `hosts` are
+  # NOT arbitrary — each must match a node name in the watched
+  # flake's `deploy.nodes` ("web" and "db" here are placeholders for
+  # whatever your nodes are called).
   watches.infra = {
     repo = "git@github.com:you/infra.git";  # or https://…
     branch = "main";                        # or tag = "prod" (a moving tag)
     interval = "15m";                       # or cron = "0 */6 * * *"
-    hosts.web = { };                        # deploy-rs defaults
-    hosts.db = { remote_build = true; };    # per-host flag overrides
+    hosts.web = { };                        # ← deploy.nodes.web, deploy-rs defaults
+    hosts.db = { remote_build = true; };    # ← deploy.nodes.db, per-host overrides
   };
   # who may control the agent over ssh / from the TUI (socket access):
   users = [ "yourname" ];
@@ -94,13 +113,39 @@ security.sudo.extraRules = [{
 #  treat wheel that way)
 ```
 
-deptui deliberately ships no option for this, for an honest reason:
-it would live on the *target's* config, not the agent's, and scoping
-it tighter than `ALL` is security theater on NixOS — activation runs
-per-generation `/nix/store/*` paths, and any rule matching those
-matches a shell too. A deploy user with NOPASSWD is root-equivalent;
-that is inherent to what deploying *is*, so the grant belongs where
-you can see it.
+**Why not scope the rule to the one command deploy-rs runs?**
+Because that command is a *store path that changes every generation*
+(`sudo /nix/store/<hash>-…/activate-rs …`), a scoped rule must
+wildcard it — `NOPASSWD: /nix/store/*/activate-rs` or similar. And on
+a Nix machine that wildcard is root: any local user can ask the nix
+daemon to materialize a store path with any content under a matching
+name (that is what `nix build` *is*), so the deploy user could build
+their own "activate-rs" that execs a shell and sudo it. Pinning the
+exact hash instead is a chicken-and-egg: the deploy that would
+install next generation's rule needs the permission before it runs.
+So the honest choices are:
+
+- **NOPASSWD `ALL` for a dedicated deploy user** — root-equivalent,
+  but visible, auditable, and independently revocable (its own key,
+  its own journal identity). This is what every deploy tool of this
+  family (deploy-rs, colmena, morph) assumes.
+- **`sshUser = "root"`** (with `PermitRootLogin prohibit-password`) —
+  the same trust stated more plainly: one credential that *says* it
+  is root, no sudo indirection at all.
+- **Keep sudo passworded and type it**: deploy-rs's
+  `--interactive-sudo` (the TUI's toggle `5`) prompts you per deploy
+  batch and feeds the password over a PTY. Fine for humans at the
+  TUI; the *agent* cannot use it — a headless daemon would have to
+  store that password in a file, and a stored reusable human
+  password is strictly *more* sensitive than a dedicated ssh key,
+  not less. deptui therefore rejects `interactive_sudo` in agent
+  config on purpose.
+
+Whichever you pick, the root-equivalence is inherent to unattended
+deployment — the design goal is keeping it visible, not pretending a
+wildcard contains it. deptui ships no option to write this rule
+because it belongs to the *target's* config (a different machine than
+the agent module manages).
 
 ### Check the chain
 

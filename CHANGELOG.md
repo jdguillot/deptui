@@ -10,6 +10,16 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- Getting-started: TUI-only flake install example, the agent
+  explicitly marked optional, the `hosts.<name>` keys explained
+  (they must match `deploy.nodes` names), and the sudo section now
+  *explains* why store-path-scoped NOPASSWD is root anyway (any user
+  can materialize a matching store path) and lays out the three
+  honest alternatives, including why `--interactive-sudo` is
+  human-only.
+
 ## [0.12.0] — 2026-09-06
 
 ### Changed
