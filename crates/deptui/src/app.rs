@@ -38,6 +38,7 @@ use crate::settings::Settings;
 use crate::ssh::SshOverride;
 use crate::ui::{self, Tui};
 use deptui_core::agentwire;
+use deptui_core::agentwire::OfflineKind;
 
 /// Focusable regions of the UI. Each one has its own keyboard
 /// affordance when focused: Hosts moves the selection, Toggles lets
@@ -466,6 +467,9 @@ pub struct AgentManaged {
     /// Pending like `offline`, but the host is up and refusing the
     /// agent's ssh — a lockout for the human, not a sleeping host.
     pub denied: bool,
+    /// Pending like `offline`, but port 22 answers and the ssh
+    /// handshake never completes — a hung sshd, also for the human.
+    pub stalled: bool,
     /// First-encounter hold: awaiting adoption.
     pub held: bool,
 }
@@ -3107,7 +3111,9 @@ resolve the paths so they can be seeded",
                                 let entry = self.agent_managed.entry(h.name.clone()).or_default();
                                 entry.failed |= h.failed_rev.is_some();
                                 entry.offline |= h.offline_rev.is_some();
-                                entry.denied |= h.offline_rev.is_some() && h.offline_denied;
+                                let kind = h.pending_kind();
+                                entry.denied |= kind == Some(OfflineKind::Denied);
+                                entry.stalled |= kind == Some(OfflineKind::Stalled);
                                 entry.held |= h.held_rev.is_some();
                             }
                         }
@@ -5420,6 +5426,7 @@ mod tests {
                         offline_rev: None,
                         offline_time: None,
                         offline_denied: false,
+                        offline_kind: None,
                         held_rev: None,
                         held_time: None,
                         approved: false,
@@ -5436,6 +5443,7 @@ mod tests {
                         offline_rev: None,
                         offline_time: None,
                         offline_denied: false,
+                        offline_kind: None,
                         held_rev: None,
                         held_time: None,
                         approved: false,
@@ -5700,6 +5708,7 @@ mod tests {
                     offline_rev: None,
                     offline_time: None,
                     offline_denied: false,
+                    offline_kind: None,
                     held_rev: None,
                     held_time: None,
                     approved: false,
@@ -5869,6 +5878,7 @@ mod tests {
                     offline_rev: None,
                     offline_time: None,
                     offline_denied: false,
+                    offline_kind: None,
                     held_rev: None,
                     held_time: None,
                     approved: false,

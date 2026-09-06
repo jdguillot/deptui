@@ -99,8 +99,9 @@ rendering paths:
   with `nix`/`deploy`/`ssh` PATH shims passed via the child's env (no
   global PATH mutation, so no `#[serial]`): deploy-on-update,
   idempotence, failure parking (no same-commit retry), offline
-  catch-up (pending, not parked; deploys on return; ssh-denied is
-  pending too but flagged, and supersedes an older park; `catch_up = false`
+  catch-up (pending, not parked; deploys on return; ssh-denied and
+  ssh-stalled are pending too but flagged, and supersede an older
+  park; `catch_up = false`
   opt-out), and the daemon's socket API (status/pause/kick/history,
   1s-recheck catch-up, SIGTERM). Test git helpers run with
   `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` — the host's commit-signing
@@ -540,15 +541,20 @@ Key invariants worth knowing before touching the code:
   API handlers talk to it over the `Cmd` mpsc channel and runs report
   back the same way (mirroring the TUI's "the channel is the seam").
   Don't hand `&mut` state to a spawned task.
-- **Offline ≠ failed ≠ denied.** A host down at deploy time gets outcome
-  `offline` (pending, re-probed at `offline_recheck`, deployed on
-  return); a real deploy failure parks the host until a new revision
-  or an approval. Keep the two paths distinct — collapsing them
-  re-introduces either retry storms or missed catch-ups. A host that
-  *answers* but refuses the agent's ssh (`runner::is_lockout` on the
-  probe's stderr) is outcome `denied`: the same pending marker and
-  recheck, flagged `OfflineStamp.denied` / wire `offline_denied`, so
-  no view greys it out as asleep. Run outcomes fold into host state
+- **Offline ≠ failed ≠ denied ≠ stalled.** A host down at deploy time
+  gets outcome `offline` (pending, re-probed at `offline_recheck`,
+  deployed on return); a real deploy failure parks the host until a
+  new revision or an approval. Keep the two paths distinct —
+  collapsing them re-introduces either retry storms or missed
+  catch-ups. A host that *answers* on port 22 but refuses the agent's
+  ssh is outcome `denied`, one that answers and never completes the
+  handshake is `stalled` (`runner::classify_miss` on the probe's
+  stderr → `agentwire::OfflineKind`): the same pending marker and
+  recheck, but the kind rides in `OfflineStamp.kind` / wire
+  `offline_kind` (read via `HostStatus::pending_kind`, which falls
+  back to the 0.18 `offline_denied` bool) so no view greys them out
+  as asleep. The probe's stderr is normalised to one line at the
+  producer (`tidy_stderr`). Run outcomes fold into host state
   through one function, `HostState::apply_outcome` (daemon and
   oneshot `check` alike): a pending outcome clears an older `failed`
   park, a success clears `unreachable` — the rules that stop the

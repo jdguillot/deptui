@@ -11,6 +11,7 @@ use tokio::sync::{broadcast, watch};
 use std::process::Stdio;
 use std::time::Duration;
 
+use deptui_core::agentwire::OfflineKind;
 use deptui_core::askpass::AskpassEnv;
 use deptui_core::deploy::{self, DeployRequest, LogLine, ProfileInfo};
 use deptui_core::flake;
@@ -54,13 +55,14 @@ pub enum DeployOutcome {
         toplevels: std::collections::BTreeMap<String, String>,
     },
     /// The pre-deploy probe could not get in and `catch_up` is on: the
-    /// update stays pending and the daemon re-probes `target`. `denied`
-    /// separates a host that answered but refused us (a lockout the
-    /// human must fix) from one that is simply down.
+    /// update stays pending and the daemon re-probes `target`. `kind`
+    /// separates a host that is simply down from one that answered
+    /// and refused us, or answered and then hung — both of which are
+    /// a human's problem, not a wait.
     Offline {
         target: String,
         message: String,
-        denied: bool,
+        kind: OfflineKind,
     },
     /// The user cancelled the run while this host was deploying; the
     /// process group has been torn down.
@@ -77,25 +79,43 @@ pub enum DeployOutcome {
     Held { message: String },
 }
 
-/// Why a BatchMode probe could not get in. `denied` means the host
-/// *answered* — sshd rejected our key, or the host key didn't check
-/// out — so it is up and waiting on a human, not asleep. Collapsing
-/// the two into "offline" made a locked-out host look like a sleeping
-/// one in every status view.
+/// Why a BatchMode probe could not get in. Anything but `Down` means
+/// the host *answered* on port 22 — sshd rejected our key, or accepted
+/// the connection and never finished the handshake — so it is up and
+/// waiting on a human, not asleep. Collapsing those into "offline"
+/// made a locked-out or hung host look like a sleeping one in every
+/// status view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unreachable {
-    pub denied: bool,
-    /// What ssh said, trimmed.
+    pub kind: OfflineKind,
+    /// What ssh said: lines trimmed and joined with `; ` (raw stderr
+    /// carries `\r\n`, which a status row rendered as two sentences
+    /// run together).
     pub message: String,
 }
 
 impl Unreachable {
     /// Upper-case headline for the `validate` report and the journal.
     pub fn headline(&self) -> String {
-        if self.denied {
-            format!("SSH DENIED (host is up): {}", self.message)
-        } else {
-            format!("UNREACHABLE: {}", self.message)
+        match self.kind {
+            OfflineKind::Down => format!("UNREACHABLE: {}", self.message),
+            OfflineKind::Denied => format!("SSH DENIED (host is up): {}", self.message),
+            OfflineKind::Stalled => {
+                format!(
+                    "SSH UNRESPONSIVE (port open, no handshake): {}",
+                    self.message
+                )
+            }
+        }
+    }
+
+    /// Short lower-case label for run logs: "offline", "ssh denied",
+    /// "ssh unresponsive".
+    pub fn label(&self) -> &'static str {
+        match self.kind {
+            OfflineKind::Down => "offline",
+            OfflineKind::Denied => "ssh denied",
+            OfflineKind::Stalled => "ssh unresponsive",
         }
     }
 }
@@ -106,13 +126,13 @@ impl std::fmt::Display for Unreachable {
     }
 }
 
-/// Does this ssh stderr describe a host that answered and turned us
-/// away? Best-effort text match on OpenSSH's fixed phrasings — the
-/// exit status is 255 for connection failures and auth failures
-/// alike, so the text is the only signal. Unknown phrasings fall
-/// through to "down", which keeps the old behaviour.
-pub fn is_lockout(stderr: &str) -> bool {
-    const PATTERNS: &[&str] = &[
+/// What kind of miss this ssh stderr describes. Best-effort text
+/// match on OpenSSH's fixed phrasings — the exit status is 255 for
+/// connection failures, auth failures, and handshake timeouts alike,
+/// so the text is the only signal. Unknown phrasings fall through to
+/// `Down`, which keeps the old behaviour.
+pub fn classify_miss(stderr: &str) -> OfflineKind {
+    const DENIED: &[&str] = &[
         "Permission denied",
         "Host key verification failed",
         "Too many authentication failures",
@@ -122,7 +142,32 @@ pub fn is_lockout(stderr: &str) -> bool {
         "no matching cipher",
         "Authentication failed",
     ];
-    PATTERNS.iter().any(|p| stderr.contains(p))
+    // Each of these is only printed after the TCP connection was
+    // accepted: the host is up, sshd is not doing its part.
+    const STALLED: &[&str] = &[
+        "banner exchange",
+        "kex_exchange_identification",
+        "Connection closed by remote host",
+        "Connection reset by peer",
+    ];
+    if DENIED.iter().any(|p| stderr.contains(p)) {
+        OfflineKind::Denied
+    } else if STALLED.iter().any(|p| stderr.contains(p)) {
+        OfflineKind::Stalled
+    } else {
+        OfflineKind::Down
+    }
+}
+
+/// ssh's stderr as one line: lossy-decoded, split on `\n`/`\r`, each
+/// piece trimmed, empties dropped, joined with `; `.
+pub fn tidy_stderr(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// BatchMode reachability probe, mirroring what a deploy will need.
@@ -144,15 +189,15 @@ pub async fn check_reachable(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let down = |message: String| Unreachable {
-        denied: false,
+        kind: OfflineKind::Down,
         message,
     };
     match tokio::time::timeout(Duration::from_secs(15), cmd.output()).await {
         Ok(Ok(out)) if out.status.success() => Ok(()),
         Ok(Ok(out)) => {
-            let message = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let message = tidy_stderr(&out.stderr);
             Err(Unreachable {
-                denied: is_lockout(&message),
+                kind: classify_miss(&message),
                 message,
             })
         }
@@ -173,6 +218,7 @@ pub fn summarize_outcomes(hosts: &[HostRun]) -> String {
         "held",
         "offline",
         "denied",
+        "stalled",
         "failed",
         "cancelled",
         "skipped",
@@ -398,19 +444,34 @@ pub async fn execute(
             Ok(DeployOutcome::Offline {
                 target,
                 message,
-                denied,
+                kind,
             }) => {
-                if denied {
-                    // The host is up; only a human can fix a lockout.
-                    // Same pending path as offline (the recheck deploys
-                    // the moment the key is accepted), but it must not
-                    // read as a sleeping host — and it notifies.
+                let u = Unreachable {
+                    kind,
+                    message: message.clone(),
+                };
+                if kind == OfflineKind::Down {
                     log(
                         &mut record,
                         format!(
-                            "[{}] {host}: ssh denied ({target}) — {message}; update pending \
-                             until the agent can log in",
+                            "[{}] {host}: offline ({target}) — {message}; update pending \
+                             until it answers",
                             watch.name
+                        ),
+                    );
+                } else {
+                    // The host is up; only a human can fix a lockout or
+                    // a hung sshd. Same pending path as offline (the
+                    // recheck deploys the moment ssh works), but it
+                    // must not read as a sleeping host — and it
+                    // notifies.
+                    log(
+                        &mut record,
+                        format!(
+                            "[{}] {host}: {} ({target}) — {message}; update pending \
+                             until the agent can log in",
+                            watch.name,
+                            u.label()
                         ),
                     );
                     notify::dispatch(
@@ -420,22 +481,13 @@ pub async fn execute(
                             &watch.name,
                             Some(host),
                             &plan.rev,
-                            format!("ssh denied ({target}): {message}"),
-                        ),
-                    );
-                } else {
-                    log(
-                        &mut record,
-                        format!(
-                            "[{}] {host}: offline ({target}) — {message}; update pending \
-                             until it answers",
-                            watch.name
+                            format!("{} ({target}): {message}", u.label()),
                         ),
                     );
                 }
                 record.hosts.push(HostRun {
                     host: host.clone(),
-                    outcome: if denied { "denied" } else { "offline" }.into(),
+                    outcome: kind.outcome().into(),
                     message: Some(message),
                     target: Some(target),
                     toplevels: Default::default(),
@@ -528,7 +580,7 @@ async fn deploy_host(
             return Ok(DeployOutcome::Offline {
                 target,
                 message: u.message,
-                denied: u.denied,
+                kind: u.kind,
             });
         }
     }
@@ -800,34 +852,80 @@ mod tests {
             "2 ok, 1 offline, 1 failed"
         );
         assert_eq!(summarize_outcomes(&[hr("denied")]), "1 denied");
+        assert_eq!(summarize_outcomes(&[hr("stalled")]), "1 stalled");
     }
 
     #[test]
-    fn lockout_is_told_apart_from_down() {
-        assert!(is_lockout(
-            "cyberfighter@vm-gameserver-nix: Permission denied (publickey,keyboard-interactive)."
-        ));
-        assert!(is_lockout("Host key verification failed."));
-        assert!(is_lockout(
-            "Received disconnect from 10.0.0.2: Too many authentication failures"
-        ));
-        assert!(!is_lockout(
-            "ssh: Could not resolve hostname simple-vm: Name or service not known"
-        ));
-        assert!(!is_lockout(
-            "ssh: connect to host web.lan port 22: Connection refused"
-        ));
-        assert!(!is_lockout(
-            "ssh: connect to host web.lan port 22: No route to host"
-        ));
-        assert!(!is_lockout("ssh probe timed out"));
-        assert!(!is_lockout(""));
+    fn miss_kinds_are_told_apart() {
+        use OfflineKind::*;
+        assert_eq!(
+            classify_miss(
+                "cyberfighter@vm-gameserver-nix: Permission denied (publickey,keyboard-interactive)."
+            ),
+            Denied
+        );
+        assert_eq!(classify_miss("Host key verification failed."), Denied);
+        assert_eq!(
+            classify_miss("Received disconnect from 10.0.0.2: Too many authentication failures"),
+            Denied
+        );
+        // Printed only after the TCP connect succeeded: up, but hung.
+        assert_eq!(
+            classify_miss(
+                "Connection timed out during banner exchange; Connection to 192.168.101.62 port 22 timed out"
+            ),
+            Stalled
+        );
+        assert_eq!(
+            classify_miss("kex_exchange_identification: Connection closed by remote host"),
+            Stalled
+        );
+        assert_eq!(
+            classify_miss("ssh: Could not resolve hostname simple-vm: Name or service not known"),
+            Down
+        );
+        assert_eq!(
+            classify_miss("ssh: connect to host web.lan port 22: Connection refused"),
+            Down
+        );
+        assert_eq!(
+            classify_miss("ssh: connect to host web.lan port 22: No route to host"),
+            Down
+        );
+        // A plain connect timeout is not a banner timeout.
+        assert_eq!(
+            classify_miss("ssh: connect to host 10.0.0.2 port 22: Connection timed out"),
+            Down
+        );
+        assert_eq!(classify_miss("ssh probe timed out"), Down);
+        assert_eq!(classify_miss(""), Down);
         let u = Unreachable {
-            denied: true,
+            kind: Denied,
             message: "root@web: Permission denied (publickey).".into(),
         };
         assert!(u.headline().starts_with("SSH DENIED"));
+        assert_eq!(u.label(), "ssh denied");
         assert_eq!(u.to_string(), "root@web: Permission denied (publickey).");
+        assert!(Unreachable {
+            kind: Stalled,
+            message: String::new()
+        }
+        .headline()
+        .starts_with("SSH UNRESPONSIVE"));
+    }
+
+    #[test]
+    fn stderr_is_one_line() {
+        // The live case: CRLF between two sentences rendered as
+        // "…banner exchangeConnection to…" in the status row.
+        assert_eq!(
+            tidy_stderr(
+                b"Connection timed out during banner exchange\r\nConnection to 192.168.101.62 port 22 timed out\r\n"
+            ),
+            "Connection timed out during banner exchange; Connection to 192.168.101.62 port 22 timed out"
+        );
+        assert_eq!(tidy_stderr(b"  \n\n"), "");
+        assert_eq!(tidy_stderr(b"one\n\n  two  \n"), "one; two");
     }
 
     #[test]

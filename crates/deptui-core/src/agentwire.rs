@@ -47,6 +47,54 @@ pub struct RunningInfo {
     pub trigger: String,
 }
 
+/// Why a pending host could not be reached, as the agent's probe
+/// classified ssh's stderr. `Down` is the sleeping host the pending
+/// machinery was built for; the other two mean the host *answered*
+/// on port 22 and the problem is on the ssh layer — something for a
+/// human, not a wait — so no view may draw them as asleep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OfflineKind {
+    /// Name resolution, connect, or route failure: nobody answered.
+    #[default]
+    Down,
+    /// sshd answered and rejected the agent (auth or host key).
+    Denied,
+    /// TCP connected but the ssh handshake never completed: no banner
+    /// within the timeout, or the connection was closed/reset during
+    /// identification. A hung or overloaded sshd.
+    Stalled,
+}
+
+impl OfflineKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Down => "down",
+            Self::Denied => "denied",
+            Self::Stalled => "stalled",
+        }
+    }
+
+    /// The per-host run outcome string that records this kind.
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Self::Down => "offline",
+            Self::Denied => "denied",
+            Self::Stalled => "stalled",
+        }
+    }
+
+    /// Inverse of [`Self::outcome`]; `None` for non-pending outcomes.
+    pub fn from_outcome(outcome: &str) -> Option<Self> {
+        match outcome {
+            "offline" => Some(Self::Down),
+            "denied" => Some(Self::Denied),
+            "stalled" => Some(Self::Stalled),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostStatus {
     pub name: String,
@@ -72,10 +120,14 @@ pub struct HostStatus {
     #[serde(default)]
     pub offline_time: Option<u64>,
     /// With `offline_rev`: the host answered and refused the agent
-    /// (auth or host key) — it is up, the lockout needs a human.
-    /// Absent from older agents, which report every miss as down.
+    /// (auth or host key). Superseded by `offline_kind`; kept so a
+    /// 0.18 agent's verdict still reads (see [`Self::pending_kind`]).
     #[serde(default)]
     pub offline_denied: bool,
+    /// With `offline_rev`: what kind of miss the probe saw. Absent
+    /// from agents before 0.19, which only knew down vs denied.
+    #[serde(default)]
+    pub offline_kind: Option<OfflineKind>,
     /// First-encounter hold: the host runs something other than the
     /// watched revision and the agent refused to deploy over it.
     #[serde(default)]
@@ -87,8 +139,24 @@ pub struct HostStatus {
     pub approved: bool,
 }
 
+impl HostStatus {
+    /// The kind of the pending miss, if an update is pending. Reads
+    /// `offline_kind` and falls back to the older `offline_denied`
+    /// flag, so the TUI needs no version gate for this field.
+    pub fn pending_kind(&self) -> Option<OfflineKind> {
+        self.offline_rev.as_ref()?;
+        Some(self.offline_kind.unwrap_or(if self.offline_denied {
+            OfflineKind::Denied
+        } else {
+            OfflineKind::Down
+        }))
+    }
+}
+
 /// Per-host outcome inside a run: `"ok"`, `"adopted"`, `"held"`,
-/// `"offline"`, `"denied"`, `"failed"`, `"cancelled"`, or `"skipped"`.
+/// `"offline"`, `"denied"`, `"stalled"`, `"failed"`, `"cancelled"`,
+/// or `"skipped"` (see [`OfflineKind::outcome`] for the pending
+/// three).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostRun {
     pub host: String,

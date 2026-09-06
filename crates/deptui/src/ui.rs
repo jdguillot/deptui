@@ -31,6 +31,7 @@ use crate::app::{
 use crate::deploy::{Mode, ProfileSel, TOGGLES};
 use crate::host::{LogKind, PkgChange, Reachability, UpdateState};
 use crate::theme;
+use deptui_core::agentwire::OfflineKind;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -577,12 +578,15 @@ fn draw_host_list(frame: &mut Frame, area: Rect, app: &App) {
             // Agent badge. Glyph-first (house rule): the suffix inside
             // the bracket carries the state, colour only reinforces —
             // `!` failed, `⊘` ssh denied (host up, agent locked out),
-            // `≠` held, `~` offline-pending, bare = managed and fine.
+            // `⊗` ssh unresponsive (port open, no handshake), `≠` held,
+            // `~` offline-pending, bare = managed and fine.
             if let Some(m) = app.agent_managed.get(&node.name) {
                 let (label, color) = if m.failed {
                     (" [agent!]", theme::ERROR)
                 } else if m.denied {
                     (" [agent⊘]", theme::ERROR)
+                } else if m.stalled {
+                    (" [agent⊗]", theme::WARNING)
                 } else if m.held {
                     (" [agent≠]", theme::WARNING)
                 } else if m.offline {
@@ -3790,7 +3794,9 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 // The standing approval outranks the parked states it
                 // unlocks — approving a cancelled host otherwise left
                 // `!` in place with no sign the approval registered.
-                let denied = h.offline_rev.is_some() && h.offline_denied;
+                let kind = h.pending_kind();
+                let denied = kind == Some(OfflineKind::Denied);
+                let stalled = kind == Some(OfflineKind::Stalled);
                 let (glyph, style) = if h.approved && h.deployed_rev.is_none() {
                     ("↑", Style::default().fg(theme::ACCENT))
                 } else if h.failed_rev.is_some() {
@@ -3798,6 +3804,9 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 } else if denied {
                     // Up but locked out: a call to action, not a sleep.
                     ("⊘", Style::default().fg(theme::ERROR))
+                } else if stalled {
+                    // Port answers, sshd doesn't: also for the human.
+                    ("⊗", Style::default().fg(theme::WARNING))
                 } else if h.held_rev.is_some() {
                     ("≠", Style::default().fg(theme::WARNING))
                 } else if h.offline_rev.is_some() {
@@ -3900,6 +3909,18 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                                 .add_modifier(Modifier::BOLD),
                             &mut state,
                         );
+                    } else if stalled {
+                        seg(
+                            format!(
+                                "ssh unresponsive {} — {} pending{why}",
+                                format_unix_ago(t),
+                                short_rev(rev)
+                            ),
+                            Style::default()
+                                .fg(theme::WARNING)
+                                .add_modifier(Modifier::BOLD),
+                            &mut state,
+                        );
                     } else {
                         seg(
                             format!(
@@ -3935,8 +3956,8 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                     );
                 }
                 // Only a *sleeping* host is context rather than a call
-                // to action; a lockout keeps full colour.
-                let offline = h.offline_rev.is_some() && !denied;
+                // to action; a lockout or a hung sshd keeps full colour.
+                let offline = kind == Some(OfflineKind::Down);
                 let name_style = if is_sel {
                     Style::default()
                         .fg(theme::ON_ACCENT)

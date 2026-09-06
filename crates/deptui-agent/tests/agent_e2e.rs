@@ -31,6 +31,10 @@ struct Env {
     /// While this file exists, the `ssh` shim answers like sshd
     /// rejecting our key — the host is up, we are locked out.
     denied_marker: PathBuf,
+    /// While this file exists, the `ssh` shim answers like a host
+    /// whose port 22 accepted the connection but sshd never sent its
+    /// banner (CRLF-separated, like the real thing).
+    stalled_marker: PathBuf,
     /// The ssh shim answers `readlink` commands with this file's
     /// contents (absent → empty, like a host with no answer) — the
     /// "what the host is running" knob for the drift-guard tests.
@@ -79,6 +83,7 @@ fn setup_with(deploy_exit: i32, extra_host_cfg: &str) -> Env {
     // which is what the pre-guard shim produced.
     let down_marker = shims.path().join("host-down");
     let denied_marker = shims.path().join("host-denied");
+    let stalled_marker = shims.path().join("host-stalled");
     let remote_path = shims.path().join("remote-path");
     let conf_rev = shims.path().join("conf-rev");
     let ssh = shims.path().join("ssh");
@@ -88,6 +93,7 @@ fn setup_with(deploy_exit: i32, extra_host_cfg: &str) -> Env {
             "#!/bin/sh\n\
              if [ -e {down} ]; then echo 'Connection refused' >&2; exit 255; fi\n\
              if [ -e {denied} ]; then echo 'root@web.lan: Permission denied (publickey).' >&2; exit 255; fi\n\
+             if [ -e {stalled} ]; then printf 'Connection timed out during banner exchange\\r\\nConnection to 10.0.0.2 port 22 timed out\\r\\n' >&2; exit 255; fi\n\
              case \"$*\" in\n\
              *nixos-version*) cat {conf} 2>/dev/null; exit 0;;\n\
              *readlink*) cat {path} 2>/dev/null; exit 0;;\n\
@@ -95,6 +101,7 @@ fn setup_with(deploy_exit: i32, extra_host_cfg: &str) -> Env {
              exit 0\n",
             down = down_marker.display(),
             denied = denied_marker.display(),
+            stalled = stalled_marker.display(),
             conf = conf_rev.display(),
             path = remote_path.display(),
         ),
@@ -166,6 +173,7 @@ offline_recheck = "1s"
         deploy_log,
         down_marker,
         denied_marker,
+        stalled_marker,
         remote_path,
         conf_rev,
         git_crypt_log,
@@ -482,7 +490,7 @@ fn denied_host_is_pending_flagged_and_supersedes_old_failure() {
         host["failed"].is_null(),
         "park at {rev_a} survived a newer pending round: {state}"
     );
-    assert_eq!(host["offline"]["denied"], true, "{state}");
+    assert_eq!(host["offline"]["kind"], "denied", "{state}");
     assert_ne!(host["offline"]["rev"].as_str().unwrap(), rev_a);
     assert_eq!(
         host["unreachable"],
@@ -505,6 +513,38 @@ fn denied_host_is_pending_flagged_and_supersedes_old_failure() {
         2,
         "deploy attempted once the key works"
     );
+}
+
+/// Port open, no ssh banner: pending with its own kind, and the
+/// two-line stderr is stored as one `; `-joined line — the raw CRLF
+/// rendered as two sentences run together in the status row.
+#[test]
+fn stalled_host_is_pending_with_its_own_kind_and_one_line_reason() {
+    let env = setup(0);
+    fs::write(&env.stalled_marker, "").unwrap();
+    let out = agent(&env, &["check"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ssh unresponsive"), "{stdout}");
+    assert_eq!(deploy_calls(&env).len(), 0);
+    let state: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(env.state.path().join("state.json")).unwrap())
+            .unwrap();
+    let host = &state["watches"]["infra"]["hosts"]["web"];
+    assert_eq!(host["offline"]["kind"], "stalled", "{state}");
+    assert_eq!(
+        host["unreachable"],
+        "Connection timed out during banner exchange; Connection to 10.0.0.2 port 22 timed out"
+    );
+
+    fs::remove_file(&env.stalled_marker).unwrap();
+    let out = agent(&env, &["check"]);
+    assert!(out.status.success());
+    assert_eq!(deploy_calls(&env).len(), 1);
 }
 
 #[test]

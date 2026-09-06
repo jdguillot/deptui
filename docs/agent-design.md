@@ -56,13 +56,17 @@ rationale record; CLAUDE.md carries the working invariants.
   answers, triggers a "catch-up" poll so normal eligibility deploys the
   coalesced newest revision. Markers persist in state, so rechecks
   resume across agent restarts. `catch_up = false` restores
-  attempt-and-park. The probe tells **down** from **denied**: an ssh
-  error that means the host answered and refused us (`Permission
-  denied`, host-key failures, …) gets outcome `denied` — the same
-  pending marker and recheck (fixing the key is enough; the next
-  recheck deploys), but flagged `denied` in state and on the wire
-  (`offline_denied`) and it fires an `unreachable` notification,
-  because nothing will change until a human acts. A pending outcome
+  attempt-and-park. The probe classifies the miss
+  (`runner::classify_miss` → `agentwire::OfflineKind`): **down**
+  (nobody answered), **denied** (sshd answered and refused us:
+  `Permission denied`, host-key failures, …), or **stalled** (TCP
+  connected, no banner / closed during identification: a hung sshd).
+  All three share the pending marker and recheck (fixing the host is
+  enough; the next recheck deploys), but denied and stalled are
+  flagged in state (`OfflineStamp.kind`) and on the wire
+  (`offline_kind`, plus the older `offline_denied` bool) and fire an
+  `unreachable` notification, because nothing will change until a
+  human acts. ssh's stderr is stored as one `; `-joined line. A pending outcome
   also clears a `failed` park from an older revision — that round
   could only start because a newer revision or an approval ended
   the park, and the stale stamp made the current state unreadable.

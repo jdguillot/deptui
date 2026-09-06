@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use deptui_core::agentwire::OfflineKind;
 use serde::{Deserialize, Serialize};
 
 /// Bump when the layout changes incompatibly; older files are discarded
@@ -111,11 +112,11 @@ pub struct OfflineStamp {
     /// Resolved `user@host` ssh target, stored so rechecks don't need a
     /// clone + discovery round-trip.
     pub target: String,
-    /// The host answered and refused us (auth/host-key), rather than
-    /// being down. Same pending machinery, different story for the
-    /// human: nothing will change until they fix the lockout.
+    /// Down, or answered-and-refused, or answered-and-hung. Same
+    /// pending machinery for all three, different story for the
+    /// human: only `Down` resolves itself.
     #[serde(default)]
-    pub denied: bool,
+    pub kind: OfflineKind,
 }
 
 impl HostState {
@@ -156,12 +157,12 @@ impl HostState {
                 // surviving a failure would retry every poll.
                 self.approved = false;
             }
-            "offline" | "denied" => {
+            "offline" | "denied" | "stalled" => {
                 self.offline = Some(OfflineStamp {
                     rev: rev.to_string(),
                     time,
                     target: hr.target.clone().unwrap_or_default(),
-                    denied: hr.outcome == "denied",
+                    kind: OfflineKind::from_outcome(&hr.outcome).unwrap_or_default(),
                 });
                 // Reaching this round means the park at the older
                 // revision is over (see `failed`).
@@ -347,7 +348,7 @@ mod tests {
         assert!(hs.failed.is_none(), "stale failure survived: {hs:?}");
         let off = hs.offline.as_ref().unwrap();
         assert_eq!(off.rev, "bbbb");
-        assert!(!off.denied);
+        assert_eq!(off.kind, OfflineKind::Down);
         assert_eq!(hs.unreachable.as_deref(), Some("Connection refused"));
 
         // Locked out: same pending shape, flagged so it isn't drawn
@@ -357,7 +358,14 @@ mod tests {
             "bbbb",
             3,
         );
-        assert!(hs.offline.as_ref().unwrap().denied);
+        assert_eq!(hs.offline.as_ref().unwrap().kind, OfflineKind::Denied);
+        hs.apply_outcome(&run("stalled", Some("banner exchange")), "bbbb", 3);
+        assert_eq!(hs.offline.as_ref().unwrap().kind, OfflineKind::Stalled);
+        hs.apply_outcome(
+            &run("denied", Some("Permission denied (publickey)")),
+            "bbbb",
+            3,
+        );
         assert_eq!(
             hs.unreachable.as_deref(),
             Some("Permission denied (publickey)")
@@ -395,7 +403,7 @@ mod tests {
                     rev: "bbbb".into(),
                     time: 2,
                     target: "root@web.lan".into(),
-                    denied: false,
+                    kind: OfflineKind::Down,
                 }),
                 ..Default::default()
             },

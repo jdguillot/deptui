@@ -10,6 +10,29 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Added
+
+- **Agent view: a hung sshd is "ssh unresponsive", not "offline".**
+  The probe now classifies a third kind of miss: port 22 accepted the
+  connection but the ssh handshake never completed (`Connection timed
+  out during banner exchange`, `kex_exchange_identification: …`).
+  Outcome `stalled`, same pending marker and recheck as offline, but
+  drawn `⊗ ssh unresponsive … — <rev> pending — <reason>` in full
+  colour, badged `[agent⊗]`, `SSH UNRESPONSIVE (port open)` in
+  `deptui-agent status`, and it notifies. The reported case: the
+  main screen's TCP probe showed the host online while the agent's
+  row said offline — both were right about their own layer, and the
+  row now says so. Wire: `HostStatus` gains `offline_kind`
+  (`down`/`denied`/`stalled`); `offline_denied` stays populated, and
+  the TUI falls back to it for a 0.18 agent.
+
+### Fixed
+
+- **The probe's reason is one line.** ssh's stderr carried `\r\n`
+  between sentences, which the status row rendered run together
+  ("…banner exchangeConnection to…"). It is now split, trimmed, and
+  joined with `; ` at the producer.
+
 ## [0.18.0] — 2026-09-06
 
 ### Changed

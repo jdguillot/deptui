@@ -278,8 +278,13 @@ Rules the agent lives by:
   (`offline_recheck`) and deploys the moment it answers. Per-host
   `catch_up = false` opts out. A host that is *up* but refuses the
   agent's ssh (`Permission denied`, host-key trouble) is pending the
-  same way but reported as **ssh denied** — it needs a human, and the
-  next recheck after the fix deploys.
+  same way but reported as **ssh denied**, and one whose port 22
+  answers but never completes the handshake (no banner, connection
+  closed during identification — a hung sshd) as **ssh unresponsive**.
+  Both need a human; the next recheck after the fix deploys. Note the
+  main screen's `●` is a TCP probe of port 22, so it can show a host
+  as online while the agent, which needs a full ssh login, cannot get
+  in — the agent view's reason says which layer failed.
 - **The agent only overwrites what it deployed** (drift guard,
   default on). It records the profile paths each deploy leaves and
   holds instead of deploying over a host that changed out-of-band —
@@ -361,11 +366,12 @@ polls; `x`/`cancel` stops a deploy already running — its hosts stay
 parked at that revision until a new commit, a kick after one, or an
 approval. Agent-managed hosts show an `[agent]` badge in the host
 list — `[agent!]` when the last agent deploy failed, `[agent⊘]` when
-the agent is locked out of a host that is up (ssh denied), `[agent≠]`
-when a first-encounter host is held, `[agent~]` when an update is
-pending on an offline host. The same glyphs lead each host row in the
-agent view (`✓` deployed, `↑` approved); a sleeping host's row is
-greyed, a locked-out one keeps full colour.
+the agent is locked out of a host that is up (ssh denied), `[agent⊗]`
+when port 22 answers but ssh never completes (ssh unresponsive),
+`[agent≠]` when a first-encounter host is held, `[agent~]` when an
+update is pending on an offline host. The same glyphs lead each host
+row in the agent view (`✓` deployed, `↑` approved); a sleeping host's
+row is greyed, a locked-out or hung one keeps full colour.
 
 ### Kicking from CI
 

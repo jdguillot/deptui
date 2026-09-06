@@ -393,7 +393,7 @@ impl Daemon {
                         // verdict: a host that came up but now refuses
                         // us must stop being drawn as asleep.
                         if let Some(off) = entry.offline.as_mut() {
-                            off.denied = u.denied;
+                            off.kind = u.kind;
                         }
                         notify::dispatch(
                             &self.cfg.notify,
@@ -525,7 +525,11 @@ impl Daemon {
                             unreachable: hs.unreachable.clone(),
                             offline_rev: hs.offline.as_ref().map(|o| o.rev.clone()),
                             offline_time: hs.offline.as_ref().map(|o| o.time),
-                            offline_denied: hs.offline.as_ref().is_some_and(|o| o.denied),
+                            offline_denied: hs
+                                .offline
+                                .as_ref()
+                                .is_some_and(|o| o.kind == wire::OfflineKind::Denied),
+                            offline_kind: hs.offline.as_ref().map(|o| o.kind),
                             held_rev: hs.held.as_ref().map(|s| s.rev.clone()),
                             held_time: hs.held.as_ref().map(|s| s.time),
                             approved: hs.approved,
@@ -792,7 +796,7 @@ impl Daemon {
                 for (host, u) in &still_down {
                     if let Some(hs) = ws.hosts.get_mut(host) {
                         if let Some(off) = hs.offline.as_mut() {
-                            off.denied = u.denied;
+                            off.kind = u.kind;
                         }
                         hs.unreachable = Some(u.message.clone());
                     }
@@ -1015,7 +1019,7 @@ impl Daemon {
         let had_offline = record
             .hosts
             .iter()
-            .any(|h| matches!(h.outcome.as_str(), "offline" | "denied"));
+            .any(|h| wire::OfflineKind::from_outcome(&h.outcome).is_some());
         self.state.push_run(&watch, record);
         self.running = None;
         self.save_state();

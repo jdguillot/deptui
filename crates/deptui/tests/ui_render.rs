@@ -395,6 +395,7 @@ fn agent_status() -> deptui_core::agentwire::AgentStatus {
                     offline_rev: None,
                     offline_time: None,
                     offline_denied: false,
+                    offline_kind: None,
                     held_rev: None,
                     held_time: None,
                     approved: false,
@@ -411,6 +412,7 @@ fn agent_status() -> deptui_core::agentwire::AgentStatus {
                     offline_rev: None,
                     offline_time: None,
                     offline_denied: false,
+                    offline_kind: None,
                     held_rev: None,
                     held_time: None,
                     approved: false,
@@ -471,7 +473,7 @@ fn agent_view_renders_status_and_tail() {
 /// for a host that was up and refusing the key.
 #[test]
 fn agent_view_tells_locked_out_from_offline() {
-    use deptui_core::agentwire::HostStatus;
+    use deptui_core::agentwire::{HostStatus, OfflineKind};
     let mut app = app_with_agent();
     app.agent.open = true;
     let mut status = agent_status();
@@ -488,6 +490,7 @@ fn agent_view_tells_locked_out_from_offline() {
             offline_rev: Some("abcdef1234567890".into()),
             offline_time: Some(1),
             offline_denied: false,
+            offline_kind: None,
             held_rev: None,
             held_time: None,
             approved: false,
@@ -503,7 +506,27 @@ fn agent_view_tells_locked_out_from_offline() {
             unreachable: Some("me@lockedout: Permission denied (publickey).".into()),
             offline_rev: Some("abcdef1234567890".into()),
             offline_time: Some(1),
+            // A 0.18 agent's flag, no kind: the fallback must still
+            // read it as denied.
             offline_denied: true,
+            offline_kind: None,
+            held_rev: None,
+            held_time: None,
+            approved: false,
+        },
+        HostStatus {
+            name: "hung".into(),
+            paused: false,
+            deployed_rev: None,
+            deployed_time: None,
+            failed_rev: None,
+            failed_time: None,
+            failed_message: None,
+            unreachable: Some("Connection timed out during banner exchange".into()),
+            offline_rev: Some("abcdef1234567890".into()),
+            offline_time: Some(1),
+            offline_denied: false,
+            offline_kind: Some(OfflineKind::Stalled),
             held_rev: None,
             held_time: None,
             approved: false,
@@ -533,6 +556,15 @@ fn agent_view_tells_locked_out_from_offline() {
     assert!(
         out.contains("abcdef1234 pending —") && out.contains("me@lockedout: Permission denied"),
         "lockout reason missing: {out}"
+    );
+    // Port open, no handshake: its own glyph and label, not "offline".
+    assert!(
+        out.contains("⊗ hung  ssh unresponsive"),
+        "hung host must not read as offline: {out}"
+    );
+    assert!(
+        out.contains("banner exchange"),
+        "stall reason missing: {out}"
     );
 }
 
@@ -652,6 +684,7 @@ fn managed_hosts_get_agent_badges_and_title_notice() {
             failed: false,
             offline: true,
             denied: false,
+            stalled: false,
             held: false,
         },
     );
@@ -661,6 +694,7 @@ fn managed_hosts_get_agent_badges_and_title_notice() {
             failed: true,
             offline: false,
             denied: false,
+            stalled: false,
             held: false,
         },
     );
@@ -673,6 +707,10 @@ fn managed_hosts_get_agent_badges_and_title_notice() {
     assert!(out.contains("[agent⊘]"), "locked-out badge missing: {out}");
     assert!(!out.contains("[agent~]"), "lockout drawn as asleep: {out}");
     app.agent_managed.get_mut("alpha").unwrap().denied = false;
+    app.agent_managed.get_mut("alpha").unwrap().stalled = true;
+    let out = render(&mut app, 120, 40);
+    assert!(out.contains("[agent⊗]"), "hung badge missing: {out}");
+    app.agent_managed.get_mut("alpha").unwrap().stalled = false;
     assert!(
         out.contains("agent: 1 host deploy(s) failed"),
         "title notice missing: {out}"

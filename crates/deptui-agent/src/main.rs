@@ -423,10 +423,10 @@ fn print_status(s: &wire::AgentStatus) {
                 // One segment: the state, what is waiting, and ssh's
                 // reason — listing "unreachable: …" separately made
                 // one probe read as two problems.
-                let what = if h.offline_denied {
-                    "SSH DENIED (host is up)"
-                } else {
-                    "OFFLINE"
+                let what = match h.pending_kind() {
+                    Some(wire::OfflineKind::Denied) => "SSH DENIED (host is up)",
+                    Some(wire::OfflineKind::Stalled) => "SSH UNRESPONSIVE (port open)",
+                    _ => "OFFLINE",
                 };
                 let why = h
                     .unreachable
