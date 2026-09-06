@@ -1335,6 +1335,12 @@ fn style_entry(
     match &entry.kind {
         LogKind::Plain => plain_segments(&entry.text, base),
         LogKind::Note => plain_segments(&entry.text, dim_style(base)),
+        LogKind::RunStart => vec![styled_segment(
+            entry.text.clone(),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )],
         LogKind::SizeLocal(bytes) => vec![
             styled_segment("[size] ", tag),
             styled_segment("local: ", tag),
@@ -2121,8 +2127,7 @@ fn info_hints_for(app: &App) -> Vec<(&'static str, &'static str)> {
                 v.push(("n/N", "next/prev"));
                 v.push(("Esc", "clear"));
             }
-            v.push(("V", "line-select"));
-            v.push(("v", "char-select"));
+            v.push(("v/V", "char/line select"));
             v.push(("Tab", "focus"));
             v.push(("?", "help"));
             v.push(("q", "quit"));
@@ -3471,11 +3476,16 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
 fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
     // Focus ring follows the Tab split: watches vs the agent log.
     let focused = !app.agent.log_focused;
+    let marked_label = if app.agent.marked.is_empty() {
+        " watches ".to_string()
+    } else {
+        format!(" watches [{} marked] ", app.agent.marked.len())
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_border_style(focused))
         .title(Span::styled(
-            " watches ",
+            marked_label,
             focus_title_style(focused).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -3795,8 +3805,21 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     state
                 };
+                // Mark column, mirroring the main host list: `+` when
+                // the host is Space-marked into the log filter.
+                let mark = if app.agent.marked.contains(&h.name) {
+                    Span::styled(
+                        "+",
+                        Style::default()
+                            .fg(theme::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw(" ")
+                };
                 let mut row = vec![
-                    Span::raw("  "),
+                    mark,
+                    Span::raw(" "),
                     Span::styled(glyph.to_string(), style),
                     Span::raw(" "),
                     Span::styled(h.name.clone(), name_style),

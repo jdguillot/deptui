@@ -182,6 +182,12 @@ pub async fn execute(
     };
 
     let short = &plan.rev[..plan.rev.len().min(12)];
+    // Seam between runs — without it, consecutive runs in the tail
+    // read as one continuous stream.
+    log(
+        &mut record,
+        format!("[{}] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", watch.name),
+    );
     log(
         &mut record,
         format!(

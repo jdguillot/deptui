@@ -69,6 +69,9 @@ pub enum LogKind {
     Pkg(PkgChange),
     /// "[pkg] done (N change(s))"
     PkgDone(usize),
+    /// A run/batch header — the visual separator between one task's
+    /// output and the next in the job log.
+    RunStart,
 }
 
 /// One entry of a package diff between two closures.

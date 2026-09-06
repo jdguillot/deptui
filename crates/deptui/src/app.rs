@@ -620,6 +620,16 @@ struct DeploySession {
     /// every host in it.
     mode: Mode,
     profile: ProfileSel,
+    /// One-shot log hints so a silently-waiting deploy explains
+    /// itself: set when the confirmation wait / first activation error
+    /// has been announced for the current host.
+    hinted_wait: bool,
+    hinted_err: bool,
+    /// deploy-rs printed its definitive per-node failure line but the
+    /// process is still waiting out the remote confirmation window
+    /// before exiting. The UI reports the failure immediately off
+    /// this instead of stalling with it.
+    failure_seen: bool,
     /// Progress: `total` stays fixed while the queue drains.
     total: usize,
     done: usize,
@@ -3975,6 +3985,24 @@ resolve the paths so they can be seeded",
         self.last_deploy = None;
         self.job_log_scroll = 0;
         self.visual_sel = None;
+        // A visible seam between tasks: without it, a failed deploy and
+        // the retry after it read as one continuous run.
+        let profile_label = match profile {
+            ProfileSel::All => "system+home",
+            ProfileSel::System => "system",
+            ProfileSel::Home => "home",
+        };
+        let what = match hosts.as_slice() {
+            [one] => one.clone(),
+            many => format!("{} + {} more", many[0], many.len() - 1),
+        };
+        self.push_log_line(String::new(), false, None, LogKind::Plain);
+        self.push_log_line(
+            format!("━━ deploy {what} — {}/{profile_label} ━━", mode.label()),
+            false,
+            None,
+            LogKind::RunStart,
+        );
         let total = hosts.len();
         self.start_next_in_queue(hosts.into_iter().collect(), mode, profile, total, 0);
     }
@@ -4117,6 +4145,9 @@ target's store instead.",
                 profile: profile_sel,
                 total,
                 done,
+                hinted_wait: false,
+                hinted_err: false,
+                failure_seen: false,
             });
             return;
         }
@@ -4221,7 +4252,55 @@ target's store instead.",
             }
             LogLine::Stderr(s) => {
                 let host = self.deploy.as_ref().map(|d| d.current.clone());
-                self.push_log_tagged(&s, true, host);
+                self.push_log_tagged(&s, true, host.clone());
+                // deploy-rs goes quiet between "activation errored" and
+                // "confirm-timeout elapsed, rolled back, failed" — up
+                // to its whole confirm window. Say what the silence is,
+                // once per phase, so the user isn't left staring.
+                // deploy-rs's per-node verdict line is definitive: the
+                // rollback has already happened by the time it prints,
+                // and only the remote confirmation window keeps the
+                // process alive. Report the failure NOW — the exit
+                // code minutes later says nothing new.
+                if s.contains("Deployment to node") && s.contains("failed") {
+                    if let Some(d) = self.deploy.as_mut() {
+                        if !d.failure_seen {
+                            d.failure_seen = true;
+                            let node = d.current.clone();
+                            self.busy_label = Some(format!(
+                                "deploy {node} FAILED (rolled back) — deploy-rs is waiting \
+                                 out its confirmation window; x skips the wait"
+                            ));
+                            self.push_log(
+                                "✗ failure confirmed and rolled back — the exit that follows \
+                                 is a formality (x stops the remaining wait)",
+                                true,
+                            );
+                        }
+                    }
+                } else if s.contains("Waiting for confirmation") {
+                    if let Some(d) = self.deploy.as_mut() {
+                        if !d.hinted_wait {
+                            d.hinted_wait = true;
+                            self.push_log(
+                                "⏳ magic rollback armed — deploy-rs waits its confirm-timeout \
+                                 before declaring success or failure",
+                                false,
+                            );
+                        }
+                    }
+                } else if s.contains('❌') || s.contains("Error waiting for activation") {
+                    if let Some(d) = self.deploy.as_mut() {
+                        if !d.hinted_err {
+                            d.hinted_err = true;
+                            self.push_log(
+                                "! activation reported errors — deploy-rs rolls back and the \
+                                 final failed status lands after its confirm-timeout",
+                                true,
+                            );
+                        }
+                    }
+                }
             }
             LogLine::SudoPrompt(prompt) => {
                 if let Some(ref pw) = self.cached_password {
@@ -5529,6 +5608,116 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         assert_eq!(app.log.len(), 3);
         assert_eq!(app.log[0].text, "old run");
+    }
+
+    #[tokio::test]
+    async fn space_marks_agent_hosts_for_the_filter() {
+        let settings: crate::settings::Settings =
+            toml::from_str("[agents.box]\nssh = \"me@box\"\n").unwrap();
+        let mut app = App::with_settings(".".into(), sample_nodes(), settings);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.agent.status = Some(agentwire::AgentStatus {
+            version: "0".into(),
+            paused: false,
+            watches: vec![agentwire::WatchStatus {
+                name: "w".into(),
+                repo: "r".into(),
+                ref_label: "branch main".into(),
+                paused: false,
+                last_seen: None,
+                next_poll: None,
+                running: None,
+                hosts: vec![agentwire::HostStatus {
+                    name: "web".into(),
+                    paused: false,
+                    deployed_rev: None,
+                    deployed_time: None,
+                    failed_rev: None,
+                    failed_time: None,
+                    failed_message: None,
+                    unreachable: None,
+                    offline_rev: None,
+                    offline_time: None,
+                    held_rev: None,
+                    held_time: None,
+                    approved: false,
+                }],
+            }],
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(app.agent.marked, vec!["web".to_string()]);
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(app.agent.marked.is_empty());
+    }
+
+    /// Each confirmed batch opens with a separator header, so a
+    /// failed deploy and its retry can't read as one continuous run.
+    #[tokio::test]
+    async fn confirmed_deploys_are_separated_in_the_log() {
+        let mut app = App::new(".".into(), sample_nodes());
+        app.input = InputMode::ConfirmDeploy {
+            hosts: vec!["alpha".into()],
+            mode: Mode::Switch,
+            profile: ProfileSel::System,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let sep = app
+            .log
+            .iter()
+            .find(|e| e.text.contains("━━ deploy alpha — switch/system ━━"))
+            .expect("run separator missing");
+        assert!(matches!(sep.kind, LogKind::RunStart));
+        assert!(
+            sep.host.is_none(),
+            "separators are untagged (always visible)"
+        );
+    }
+
+    /// deploy-rs's definitive failure line flips the UI to failed
+    /// immediately — the process lingering on its confirmation window
+    /// must not keep the TUI saying "deploying".
+    #[tokio::test]
+    async fn definitive_failure_line_reports_before_exit() {
+        let mut app = App::new(".".into(), sample_nodes());
+        let (_tx, rx) = mpsc::channel(1);
+        app.deploy = Some(DeploySession {
+            rx,
+            task: tokio::spawn(async {}),
+            cancel: None,
+            stdin_tx: None,
+            current: "alpha".into(),
+            queue: VecDeque::new(),
+            mode: Mode::Switch,
+            profile: ProfileSel::System,
+            total: 1,
+            done: 0,
+            hinted_wait: false,
+            hinted_err: false,
+            failure_seen: false,
+        });
+        app.handle_deploy_line(LogLine::Stderr(
+            "🚀 ❌ [deploy] [ERROR] Deployment to node alpha failed, rolled back to previous generation".into(),
+        ));
+        let label = app.busy_label.clone().unwrap_or_default();
+        assert!(
+            label.contains("FAILED"),
+            "busy label must say failed: {label}"
+        );
+        assert!(app.log.iter().any(|e| e.text.contains("failure confirmed")));
+        // Once per session — a repeated line doesn't spam.
+        let hints = app
+            .log
+            .iter()
+            .filter(|e| e.text.contains("failure confirmed"))
+            .count();
+        app.handle_deploy_line(LogLine::Stderr("Deployment to node alpha failed".into()));
+        assert_eq!(
+            app.log
+                .iter()
+                .filter(|e| e.text.contains("failure confirmed"))
+                .count(),
+            hints
+        );
     }
 
     #[test]

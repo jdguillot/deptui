@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/deptui-core", "crates/deptui", "crates/deptui-agent"]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 license = "MIT"
 
@@ -35,6 +35,15 @@ serial_test = "3"
 
 # Profiles only apply at the workspace root; member profile sections are
 # silently ignored.
+
+# line-tables-only keeps file:line backtraces but drops the full DWARF
+# debuginfo, roughly halving target/'s size on disk and speeding links
+# — the edit loop's binaries don't need debugger-grade info. Override
+# per-invocation with CARGO_PROFILE_DEV_DEBUG=full when stepping in a
+# real debugger.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

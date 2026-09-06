@@ -10,6 +10,37 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-09-05
+
+### Added
+
+- Run separators in both logs: each confirmed TUI deploy opens with a
+  `━━ deploy <host> — <mode>/<profiles> ━━` header (a typed
+  `LogKind::RunStart`, always visible), and each agent run starts
+  with a rule line — a failed run and its retry no longer read as one
+  stream.
+- deploy-rs's definitive per-node verdict ("Deployment to node X
+  failed, rolled back…") flips the TUI to failed *immediately* — the
+  title says FAILED (rolled back) and offers `x` to skip the rest of
+  the confirmation window deploy-rs insists on waiting out before
+  exiting.
+- The quiet stretch after a failed activation explains itself: the
+  TUI announces when deploy-rs arms magic rollback ("waits its
+  confirm-timeout…") and when activation errors first appear ("final
+  failed status lands after the confirm-timeout") — once per host,
+  so the wait before the official failure is no longer a mystery.
+- Space-marked hosts in the agent view now show a `+` mark column and
+  a `[N marked]` title count (the marking worked; the missing
+  feedback made it look broken).
+- `[profile.dev] debug = "line-tables-only"`: file:line backtraces
+  kept, full DWARF dropped — roughly halves `target/` on disk and
+  speeds links.
+
+### Changed
+
+- Main-screen job-log hints compacted (`v/V char/line select`),
+  matching the agent footer's grouping.
+
 ## [0.9.1] — 2026-09-05
 
 ### Fixed
