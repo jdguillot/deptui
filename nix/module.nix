@@ -221,6 +221,20 @@ in
       };
     };
 
+    autoRestartWhenIdle = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        The agent notices when a deploy installed a newer unit/binary
+        and restarts itself at the next idle moment (within a minute;
+        immediately after a run finishes — which is what makes
+        self-deploy updates apply right after the run that shipped
+        them). Uses Restart=always plus a clean exit, so `systemctl
+        stop` still stops it. Disable to manage restarts entirely by
+        hand.
+      '';
+    };
+
     restartOnUpdate = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -402,13 +416,17 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       environment.HOME = "/var/lib/deptui-agent";
+      environment.DEPTUI_AGENT_SELF_RESTART = lib.mkIf cfg.autoRestartWhenIdle "1";
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/deptui-agent --config ${configFile} run";
         User = cfg.user;
         Group = cfg.group;
         StateDirectory = "deptui-agent";
         RuntimeDirectory = "deptui-agent";
-        Restart = "on-failure";
+        # `always` is what turns the agent's clean self-restart exit
+        # into an actual restart; a manual `systemctl stop` still
+        # stops (systemd suppresses Restart= for explicit stops).
+        Restart = if cfg.autoRestartWhenIdle then "always" else "on-failure";
         RestartSec = 5;
       };
     };

@@ -10,6 +10,19 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-09-06
+
+### Added
+
+- **Updates apply themselves.** The daemon now notices when a deploy
+  installed a newer unit/binary (60s check against the installed
+  unit's ExecStart) and restarts itself at the next idle moment —
+  immediately after a run finishes, so even a self-deploy's own
+  update takes over right after the run that shipped it. Clean exit
+  + `Restart=always`, so `systemctl stop` still stops. Module option
+  `autoRestartWhenIdle` (default on) — the manual restart-once dance
+  after every agent update is gone.
+
 ## [0.13.3] — 2026-09-06
 
 ### Fixed

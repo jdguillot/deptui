@@ -327,5 +327,6 @@ surface never leaves the group-gated Unix socket. (`ssh <agent-host> deptui-agen
 | every target: bare `Permission denied` | run `validate` — usually a missing or passphrase-protected key, both named outright |
 | socket `Permission denied` on `deptui-agent status` | your ssh user isn't in `services.deptui-agent.users` |
 | host shows `HELD` | by design: first encounter differs from the repo — approve it (`Enter` / `approve`) |
-| `pubkey` says no key exists on a long-running agent | key generation happens at service start, and activation deliberately never restarts a running agent — after switching an agent from `sshKeyFile` to the generated identity, `sudo systemctl restart deptui-agent` once |
-| agent deployed its own host and disappeared | you set `restartOnUpdate = true`; the default (`false`) survives self-deploys, new agent takes over on next restart/reboot |
+| `pubkey` says no key exists on a long-running agent | key generation happens at service start — after switching an agent from `sshKeyFile` to the generated identity, wait for the idle self-restart (≤1 min) or `sudo systemctl restart deptui-agent` |
+| CLI says the running agent "is older than this CLI" | updates apply at the next *idle* moment (never mid-run); wait a minute or restart the unit |
+| agent deployed its own host and disappeared | you set `restartOnUpdate = true`; the default (`false`) survives self-deploys — and with `autoRestartWhenIdle` (default) the new version takes over right after the run completes |

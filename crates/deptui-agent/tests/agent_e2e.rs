@@ -792,3 +792,48 @@ fn pubkey_reads_and_diagnoses_identities() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("passphrase"));
 }
+
+/// Self-restart-on-update: with DEPTUI_AGENT_SELF_RESTART set and the
+/// installed unit's ExecStart naming a different binary, an idle
+/// daemon exits cleanly (systemd's Restart=always then starts the new
+/// one — here we just assert the clean handover exit).
+#[test]
+fn idle_daemon_exits_cleanly_when_unit_points_at_new_binary() {
+    let state = TempDir::new().unwrap();
+    let config_path = state.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "state_dir = \"{0}\"\nsocket = \"{0}/agent.sock\"\n",
+            state.path().display()
+        ),
+    )
+    .unwrap();
+    let unit = state.path().join("deptui-agent.service");
+    fs::write(&unit, "[Service]\nExecStart=/bin/sh -c true\n").unwrap();
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_deptui-agent"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("run")
+        .env("DEPTUI_AGENT_SELF_RESTART", "1")
+        .env("DEPTUI_AGENT_SELF_CHECK_SECS", "1")
+        .env("DEPTUI_AGENT_UNIT", &unit)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let start = Instant::now();
+    loop {
+        if let Some(st) = daemon.try_wait().unwrap() {
+            assert!(st.success(), "handover must be a clean exit: {st:?}");
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "daemon did not hand over to the newer binary"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}

@@ -105,6 +105,15 @@ pub struct Daemon {
     /// A validation walk is in flight; polls queue behind it so git
     /// operations on the clones can't race.
     validating: bool,
+    /// Self-restart-on-update: when the installed unit's ExecStart
+    /// names a different binary than the one running, exit cleanly at
+    /// the next idle moment and let systemd (Restart=always) start
+    /// the new version. Enabled by DEPTUI_AGENT_SELF_RESTART.
+    self_restart: bool,
+    next_self_check: Instant,
+    /// Set when an update was detected while busy — re-checked as
+    /// soon as the daemon goes idle.
+    restart_wanted: bool,
     /// Watches that asked for a poll while a run was in flight
     /// (coalescing) or explicitly via kick.
     pending: Vec<(String, String)>, // (watch, trigger)
@@ -156,6 +165,9 @@ impl Daemon {
             recheck_at: BTreeMap::new(),
             running: None,
             validating: false,
+            self_restart: std::env::var_os("DEPTUI_AGENT_SELF_RESTART").is_some(),
+            next_self_check: now + self_check_interval(),
+            restart_wanted: false,
             pending: Vec::new(),
             log_tx,
             cmd_tx,
@@ -201,15 +213,49 @@ impl Daemon {
         self.next_poll.insert(watch.to_string(), next);
     }
 
+    fn idle(&self) -> bool {
+        self.running.is_none() && !self.validating && self.pending.is_empty()
+    }
+
+    /// Periodic update check: returns true when the daemon should exit
+    /// (cleanly) so systemd restarts it as the new binary. Busy →
+    /// remember and hand over the moment the work finishes.
+    fn self_check_due(&mut self) -> bool {
+        if !self.self_restart || Instant::now() < self.next_self_check {
+            return false;
+        }
+        self.next_self_check = Instant::now() + self_check_interval();
+        let unit = std::env::var("DEPTUI_AGENT_UNIT")
+            .unwrap_or_else(|_| "/etc/systemd/system/deptui-agent.service".to_string());
+        if updated_exe(std::path::Path::new(&unit)).is_none() {
+            return false;
+        }
+        if self.idle() {
+            tracing::info!(
+                "updated agent binary detected — exiting for systemd to restart into it"
+            );
+            return true;
+        }
+        tracing::info!("updated agent binary detected — restarting once the current work finishes");
+        self.restart_wanted = true;
+        false
+    }
+
     /// The soonest scheduled poll or offline recheck, for the select!
     /// sleep.
     fn earliest_poll(&self) -> Instant {
-        self.next_poll
+        let base = self
+            .next_poll
             .values()
             .chain(self.recheck_at.values())
             .min()
             .copied()
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600))
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        if self.self_restart {
+            base.min(self.next_self_check)
+        } else {
+            base
+        }
     }
 
     /// Arm (or re-arm) the offline recheck timer for a watch.
@@ -249,10 +295,19 @@ impl Daemon {
                 cmd = self.cmd_rx.recv() => {
                     let Some(cmd) = cmd else { break };
                     self.handle_cmd(cmd).await;
+                    if self.restart_wanted && self.idle() {
+                        tracing::info!(
+                            "updated agent binary detected — restarting into it now that the run is done"
+                        );
+                        break;
+                    }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     self.poll_due().await;
                     self.recheck_due().await;
+                    if self.self_check_due() {
+                        break;
+                    }
                 }
                 _ = shutdown_signal() => {
                     tracing::info!("shutting down");
@@ -924,6 +979,30 @@ impl Daemon {
             }
         }
     }
+}
+
+fn self_check_interval() -> Duration {
+    std::env::var("DEPTUI_AGENT_SELF_CHECK_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60))
+}
+
+/// The binary the INSTALLED unit would start, when it differs from the
+/// one running. NixOS activation swaps the unit file but deliberately
+/// leaves the running agent alone (self-deploy safety); this is how
+/// the agent notices and hands over.
+fn updated_exe(unit_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(unit_path).ok()?;
+    let line = text
+        .lines()
+        .map(str::trim_start)
+        .find(|l| l.starts_with("ExecStart="))?;
+    let first = line.strip_prefix("ExecStart=")?.split_whitespace().next()?;
+    let expected = std::fs::canonicalize(first).ok()?;
+    let current = std::fs::canonicalize("/proc/self/exe").ok()?;
+    (expected != current).then_some(expected)
 }
 
 /// SIGTERM (systemd stop) or ctrl-c.

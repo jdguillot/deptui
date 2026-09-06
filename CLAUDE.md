@@ -560,6 +560,14 @@ Key invariants worth knowing before touching the code:
   that revision (outcome `cancelled`, failed-stamp message says so),
   so the run doesn't quietly resume at the next poll. No failure
   notification fires for a user cancel.
+- **Updates apply at idle, never mid-run.** Activation never restarts
+  a running agent (`restartIfChanged = false`); instead the daemon
+  compares its own binary against the installed unit's ExecStart
+  (`DEPTUI_AGENT_SELF_RESTART`, 60s cadence, env-tunable for tests)
+  and exits cleanly at the next idle moment — `Restart=always` starts
+  the new version. Busy → `restart_wanted`, handed over the moment
+  the run/validation finishes, which is what makes a self-deploy's
+  own update apply right after the run that shipped it.
 - **Self-deploy must not kill the agent.** The module sets
   `restartIfChanged = false` (option `restartOnUpdate`): when the
   agent deploys its own host and the update changes
