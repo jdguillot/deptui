@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.14.2] — 2026-09-06
+
 ### Fixed
 
 - Agent view: the footer key hints now stack onto extra rows on
