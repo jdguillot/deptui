@@ -659,37 +659,44 @@ fn read_public_key(path: &Path) -> Result<String> {
 
 /// `validate`: resolve each watch's current revision, discover its
 /// nodes, and probe every configured host non-interactively.
-async fn validate(cli: &Cli, state_dir: Option<PathBuf>) -> Result<()> {
-    let cfg = load_config(cli, state_dir)?;
-    require_watches(cli, &cfg)?;
+/// The validation walk, as a report: identity first, then every
+/// watch's poll/checkout/discovery and per-host reachability. Shared
+/// by the CLI's no-daemon fallback and the daemon (which runs it in
+/// its own context — the user that owns the clones, the key, and the
+/// ssh config, which an over-ssh caller is NOT).
+pub(crate) async fn validation_report(cfg: &AgentConfig) -> (String, u32) {
+    let mut out: Vec<String> = Vec::new();
     let mut failures = 0u32;
-    // Local identity first: a broken key fails every probe below with
-    // an unhelpful "Permission denied" — name the real problem here.
     let id_path = default_identity_path();
     match read_public_key(&id_path) {
-        Ok(key) => println!(
+        Ok(key) => out.push(format!(
             "identity {}: ok — authorize this on targets:\n  {key}",
             id_path.display()
-        ),
+        )),
         Err(e) if id_path.exists() => {
-            eprintln!("identity {}: {e:#}", id_path.display());
+            out.push(format!("identity {}: {e:#}", id_path.display()));
             failures += 1;
         }
-        Err(_) => println!(
+        Err(_) => out.push(format!(
             "identity: none at {} (fine if sshKeyFile or your ssh config provides one)",
             id_path.display()
-        ),
+        )),
     }
     for w in &cfg.watches {
         let rev = match gitwatch::ls_remote(&w.repo, &w.refspec()).await {
             Ok(Some(rev)) => rev,
             Ok(None) => {
-                eprintln!("{}: {} not found in {}", w.name, w.refspec(), w.repo);
+                out.push(format!(
+                    "{}: {} not found in {}",
+                    w.name,
+                    w.refspec(),
+                    w.repo
+                ));
                 failures += 1;
                 continue;
             }
             Err(e) => {
-                eprintln!("{}: cannot poll {}: {e:#}", w.name, w.repo);
+                out.push(format!("{}: cannot poll {}: {e:#}", w.name, w.repo));
                 failures += 1;
                 continue;
             }
@@ -697,7 +704,7 @@ async fn validate(cli: &Cli, state_dir: Option<PathBuf>) -> Result<()> {
         let dir = match gitwatch::ensure_checkout(&cfg.state_dir, &w.name, &w.repo, &rev).await {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("{}: checkout failed: {e:#}", w.name);
+                out.push(format!("{}: checkout failed: {e:#}", w.name));
                 failures += 1;
                 continue;
             }
@@ -706,32 +713,63 @@ async fn validate(cli: &Cli, state_dir: Option<PathBuf>) -> Result<()> {
         let nodes = match deptui_core::flake::discover(&flake_ref).await {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("{}: discovery failed: {e:#}", w.name);
+                out.push(format!("{}: discovery failed: {e:#}", w.name));
                 failures += 1;
                 continue;
             }
         };
         for (host, hc) in &w.hosts {
             let Some(node) = nodes.iter().find(|n| n.name == *host) else {
-                eprintln!("{}: host `{host}` not in deploy.nodes", w.name);
+                out.push(format!("{}: host `{host}` not in deploy.nodes", w.name));
                 failures += 1;
                 continue;
             };
             let override_ = hc.ssh_override();
             let target = deptui_core::host::build_ssh_target(node, "system", &override_);
             match runner::check_reachable(&target, &override_).await {
-                Ok(()) => println!("{}: {host} ({target}) ok", w.name),
+                Ok(()) => out.push(format!("{}: {host} ({target}) ok", w.name)),
                 Err(e) => {
-                    eprintln!("{}: {host} ({target}) UNREACHABLE: {e}", w.name);
+                    out.push(format!("{}: {host} ({target}) UNREACHABLE: {e}", w.name));
                     failures += 1;
                 }
             }
         }
     }
+    if failures == 0 {
+        out.push("all targets reachable".to_string());
+    }
+    (out.join("\n"), failures)
+}
+
+async fn validate(cli: &Cli, state_dir: Option<PathBuf>) -> Result<()> {
+    // Daemon first: it owns the clones, the identity, and the ssh
+    // config. Running the walk as whoever invoked the CLI checks the
+    // WRONG user's chain and trips git's cross-user ownership guard
+    // on the daemon's clones.
+    let socket = socket_path(cli);
+    match client::post_json::<wire::OkReply>(&socket, "/validate").await {
+        Ok(reply) => {
+            println!("{}", reply.message);
+            if !reply.ok {
+                bail!("validation failed (agent-side)");
+            }
+            return Ok(());
+        }
+        Err(e) if e.to_string().contains("is deptui-agent running") => {
+            // No daemon — fall through to the local walk.
+        }
+        Err(e) => {
+            // Daemon answered with a failing report (400) or errored.
+            bail!("{e:#}");
+        }
+    }
+    let cfg = load_config(cli, state_dir)?;
+    require_watches(cli, &cfg)?;
+    let (report, failures) = validation_report(&cfg).await;
+    println!("{report}");
     if failures > 0 {
         bail!("{failures} validation failure(s)");
     }
-    println!("all targets reachable");
     Ok(())
 }
 

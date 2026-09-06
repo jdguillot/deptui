@@ -10,6 +10,18 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.13.2] — 2026-09-06
+
+### Fixed
+
+- `validate` over ssh checked the wrong user's world: it read the
+  invoker's identity (none) and then tripped git's cross-user
+  "dubious ownership" guard on the daemon's clones. Like `pubkey`,
+  it now runs through the daemon (`POST /validate`, Unix socket
+  only): the walk executes in the daemon's own context — its clones,
+  its key, its ssh config — with polls deferred while it runs so git
+  can't race; the local walk remains as the no-daemon fallback.
+
 ## [0.13.1] — 2026-09-06
 
 ### Fixed

@@ -683,6 +683,18 @@ fn daemon_waits_for_cadence_and_approval_takes_next_round() {
         status["watches"][0]["hosts"][0][field].clone()
     };
 
+    // validate goes through the daemon (its clones, its identity) —
+    // the caller's own context must not matter.
+    let out = agent(&env, &["validate"]);
+    assert!(
+        out.status.success(),
+        "daemon-side validate failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("web (root@web.lan) ok"), "{report}");
+
     // No startup poll: several seconds in, nothing has happened (the
     // watch interval is 1h).
     std::thread::sleep(Duration::from_secs(3));

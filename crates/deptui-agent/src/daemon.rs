@@ -54,6 +54,15 @@ pub enum Cmd {
         revoke: bool,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Run the validation walk in the daemon's own context (clones,
+    /// identity, ssh config all belong to it — not to whoever invoked
+    /// the CLI over ssh). Refused while a run is in flight; polls are
+    /// deferred while it runs.
+    Validate {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Internal: the spawned validation finished.
+    ValidateDone,
     /// Stop the run in flight: signals the deploy's process group and
     /// parks everything the run was going to do at that revision.
     CancelRun {
@@ -93,6 +102,9 @@ pub struct Daemon {
     /// host of that watch has a pending (offline) update.
     recheck_at: BTreeMap<String, Instant>,
     running: Option<RunningRun>,
+    /// A validation walk is in flight; polls queue behind it so git
+    /// operations on the clones can't race.
+    validating: bool,
     /// Watches that asked for a poll while a run was in flight
     /// (coalescing) or explicitly via kick.
     pending: Vec<(String, String)>, // (watch, trigger)
@@ -143,6 +155,7 @@ impl Daemon {
             next_poll,
             recheck_at: BTreeMap::new(),
             running: None,
+            validating: false,
             pending: Vec::new(),
             log_tx,
             cmd_tx,
@@ -327,6 +340,38 @@ impl Daemon {
                 reply,
             } => {
                 let _ = reply.send(self.approve(watch, host, revoke));
+            }
+            Cmd::Validate { reply } => {
+                if self.running.is_some() {
+                    let _ = reply.send(Err(
+                        "a run is in flight — validate after it finishes".to_string()
+                    ));
+                } else if self.validating {
+                    let _ = reply.send(Err("a validation is already running".to_string()));
+                } else {
+                    self.validating = true;
+                    let cfg = self.cfg.clone();
+                    let cmd_tx = self.cmd_tx.clone();
+                    tokio::spawn(async move {
+                        let (report, failures) = crate::validation_report(&cfg).await;
+                        let _ = reply.send(if failures == 0 {
+                            Ok(report)
+                        } else {
+                            Err(format!("{report}\n{failures} validation failure(s)"))
+                        });
+                        let _ = cmd_tx.send(Cmd::ValidateDone).await;
+                    });
+                }
+            }
+            Cmd::ValidateDone => {
+                self.validating = false;
+                let pending = std::mem::take(&mut self.pending);
+                for (w, trigger) in pending {
+                    self.request_poll(&w, &trigger).await;
+                    if self.running.is_some() {
+                        return;
+                    }
+                }
             }
             Cmd::CancelRun { reply } => {
                 let result = match &self.running {
@@ -659,7 +704,7 @@ impl Daemon {
 
     /// Poll one watch now; start a run when there's something to do.
     async fn request_poll(&mut self, watch: &str, trigger: &str) {
-        if self.running.is_some() {
+        if self.running.is_some() || self.validating {
             // Coalesce: remember the watch, re-poll when the run ends.
             if !self.pending.iter().any(|(w, _)| w == watch) {
                 self.pending.push((watch.to_string(), trigger.to_string()));
