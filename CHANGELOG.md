@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.19.2] — 2026-09-10
+
 ### Changed
 
 - **deploy-rs bumped to 414ac5f (2026-09-08), and the failed-deploy
