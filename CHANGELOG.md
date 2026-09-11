@@ -10,6 +10,23 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Changed
+
+- **deploy-rs bumped to 414ac5f (2026-09-08), and the failed-deploy
+  workaround is gone.** A failed activation under magic rollback used
+  to leave `deploy` waiting out the whole `activation_timeout`
+  (default 240s) after it had already rolled back
+  ([serokell/deploy-rs#372](https://github.com/serokell/deploy-rs/issues/372)).
+  The TUI covered for it by watching the log for the "Deployment to
+  node … failed" verdict and tearing the process group down itself,
+  plus one-shot hints narrating the wait. deploy-rs now cancels that
+  wait itself (#373), so a failed deploy exits on its own and the TUI
+  reports it off the exit code like any other. The fix lives in the
+  target-side `activate-rs`, which comes from **your fleet flake's**
+  deploy-rs input, not deptui's: a flake still pinning an older
+  deploy-rs sees the full wait again on a failed activation (`x`
+  still ends it).
+
 ## [0.19.1] — 2026-09-10
 
 ### Fixed

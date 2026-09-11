@@ -631,16 +631,6 @@ struct DeploySession {
     /// every host in it.
     mode: Mode,
     profile: ProfileSel,
-    /// One-shot log hints so a silently-waiting deploy explains
-    /// itself: set when the confirmation wait / first activation error
-    /// has been announced for the current host.
-    hinted_wait: bool,
-    hinted_err: bool,
-    /// deploy-rs printed its definitive per-node failure line but the
-    /// process is still waiting out the remote confirmation window
-    /// before exiting. The UI reports the failure immediately off
-    /// this instead of stalling with it.
-    failure_seen: bool,
     /// Progress: `total` stays fixed while the queue drains.
     total: usize,
     done: usize,
@@ -4219,9 +4209,6 @@ target's store instead.",
                 profile: profile_sel,
                 total,
                 done,
-                hinted_wait: false,
-                hinted_err: false,
-                failure_seen: false,
             });
             return;
         }
@@ -4326,69 +4313,7 @@ target's store instead.",
             }
             LogLine::Stderr(s) => {
                 let host = self.deploy.as_ref().map(|d| d.current.clone());
-                self.push_log_tagged(&s, true, host.clone());
-                // deploy-rs goes quiet between "activation errored" and
-                // "confirm-timeout elapsed, rolled back, failed" — up
-                // to its whole confirm window. Say what the silence is,
-                // once per phase, so the user isn't left staring.
-                // deploy-rs's per-node verdict line is definitive: the
-                // rollback has already happened by the time it prints,
-                // and only the remote confirmation window keeps the
-                // process alive. Report the failure NOW — the exit
-                // code minutes later says nothing new.
-                if s.contains("Deployment to node") && s.contains("failed") {
-                    let mut end_it = false;
-                    if let Some(d) = self.deploy.as_mut() {
-                        if !d.failure_seen {
-                            d.failure_seen = true;
-                            end_it = true;
-                            let node = d.current.clone();
-                            self.busy_label =
-                                Some(format!("deploy {node} FAILED (rolled back) — cleaning up…"));
-                        }
-                    }
-                    if end_it {
-                        // The verdict line prints AFTER deploy-rs has
-                        // finished rolling the target back; the process
-                        // only lingers to wait out the confirmation
-                        // window. Nothing of value remains — run the
-                        // same group teardown `x` would, so the session
-                        // frees for the user's retry instead of sitting
-                        // occupied until the timeout. The canceller
-                        // stays in place; Exit flows through the normal
-                        // bookkeeping (and the batch queue continues).
-                        if let Some(c) = self.deploy.as_ref().and_then(|d| d.cancel.as_ref()) {
-                            c.cancel();
-                        }
-                        self.push_log(
-                            "✗ failure confirmed and rolled back — ending the lingering \
-                             deploy-rs wait now",
-                            true,
-                        );
-                    }
-                } else if s.contains("Waiting for confirmation") {
-                    if let Some(d) = self.deploy.as_mut() {
-                        if !d.hinted_wait {
-                            d.hinted_wait = true;
-                            self.push_log(
-                                "⏳ magic rollback armed — deploy-rs waits its confirm-timeout \
-                                 before declaring success or failure",
-                                false,
-                            );
-                        }
-                    }
-                } else if s.contains('❌') || s.contains("Error waiting for activation") {
-                    if let Some(d) = self.deploy.as_mut() {
-                        if !d.hinted_err {
-                            d.hinted_err = true;
-                            self.push_log(
-                                "! activation reported errors — deploy-rs is rolling back; \
-                                 the failed status lands when its verdict prints",
-                                true,
-                            );
-                        }
-                    }
-                }
+                self.push_log_tagged(&s, true, host);
             }
             LogLine::SudoPrompt(prompt) => {
                 if let Some(ref pw) = self.cached_password {
@@ -5821,56 +5746,6 @@ mod tests {
         assert!(
             sep.host.is_none(),
             "separators are untagged (always visible)"
-        );
-    }
-
-    /// deploy-rs's definitive failure line flips the UI to failed
-    /// immediately — the process lingering on its confirmation window
-    /// must not keep the TUI saying "deploying".
-    #[tokio::test]
-    async fn definitive_failure_line_reports_before_exit() {
-        let mut app = App::new(".".into(), sample_nodes());
-        let (_tx, rx) = mpsc::channel(1);
-        app.deploy = Some(DeploySession {
-            rx,
-            task: tokio::spawn(async {}),
-            cancel: None,
-            stdin_tx: None,
-            current: "alpha".into(),
-            queue: VecDeque::new(),
-            mode: Mode::Switch,
-            profile: ProfileSel::System,
-            total: 1,
-            done: 0,
-            hinted_wait: false,
-            hinted_err: false,
-            failure_seen: false,
-        });
-        app.handle_deploy_line(LogLine::Stderr(
-            "🚀 ❌ [deploy] [ERROR] Deployment to node alpha failed, rolled back to previous generation".into(),
-        ));
-        let label = app.busy_label.clone().unwrap_or_default();
-        assert!(
-            label.contains("FAILED"),
-            "busy label must say failed: {label}"
-        );
-        assert!(app
-            .log
-            .iter()
-            .any(|e| e.text.contains("ending the lingering")));
-        // Once per session — a repeated line doesn't spam.
-        let hints = app
-            .log
-            .iter()
-            .filter(|e| e.text.contains("failure confirmed"))
-            .count();
-        app.handle_deploy_line(LogLine::Stderr("Deployment to node alpha failed".into()));
-        assert_eq!(
-            app.log
-                .iter()
-                .filter(|e| e.text.contains("failure confirmed"))
-                .count(),
-            hints
         );
     }
 
