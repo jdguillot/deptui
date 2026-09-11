@@ -9,5 +9,6 @@ pub mod askpass;
 pub mod deploy;
 pub mod flake;
 pub mod host;
+pub mod localhost;
 pub mod probe;
 pub mod ssh;

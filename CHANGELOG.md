@@ -10,6 +10,21 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The agent view works when the TUI runs on the agent's own host.**
+  Every agent call shelled out to `ssh <node> deptui-agent …`, and a
+  machine almost never has an ssh key authorized to itself: the scan
+  came back `Permission denied (publickey)` and the agent it was
+  standing on looked absent (#2). A destination that *is* this machine
+  — `localhost`, loopback, its hostname (with or without a domain or a
+  `user@`), or any address bound to one of its interfaces — now skips
+  ssh and runs the CLI directly against the agent's Unix socket, for
+  status, verbs, history, backfill and the live tail alike. The view's
+  header marks such an agent `[local]`. Socket access is then the only
+  requirement (`services.deptui-agent.users`), and the discovery scan
+  also probes this machine even when it is not a deploy node at all.
+
 ## [0.19.0] — 2026-09-06
 
 ### Added

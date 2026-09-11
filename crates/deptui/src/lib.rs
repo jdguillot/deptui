@@ -4,7 +4,7 @@
 //! under the same names so `crate::host::…`-style paths keep working
 //! throughout the TUI code.
 
-pub use deptui_core::{askpass, deploy, flake, host, probe, ssh};
+pub use deptui_core::{askpass, deploy, flake, host, localhost, probe, ssh};
 
 pub mod agentclient;
 pub mod app;

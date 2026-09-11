@@ -64,7 +64,8 @@ passwordless activation on the targets.
 
 How the pieces talk — you keep deploying directly whenever you want,
 and the agent deploys on its schedule; pressing `a` in the TUI
-remote-controls the agent over ssh:
+remote-controls the agent over ssh (or directly, with no ssh hop, when
+the TUI runs on the agent's own host):
 
 ```mermaid
 flowchart LR

@@ -20,10 +20,13 @@ and to `nix` / `ssh` / `git`. Three crates under `crates/`:
   repos, deploys via the core runner, serves a control API on a Unix
   socket (plus an optional token-gated TCP kick/status listener), and
   is its own CLI client (`ssh host deptui-agent <verb> --json` is the
-  TUI's remote-control transport). The TUI finds agents by probing
-  `deploy.nodes` (BatchMode `deptui-agent status --json`); the client
-  settings file only pins agents that aren't deploy nodes. All real
-  agent configuration lives on the agent host.
+  TUI's remote-control transport — minus the `ssh` when the
+  destination is the machine the TUI runs on, see
+  `deptui_core::localhost`). The TUI finds agents by probing
+  `deploy.nodes` (BatchMode `deptui-agent status --json`) plus the
+  local machine; the client settings file only pins agents that
+  aren't deploy nodes. All real agent configuration lives on the
+  agent host.
 
 ## Common commands
 
@@ -63,6 +66,9 @@ blocks in the source modules:
 - `flake.rs` — `Node::has_system`, `Node::has_home`, JSON deserialisation.
 - `joblog.rs` — the job-log host filter and the char-selection column
   bounds shared by highlight + yank.
+- `localhost.rs` — `host_part` (user@ / :port / bracketed IPv6), and
+  the locality verdict for loopback, this host's own name, and a
+  foreign name or address.
 - `theme.rs` — the `NO_COLOR` / `TERM=dumb` decision as a pure function,
   and the `Monochrome` pass (colour cleared, filled cells reversed).
 - `app.rs` — `App::new` defaults, key handling (quit confirmation,
@@ -106,6 +112,11 @@ rendering paths:
   1s-recheck catch-up, SIGTERM). Test git helpers run with
   `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` — the host's commit-signing
   config once leaked in and failed intermittently.
+- `crates/deptui/tests/agent_local.rs` — `deptui-agent` and `ssh` PATH
+  shims: a local destination reaches the CLI directly (the `ssh` shim
+  refuses like a host with no key to itself, so a regression to the
+  ssh hop fails the test), a remote one still goes over ssh, and a
+  missing local CLI says so rather than blaming keys.
 - `tests/no_color.rs` — deliberately its own binary: `theme::monochrome`
   caches in a `OnceLock`, so the environment has to be set before
   anything in the process asks. Asserts a full frame comes out with every
@@ -278,6 +289,19 @@ Key invariants worth knowing before touching the code:
   cursor — filtering to it hid a running deploy's host-tagged output).
   Watch-tagged agent lines are stored untagged so they behave like
   the main screen's app-level messages.
+- **An agent on this machine is reached without ssh.**
+  `agentclient` picks its transport per target from
+  `localhost::is_local_target` — literals, this host's name, then a
+  resolve whose addresses are tested with `bind()` (an address only
+  binds where it lives). A local target runs `deptui-agent <verb>`
+  here, against the agent's own Unix socket: no host authorizes an
+  ssh key to itself, so the old `ssh <self>` hop reported
+  `Permission denied` and hid the agent the TUI was standing on
+  (issue #2). The verdict is about the *target*, never about what
+  answers — a local agent that is down must say "is deptui-agent
+  running?", not silently retry over ssh, which cannot work either.
+  Verdicts are cached; `cached_verdict` is the renderer's
+  non-blocking peek (it must never wait on a resolver).
 - **The mouse adds reach, not abilities.** `ui::draw` rebuilds
   `App.mouse` (a `MouseMap` of inner rects + linear hit ranges for the
   strip chips) every frame, and `handle_mouse` routes every hit

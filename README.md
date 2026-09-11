@@ -168,7 +168,8 @@ pushes updates to configured hosts via deploy-rs — GitOps for your
 homelab, using the same deploy machinery as the TUI. It polls a branch
 head (or a moving tag) on an interval or cron schedule, deploys from
 its own private clone (never a working tree), and exposes a control
-API on a Unix socket. The TUI connects to it over ssh: press `a`.
+API on a Unix socket. The TUI connects to it over ssh — or directly,
+when you run the TUI on the agent's own host: press `a`.
 
 ### Quick start (NixOS)
 
@@ -333,11 +334,17 @@ deptui-agent tail                   # live run log
 
 ### Connecting the TUI
 
-Zero config: press `a`. The TUI scans your `deploy.nodes` for hosts
-that answer `deptui-agent status` (over ssh, non-interactively) and
-connects to what it finds — the client machine needs no agent setup
-at all; all the real configuration (watches, cadence, hosts, flags)
-lives with the agent itself. The NixOS module makes the agent host
+Zero config: press `a`. The TUI scans this machine and your
+`deploy.nodes` for hosts that answer `deptui-agent status` (over ssh,
+non-interactively) and connects to what it finds — the client machine
+needs no agent setup at all; all the real configuration (watches,
+cadence, hosts, flags) lives with the agent itself. A destination that
+*is* the machine you are on (any spelling of it: `localhost`, its
+hostname, one of its own addresses) is reached without an ssh hop at
+all, so running the TUI on the agent host works even though no host
+has an ssh key authorized to itself — the header marks it `[local]`.
+There, socket access is all that is needed
+(`services.deptui-agent.users`). The NixOS module makes the agent host
 discoverable (it installs the CLI system-wide); grant socket access
 to your ssh user with `services.deptui-agent.users = [ "you" ]` —
 the deploy user `root` needs no grant. When a scan finds nothing,

@@ -3601,6 +3601,32 @@ resolve the paths so they can be seeded",
             .collect();
         let tx = self.status_tx.clone();
         tokio::spawn(async move {
+            let mut found = Vec::new();
+            // Is one of the nodes this very machine? Resolved in
+            // parallel: a node that needs a DNS round-trip (or times
+            // one out) must not hold up the scan.
+            let local_node = futures::future::join_all(
+                candidates
+                    .iter()
+                    .map(|(_, target)| agentclient::is_local(target)),
+            )
+            .await
+            .into_iter()
+            .any(|local| local);
+            // If not, the machine running the TUI may still be an agent
+            // host — one that simply isn't a deploy node, which the
+            // scan would otherwise never look at. Probing it costs one
+            // local exec, and it is reported only on success: a
+            // workstation without an agent is the normal case, not a
+            // scan failure worth listing next to the nodes'.
+            if !local_node {
+                if let Some(me) = crate::localhost::local_hostname() {
+                    let target = agentclient::LOCAL_TARGET.to_string();
+                    if agentclient::probe(&target).await.is_ok() {
+                        found.push((me.to_string(), target));
+                    }
+                }
+            }
             let probes = candidates.into_iter().map(|(name, target)| async move {
                 match agentclient::probe(&target).await {
                     Ok(_) => Ok((name, target)),
@@ -3622,7 +3648,6 @@ resolve the paths so they can be seeded",
                     }
                 }
             });
-            let mut found = Vec::new();
             let mut failed = Vec::new();
             for r in futures::future::join_all(probes).await {
                 match r {

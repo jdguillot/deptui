@@ -3446,6 +3446,13 @@ fn draw_agent_screen(frame: &mut Frame, area: Rect, app: &mut App) {
             format!(" ({ssh})"),
             Style::default().fg(theme::MUTED),
         ));
+        // Reached without an ssh hop because the destination is this
+        // machine. Said out loud so the absence of the usual key/
+        // password dance reads as intentional. The verdict is whatever
+        // the client already cached — the renderer never resolves.
+        if crate::localhost::cached_verdict(ssh) == Some(true) {
+            spans.push(Span::styled("  [local]", Style::default().fg(theme::MUTED)));
+        }
     }
     if app.agent.agents.len() > 1 {
         spans.push(Span::styled(
@@ -3615,18 +3622,18 @@ fn draw_agent_watches(frame: &mut Frame, area: Rect, app: &App) {
     if app.agent.agents.is_empty() && app.agent.scanning {
         let sp = SPINNER_FRAMES[(app.tick_counter as usize) % SPINNER_FRAMES.len()];
         lines.push(Line::from(Span::styled(
-            format!("{sp} scanning your deploy nodes for agents…"),
+            format!("{sp} scanning this machine and your deploy nodes for agents…"),
             Style::default().fg(theme::BUSY),
         )));
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "hosts running deptui-agent (reachable non-interactively) appear here",
+            "this host, and deploy nodes reachable non-interactively, appear here",
             Style::default().fg(theme::MUTED),
         )));
     } else if app.agent.agents.is_empty() {
         lines.push(Line::from(Span::styled(
             if app.agent.scanned {
-                "no agents found on your deploy nodes"
+                "no agents found here or on your deploy nodes"
             } else {
                 "no agents configured"
             },

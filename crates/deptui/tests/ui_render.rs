@@ -851,15 +851,12 @@ fn agent_view_shows_scan_states() {
     app.agent.open = true;
     app.agent.scanning = true;
     let out = render(&mut app, 120, 40);
-    assert!(out.contains("scanning your deploy nodes"), "{out}");
+    assert!(out.contains("scanning this machine"), "{out}");
 
     app.agent.scanning = false;
     app.agent.scanned = true;
     let out = render(&mut app, 120, 40);
-    assert!(
-        out.contains("no agents found on your deploy nodes"),
-        "{out}"
-    );
+    assert!(out.contains("no agents found here"), "{out}");
     assert!(out.contains("r rescans"), "{out}");
 }
 
