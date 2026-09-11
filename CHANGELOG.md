@@ -10,6 +10,8 @@ release is tagged `vX.Y.Z`.
 
 ## [Unreleased]
 
+## [0.19.1] — 2026-09-10
+
 ### Fixed
 
 - **The agent view works when the TUI runs on the agent's own host.**
